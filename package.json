@@ -1,0 +1,17 @@
+{
+  "name": "site-context-planner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "earcut": "^3.0.2",
+    "polygon-clipping": "^0.15.7",
+    "proj4": "^2.20.4",
+    "rhino3dm": "^8.17.0",
+    "shapefile": "^0.6.6"
+  }
+}

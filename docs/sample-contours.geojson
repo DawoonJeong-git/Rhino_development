@@ -1,0 +1,33 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "elevation": 52
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [126.968, 37.5848],
+          [126.9695, 37.5842],
+          [126.9715, 37.5836]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "elevation": 53
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [126.9682, 37.5856],
+          [126.97, 37.5851],
+          [126.972, 37.5845]
+        ]
+      }
+    }
+  ]
+}

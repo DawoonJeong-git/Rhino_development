@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+config.local.json
+tmp_*
+*.log
+*.obj
+*.3dm
+docs/sample-contours.geojson

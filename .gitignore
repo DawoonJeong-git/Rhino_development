@@ -1,0 +1,10 @@
+node_modules/
+config.local.json
+.env.production
+.env.production.local
+tmp_*
+*.log
+*.obj
+*.3dm
+data/contours/
+data/dem/
