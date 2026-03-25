@@ -1,18 +1,28 @@
-const HISTORY_STORAGE_KEY = "site-context-history-v1";
+﻿const HISTORY_STORAGE_KEY = "site-context-history-v1";
 
 const state = {
   activeSelectionKey: "",
   buildingRegister: null,
+  eventsBound: false,
   landInfo: null,
   landInfoDetails: null,
   isLandInfoRequesting: false,
+  mapSelectionMode: "address",
   map: null,
   marker: null,
+  previewMarker: null,
   latestSpec: null,
+  manualRangePoints: [],
+  pendingSearchSelectionId: "",
   runtimeConfig: null,
+  searchCache: new Map(),
+  searchProviderLabel: "search",
+  searchResultItems: [],
   selectedLocation: null,
   siteContext: null,
+  siteContextRequest: null,
   siteContextOptionsSignature: "",
+  suppressNextAutoFit: false,
   searchRequestId: 0,
   searchDebounceId: null,
   modelProgressTimer: null,
@@ -25,13 +35,20 @@ const state = {
     buildings: null,
     clipBoundary: null,
     contourLines: null,
+    parcelContext: null,
     parcelBoundary: null,
+    rangeDraft: null,
+    roads: null,
   },
 };
 
 const providerBadge = document.querySelector("#providerBadge");
+const toolbar = document.querySelector(".toolbar");
+const sidePanel = document.querySelector(".side-panel");
+const selectionSummaryStack = document.querySelector(".selection-summary-stack");
 const selectionSummary = document.querySelector("#selectionSummary");
 const searchResults = document.querySelector("#searchResults");
+let searchSelectionCard = document.querySelector("#searchSelectionCard");
 const selectionMeta = document.querySelector("#selectionMeta");
 const siteContextMeta = document.querySelector("#siteContextMeta");
 const siteContextNote = document.querySelector("#siteContextNote");
@@ -67,9 +84,12 @@ const download3dmButton = document.querySelector("#download3dmButton");
 const modelProgressBar = document.querySelector("#modelProgressBar");
 const modelProgressFill = document.querySelector("#modelProgressFill");
 const modelProgressLabel = document.querySelector("#modelProgressLabel");
+let exportProgressBar = null;
+let exportProgressFill = null;
+let exportProgressLabel = null;
 const historyList = document.querySelector("#historyList");
 const clearHistoryButton = document.querySelector("#clearHistoryButton");
-const MIN_CONTOUR_INTERVAL_METERS = 1;
+const MIN_CONTOUR_INTERVAL_METERS = 0.1;
 const MODEL_PROGRESS_STORAGE_KEY =
   "site-context-planner.model-progress-estimates.v1";
 const MODEL_PROGRESS_MIN_ESTIMATE_MS = 1500;
@@ -81,7 +101,111 @@ const MODEL_PROGRESS_DEFAULT_ESTIMATES_MS = Object.freeze({
   "export-obj-cached": 3400,
   "export-3dm": 7600,
   "export-3dm-cached": 5200,
+  "export-dxf": 4200,
+  "export-dxf-cached": 2600,
 });
+
+function clearRangeDraftLayer() {
+  if (state.layers.rangeDraft && state.map) {
+    state.map.removeLayer(state.layers.rangeDraft);
+  }
+
+  state.layers.rangeDraft = null;
+}
+
+function ensureSidePanelTopStack() {
+  if (!sidePanel) {
+    return null;
+  }
+
+  let topStack = sidePanel.querySelector(".side-panel-top-stack");
+
+  if (!topStack) {
+    topStack = document.createElement("div");
+    topStack.className = "side-panel-top-stack";
+    sidePanel.prepend(topStack);
+  }
+
+  return topStack;
+}
+
+function relocateSearchUiToSidePanel() {
+  const topStack = ensureSidePanelTopStack();
+
+  if (!topStack) {
+    return;
+  }
+
+  if (searchForm && searchForm.parentElement !== topStack) {
+    topStack.append(searchForm);
+  }
+
+  if (selectionSummaryStack && selectionSummaryStack.parentElement !== topStack) {
+    topStack.append(selectionSummaryStack);
+  }
+
+  if (toolbar) {
+    toolbar.classList.add("is-relocated");
+  }
+
+  ensureSearchSelectionCard();
+}
+
+function ensureSearchSelectionCard() {
+  if (!searchResults) {
+    return null;
+  }
+
+  if (!searchSelectionCard) {
+    const topStack = ensureSidePanelTopStack();
+
+    if (!topStack) {
+      return null;
+    }
+
+    searchSelectionCard = document.createElement("article");
+    searchSelectionCard.id = "searchSelectionCard";
+    searchSelectionCard.className = "card search-selection-card is-hidden";
+    searchSelectionCard.setAttribute("aria-hidden", "true");
+    searchSelectionCard.innerHTML = `
+      <div class="card-header">
+        <div>
+          <p class="card-kicker">Address Selection</p>
+          <h2>주소 선택</h2>
+        </div>
+      </div>
+      <p class="helper-text search-selection-note" id="searchSelectionNote">
+        검색 결과를 지도에서 확인한 뒤 주소를 확정하세요.
+      </p>
+      <div class="search-selection-body" id="searchSelectionBody"></div>
+    `;
+    if (searchForm && searchForm.parentElement === topStack) {
+      searchForm.insertAdjacentElement("afterend", searchSelectionCard);
+    } else {
+      topStack.prepend(searchSelectionCard);
+    }
+  }
+
+  const searchSelectionBody = searchSelectionCard.querySelector("#searchSelectionBody");
+
+  if (searchSelectionBody && searchResults.parentElement !== searchSelectionBody) {
+    searchSelectionBody.append(searchResults);
+  }
+
+  searchResults.setAttribute("aria-live", "polite");
+  return searchSelectionCard;
+}
+
+function setSearchSelectionCardVisible(visible) {
+  const card = ensureSearchSelectionCard();
+
+  if (!card) {
+    return;
+  }
+
+  card.classList.toggle("is-hidden", !visible);
+  card.setAttribute("aria-hidden", visible ? "false" : "true");
+}
 
 async function readErrorMessageFromResponse(response, fallbackMessage) {
   try {
@@ -438,6 +562,143 @@ function buildSelectionLabel(location) {
   );
 }
 
+function isRangeSelection(location = state.selectedLocation) {
+  return Boolean(location?.selectionMode === "range" && location?.customBounds);
+}
+
+function normalizeRangeBounds(bounds) {
+  if (!bounds || typeof bounds !== "object") {
+    return null;
+  }
+
+  const minLat = Number(bounds.minLat ?? bounds.south ?? bounds.swLat);
+  const maxLat = Number(bounds.maxLat ?? bounds.north ?? bounds.neLat);
+  const minLng = Number(bounds.minLng ?? bounds.west ?? bounds.swLng);
+  const maxLng = Number(bounds.maxLng ?? bounds.east ?? bounds.neLng);
+
+  if (
+    !Number.isFinite(minLat) ||
+    !Number.isFinite(maxLat) ||
+    !Number.isFinite(minLng) ||
+    !Number.isFinite(maxLng)
+  ) {
+    return null;
+  }
+
+  return {
+    minLat: Math.min(minLat, maxLat),
+    maxLat: Math.max(minLat, maxLat),
+    minLng: Math.min(minLng, maxLng),
+    maxLng: Math.max(minLng, maxLng),
+  };
+}
+
+function buildRangeSelection(bounds) {
+  const normalizedBounds = normalizeRangeBounds(bounds);
+
+  if (!normalizedBounds) {
+    return null;
+  }
+
+  const centerLat = (normalizedBounds.minLat + normalizedBounds.maxLat) / 2;
+  const centerLng = (normalizedBounds.minLng + normalizedBounds.maxLng) / 2;
+
+  return {
+    id: `range-${normalizedBounds.minLat.toFixed(6)}-${normalizedBounds.minLng.toFixed(6)}-${normalizedBounds.maxLat.toFixed(6)}-${normalizedBounds.maxLng.toFixed(6)}`,
+    label: "직접 지정 범위",
+    roadAddress: "",
+    parcelAddress: "",
+    lat: Number(centerLat.toFixed(8)),
+    lng: Number(centerLng.toFixed(8)),
+    provider: "manual-range",
+    searchType: "range",
+    selectionMode: "range",
+    customBounds: normalizedBounds,
+  };
+}
+
+function parseParcelAddressReference(value) {
+  const normalized = String(value || "").trim();
+  const match = normalized.match(/(?:^|\s)(산)?\s*(\d+)(?:-(\d+))?\s*$/);
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    mtYn: match[1] ? "1" : "0",
+    bun: String(Number(match[2] || 0)),
+    ji: String(Number(match[3] || 0)),
+  };
+}
+
+function extractLocationParcelReference(location) {
+  const pnu = String(location?.pnu || "").replace(/\D+/g, "");
+
+  if (pnu.length === 19) {
+    return {
+      mtYn: pnu.slice(10, 11) === "2" ? "1" : "0",
+      bun: String(Number(pnu.slice(11, 15) || 0)),
+      ji: String(Number(pnu.slice(15, 19) || 0)),
+    };
+  }
+
+  return parseParcelAddressReference(location?.parcelAddress || "");
+}
+
+function looksLikeRoadAddressQuery(value) {
+  const normalized = normalizeSystemAddress(value);
+
+  if (!normalized) {
+    return false;
+  }
+
+  return /(?:로|길|대로)\s*\d/.test(normalized);
+}
+
+function shouldAutoSelectSearchResult(item, query) {
+  const normalizedQuery = normalizeSystemAddress(query);
+  const normalizedParcelAddress = normalizeSystemAddress(item?.parcelAddress || "");
+  const normalizedRoadAddress = normalizeSystemAddress(
+    item?.roadAddress || item?.label || ""
+  );
+
+  if (
+    normalizedQuery &&
+    normalizedRoadAddress &&
+    (normalizedRoadAddress === normalizedQuery ||
+      normalizedRoadAddress.endsWith(normalizedQuery))
+  ) {
+    return true;
+  }
+
+  if (normalizedQuery && normalizedParcelAddress && normalizedQuery === normalizedParcelAddress) {
+    return true;
+  }
+
+  if (looksLikeRoadAddressQuery(query)) {
+    return true;
+  }
+
+  const queryReference = parseParcelAddressReference(query);
+
+  if (!queryReference) {
+    return true;
+  }
+
+  const itemReference = extractLocationParcelReference(item);
+
+  if (!itemReference) {
+    return false;
+  }
+
+  return (
+    String(itemReference.mtYn || "0") === String(queryReference.mtYn || "0") &&
+    String(itemReference.bun || "") === String(queryReference.bun || "") &&
+    String(itemReference.ji || "") === String(queryReference.ji || "")
+  );
+}
+
 function buildHistoryKey(location) {
   return `${location.label || ""}|${formatCoord(location.lat)}|${formatCoord(location.lng)}`;
 }
@@ -489,24 +750,6 @@ function formatElevationRange(minValue, maxValue) {
   })}m ~ ${Number(maxValue).toLocaleString("ko-KR", {
     maximumFractionDigits: 1,
   })}m`;
-}
-
-function buildAppliedModelSummary(siteContext = state.siteContext) {
-  if (!siteContext) {
-    return "범위를 설정하면 대지, 지형, 건물 범위를 먼저 확인할 수 있습니다.";
-  }
-
-  const stats = siteContext.stats || {};
-  const options = siteContext.options || {};
-
-  return (
-    `범위 ${Number(options.radius || 0).toLocaleString("ko-KR")}m, ` +
-    `등고 간격 ${Number(options.contourInterval || 1).toLocaleString("ko-KR")}m, ` +
-    `대지 ${Number(stats.parcelAreaSqm || 0).toLocaleString("ko-KR")}㎡, ` +
-    `표고 ${formatElevationRange(stats.minElevation, stats.maxElevation)}, ` +
-    `건물 ${stats.buildingCount || 0}개 ` +
-    `(대지 내부 ${stats.targetBuildingCount || 0}개)가 추출 범위에 반영되었습니다.`
-  );
 }
 
 function setProviderBadge() {
@@ -645,15 +888,37 @@ function formatModelElapsedTime(elapsedMs) {
 }
 
 function setModelProgress(value, message, stateName = "idle") {
-  if (!modelProgressBar || !modelProgressFill || !modelProgressLabel) {
+  const scope = state.modelProgressSession?.scope || "preview";
+  const elements = getModelProgressElements(scope);
+
+  if (!elements.bar || !elements.fill || !elements.label) {
     return;
   }
 
   const normalized = Math.max(0, Math.min(100, Number(value) || 0));
   state.modelProgressValue = normalized;
-  modelProgressBar.dataset.state = stateName;
-  modelProgressFill.style.width = `${normalized}%`;
-  modelProgressLabel.textContent = message;
+  elements.bar.dataset.state = stateName;
+  elements.fill.style.width = `${normalized}%`;
+  elements.label.textContent = message;
+}
+
+function setScopedModelProgress(scope, value, message, stateName = "idle") {
+  const previousSession = state.modelProgressSession;
+
+  if (!previousSession || previousSession.scope !== scope) {
+    state.modelProgressSession = {
+      ...(previousSession || {}),
+      scope,
+    };
+  }
+
+  setModelProgress(value, message, stateName);
+
+  if (!previousSession) {
+    state.modelProgressSession = null;
+  } else {
+    state.modelProgressSession = previousSession;
+  }
 }
 
 function clearModelProgressTimer() {
@@ -695,8 +960,10 @@ function startModelProgress(operationKey, message, options = {}) {
   clearModelProgressPollTimer();
   const startValue = Math.max(0, Number(options.startValue) || 6);
   const maxValue = Math.max(startValue, Number(options.maxValue) || 94);
+  const scope = options.scope || resolveProgressScope(operationKey);
   state.modelProgressSession = {
     operationKey,
+    scope,
     message,
     startedAt: performance.now(),
     startValue,
@@ -756,7 +1023,13 @@ function resetModelProgress(
   clearModelProgressTimer();
   clearModelProgressPollTimer();
   state.modelProgressSession = null;
-  setModelProgress(0, message, "idle");
+  setScopedModelProgress("preview", 0, message, "idle");
+  setScopedModelProgress(
+    "export",
+    0,
+    "파일 형식과 옵션을 고른 뒤 3D 파일 다운로드를 누르면 여기에서 진행 상태가 표시됩니다.",
+    "idle"
+  );
 }
 
 function loadHistory() {
@@ -813,8 +1086,14 @@ function renderHistory() {
   });
 }
 
-function clearContextLayers() {
+function clearContextLayers(options = {}) {
+  const preserveRangeDraft = options.preserveRangeDraft === true;
+
   Object.keys(state.layers).forEach((key) => {
+    if (preserveRangeDraft && key === "rangeDraft") {
+      return;
+    }
+
     if (state.layers[key]) {
       state.map.removeLayer(state.layers[key]);
       state.layers[key] = null;
@@ -824,49 +1103,116 @@ function clearContextLayers() {
 
 function updateContextLayers(siteContext) {
   clearContextLayers();
+  const isRangeMode = siteContext?.selectionMode === "range";
+  const isSelectionPreview = siteContext?.layerMode === "selection-preview";
 
-  state.layers.clipBoundary = L.geoJSON(siteContext.clipBoundary, {
-    style: {
-      color: "#bb5a34",
-      dashArray: "8 8",
-      fillColor: "#bb5a34",
-      fillOpacity: 0.04,
-      weight: 2,
-    },
-  }).addTo(state.map);
-
-  state.layers.parcelBoundary = L.geoJSON(siteContext.parcelBoundary, {
-    style: {
-      color: "#223d2c",
-      fillOpacity: 0,
-      weight: 3,
-    },
-  }).addTo(state.map);
-
-  state.layers.contourLines = L.geoJSON(siteContext.contourLines, {
-    style: {
-      color: "#6d6a76",
-      opacity: 0.9,
-      weight: 1.25,
-    },
-  }).addTo(state.map);
-
-  if (siteContext.buildings?.features?.length) {
-    state.layers.buildings = L.geoJSON(siteContext.buildings, {
-      style: (feature) => ({
-        color: feature?.properties?.isTarget ? "#c5622e" : "#7f6a59",
-        fillColor: feature?.properties?.isTarget ? "#d28845" : "#9e8a78",
-        fillOpacity: feature?.properties?.isTarget ? 0.32 : 0.18,
-        weight: feature?.properties?.isTarget ? 2.2 : 1.1,
-      }),
+  if (!isSelectionPreview && siteContext.clipBoundary) {
+    state.layers.clipBoundary = L.geoJSON(siteContext.clipBoundary, {
+      style: {
+        color: "#bb5a34",
+        dashArray: "8 8",
+        fillColor: "#bb5a34",
+        fillOpacity: 0.04,
+        weight: 2,
+      },
     }).addTo(state.map);
   }
 
-  const bounds = state.layers.clipBoundary.getBounds();
-
-  if (bounds.isValid()) {
-    state.map.fitBounds(bounds.pad(0.15));
+  if (!isSelectionPreview && siteContext.parcelContext?.features?.length) {
+    state.layers.parcelContext = L.geoJSON(siteContext.parcelContext, {
+      style: {
+        color: "#6e846d",
+        fillOpacity: 0,
+        opacity: 0.85,
+        weight: 1.3,
+      },
+    }).addTo(state.map);
   }
+
+  if (!isRangeMode && siteContext.parcelBoundary) {
+    state.layers.parcelBoundary = L.geoJSON(siteContext.parcelBoundary, {
+      style: {
+        color: isSelectionPreview ? "#bb5a34" : "#223d2c",
+        fillColor: "#4f6348",
+        fillOpacity: isSelectionPreview ? 0.16 : 0,
+        weight: isSelectionPreview ? 5 : 3,
+        dashArray: isSelectionPreview ? "8 4" : null,
+      },
+    }).addTo(state.map);
+    state.layers.parcelBoundary.bringToFront();
+  }
+
+  if (!isSelectionPreview && siteContext.contourLines) {
+    state.layers.contourLines = L.geoJSON(siteContext.contourLines, {
+      style: {
+        color: "#6d6a76",
+        opacity: 0.9,
+        weight: 1.25,
+      },
+    }).addTo(state.map);
+  }
+
+  if (!isSelectionPreview && siteContext.roads?.features?.length) {
+    state.layers.roads = L.geoJSON(siteContext.roads, {
+      style: (feature) => {
+        const isPolygon =
+          feature?.geometry?.type === "Polygon" ||
+          feature?.geometry?.type === "MultiPolygon";
+
+        return isPolygon
+          ? {
+              color: "#1677ff",
+              fillColor: "#4da2ff",
+              fillOpacity: 0.35,
+              opacity: 1,
+              weight: 2,
+            }
+          : {
+              color: "#1677ff",
+              opacity: 1,
+              weight: 4,
+              lineCap: "round",
+              lineJoin: "round",
+            };
+      },
+    }).addTo(state.map);
+  }
+
+  const allBuildingFeatures = siteContext.buildings?.features || [];
+  const targetBuildingFeatures = allBuildingFeatures.filter(
+    (feature) => feature?.properties?.isTarget
+  );
+  const buildingFeatures = isSelectionPreview
+    ? (targetBuildingFeatures.length ? targetBuildingFeatures : allBuildingFeatures)
+    : allBuildingFeatures;
+
+  if (buildingFeatures.length) {
+    state.layers.buildings = L.geoJSON(
+      {
+        type: "FeatureCollection",
+        features: buildingFeatures,
+      },
+      {
+        style: (feature) => ({
+          color:
+            !isRangeMode && feature?.properties?.isTarget ? "#c5622e" : "#7f6a59",
+          fillColor:
+            !isRangeMode && feature?.properties?.isTarget ? "#d28845" : "#9e8a78",
+          fillOpacity:
+            !isRangeMode && feature?.properties?.isTarget
+              ? (isSelectionPreview ? 0.42 : 0.32)
+              : 0.18,
+          weight:
+            !isRangeMode && feature?.properties?.isTarget
+              ? (isSelectionPreview ? 3 : 2.2)
+              : 1.1,
+        }),
+      }
+    ).addTo(state.map);
+    state.layers.buildings.bringToFront();
+  }
+
+  state.suppressNextAutoFit = false;
 }
 
 function renderSelectionSummary() {
@@ -892,6 +1238,18 @@ function renderSelectionMeta() {
   }
 
   const item = state.selectedLocation;
+
+  if (isRangeSelection(item)) {
+    const bounds = normalizeRangeBounds(item.customBounds);
+
+    selectionMeta.innerHTML = `
+      <div><dt>선택 방식</dt><dd>직접 지정 범위</dd></div>
+      <div><dt>범위 좌표</dt><dd>${bounds.minLat.toFixed(6)}, ${bounds.minLng.toFixed(6)} ~ ${bounds.maxLat.toFixed(6)}, ${bounds.maxLng.toFixed(6)}</dd></div>
+      <div><dt>중심 좌표</dt><dd>${formatCoord(item.lat)}, ${formatCoord(item.lng)}</dd></div>
+      <div><dt>설명</dt><dd>지도의 두 점으로 지정한 사각형 범위</dd></div>
+    `;
+    return;
+  }
   const systemAddress = getSystemAddress(item) || "현재 미확인";
   const parcelAddress = normalizeSystemAddress(item.parcelAddress || "") || "현재 미확인";
   const buildingName = item.buildingName || item.label || "현재 미확인";
@@ -902,36 +1260,6 @@ function renderSelectionMeta() {
     <div><dt>좌표</dt><dd>${formatCoord(item.lat)}, ${formatCoord(item.lng)}</dd></div>
     <div><dt>건물명</dt><dd>${escapeHtml(buildingName)}</dd></div>
   `;
-}
-
-function renderSiteContextMetaLegacy() {
-  if (!hasFreshSiteContextForCurrentOptions()) {
-    siteContextMeta.innerHTML = `
-      <div><dt>대지 소스</dt><dd>아직 불러오지 않음</dd></div>
-      <div><dt>지형 소스</dt><dd>아직 불러오지 않음</dd></div>
-      <div><dt>대지 면적</dt><dd>아직 불러오지 않음</dd></div>
-      <div><dt>등고선 수</dt><dd>아직 불러오지 않음</dd></div>
-    `;
-    siteContextNote.textContent = "위치를 선택한 뒤 대지/등고 미리보기를 불러오세요.";
-    return;
-  }
-
-  const parcel = state.siteContext.dataSources?.parcel;
-  const terrain = state.siteContext.dataSources?.terrain;
-  const stats = state.siteContext.stats || {};
-
-  siteContextMeta.innerHTML = `
-    <div><dt>대지 소스</dt><dd>${escapeHtml(
-      `${parcel?.provider || "unknown"} / ${parcel?.mode || "unknown"}`
-    )}</dd></div>
-    <div><dt>지형 소스</dt><dd>${escapeHtml(
-      `${terrain?.provider || "unknown"} / ${terrain?.mode || "unknown"}`
-    )}</dd></div>
-    <div><dt>대지 면적</dt><dd>${escapeHtml(formatArea(stats.parcelAreaSqm || 0))}</dd></div>
-    <div><dt>등고선 수</dt><dd>${escapeHtml(String(stats.contourCount || 0))}</dd></div>
-  `;
-  siteContextNote.textContent =
-    parcel?.note || terrain?.note || "대지 컨텍스트를 불러왔습니다.";
 }
 
 function renderSiteContextMeta() {
@@ -1070,8 +1398,10 @@ function renderLandInfo() {
     <div><dt>공시지가</dt><dd>${escapeHtml(summary.announcedPrice || "미확인")}</dd></div>
     <div><dt>기준 주소</dt><dd>${escapeHtml(state.landInfo.address || buildSelectionLabel(state.selectedLocation))}</dd></div>
   `;
-  landInfoNote.textContent =
+  landInfoNote.textContent = `${state.landInfo.address || buildSelectionLabel(state.selectedLocation)} 기준 토지이음 결과를 정리했습니다.`; /*
+    ? "직접 지정 범위는 특정 필지 토지요약 대신 범위 안의 컨텍스트를 확인합니다."
     `${state.landInfo.address || buildSelectionLabel(state.selectedLocation)} 기준 토지이음 결과를 정리했습니다.`;
+  */
   renderInfoItems(
     landInfoList,
     urbanPlanningItems,
@@ -1704,7 +2034,7 @@ function renderSelectionAwareActions() {
 }
 
 function openPopup(location) {
-  if (!state.marker) {
+  if (!state.marker || !state.map) {
     return;
   }
 
@@ -1712,55 +2042,10 @@ function openPopup(location) {
     `
       <strong>${escapeHtml(buildSelectionLabel(location))}</strong><br />
       ${formatCoord(location.lat)}, ${formatCoord(location.lng)}
-    `
+    `,
+    { autoPan: false }
   );
   state.marker.openPopup();
-}
-
-function setSelectedLocationLegacy(location, moveMap = true) {
-  state.selectedLocation = location;
-  state.activeSelectionKey = buildHistoryKey(location);
-  state.siteContext = null;
-  state.siteContextOptionsSignature = "";
-  state.buildingRegister = null;
-  state.landInfo = null;
-  state.landInfoDetails = null;
-  state.latestSpec = null;
-  specPreview.textContent =
-    "추출 조건 확인을 누르면 범위, 지형, 포함 건물 수를 이곳에서 먼저 확인할 수 있습니다.";
-
-  if (!state.marker) {
-    state.marker = L.marker([location.lat, location.lng]).addTo(state.map);
-  } else {
-    state.marker.setLatLng([location.lat, location.lng]);
-  }
-
-  if (moveMap) {
-    state.map.flyTo([location.lat, location.lng], 18, {
-      duration: 0.8,
-    });
-  }
-
-  pushHistory(location);
-  clearContextLayers();
-  renderSelectionSummary();
-  renderSelectionMeta();
-  renderSiteContextMeta();
-  renderLandInfo();
-  renderBuildingRegister();
-  openPopup(location);
-  siteContextNote.textContent =
-    "선택한 위치 기준으로 대지, 지형, 건물 컨텍스트를 불러오는 중입니다.";
-  landInfoNote.textContent =
-    "선택한 위치 기준으로 토지이음 요약을 불러오는 중입니다.";
-  if (state.runtimeConfig?.futureSources?.hasBuildingHubKey) {
-    buildingRegisterNote.textContent =
-      "선택한 위치 기준으로 건축물대장 요약을 불러오는 중입니다.";
-  }
-  siteContextNote.textContent =
-    "현재 위치가 선택되었습니다. 대지/건물 미리보기를 누르면 지금 설정한 범위와 지형 모드로 불러옵니다.";
-  syncPanelStatusChips();
-  void refreshSelectionData(state.activeSelectionKey);
 }
 
 function createResultBadges(item) {
@@ -1786,8 +2071,99 @@ function createResultBadges(item) {
     .join("");
 }
 
+function getSearchResultDisplayTitle(item) {
+  if (item?.searchType === "parcel") {
+    return item?.parcelAddress || item?.label || "주소 결과";
+  }
+
+  return item?.label || item?.roadAddress || item?.parcelAddress || "주소 결과";
+}
+
+function getSearchResultMetaLines(item, providerLabel) {
+  const lines = [];
+
+  if (item?.searchType === "parcel" && item?.roadAddress) {
+    lines.push(`도로명: ${item.roadAddress}`);
+  }
+
+  if (item?.searchType !== "parcel" && item?.parcelAddress) {
+    lines.push(`지번: ${item.parcelAddress}`);
+  }
+
+  lines.push(`${formatCoord(item.lat)}, ${formatCoord(item.lng)} / ${providerLabel}`);
+  return lines;
+}
+
+function clearPreviewMarker() {
+  if (state.previewMarker && state.map) {
+    state.map.removeLayer(state.previewMarker);
+  }
+
+  state.previewMarker = null;
+}
+
+function centerMapOnCoordinates(lat, lng) {
+  if (!state.map || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return;
+  }
+
+  state.map.stop();
+  state.map.closePopup();
+  state.map.setView([lat, lng], state.map.getZoom(), {
+    animate: false,
+  });
+}
+
+function showSearchResultPreview(item) {
+  if (!state.map || !item) {
+    return;
+  }
+
+  setSearchSelectionCardVisible(true);
+  clearPreviewMarker();
+  state.pendingSearchSelectionId = item.id || "";
+  centerMapOnCoordinates(item.lat, item.lng);
+  state.previewMarker = L.marker([item.lat, item.lng], {
+    opacity: 0.85,
+  }).addTo(state.map);
+  state.previewMarker.bindPopup(
+    `
+      <strong>${escapeHtml(buildSelectionLabel(item))}</strong><br />
+      검색 결과 미리보기
+    `,
+    { autoPan: false }
+  );
+  state.previewMarker.openPopup();
+  renderSearchResults(state.searchResultItems, state.searchProviderLabel);
+  setActionFeedback(
+    `검색 결과를 지도에서 미리보고 있습니다. "${buildSelectionLabel(item)}"를 확정하려면 아래 버튼을 눌러주세요.`
+  );
+}
+
+function confirmSearchResult(item) {
+  clearPreviewMarker();
+  state.pendingSearchSelectionId = "";
+  searchInput.value = item.roadAddress || item.parcelAddress || item.label || "";
+  setSelectedLocation(item);
+  state.searchResultItems = [];
+  searchResults.innerHTML = "";
+  setSearchSelectionCardVisible(false);
+}
+
 function renderSearchResults(items, providerLabel) {
-  if (!items.length) {
+  state.searchResultItems = Array.isArray(items) ? [...items] : [];
+  state.searchProviderLabel = providerLabel || "search";
+  setSearchSelectionCardVisible(true);
+  const searchSelectionNote = document.querySelector("#searchSelectionNote");
+  const resultCount = state.searchResultItems.length;
+
+  if (searchSelectionNote) {
+    searchSelectionNote.textContent = resultCount
+      ? `검색 결과 ${resultCount}건입니다. 지도에서 위치를 확인한 뒤 주소를 확정하세요.`
+      : "검색 결과가 없습니다. 다른 주소어 또는 지도 클릭으로 위치를 지정해보세요.";
+  }
+
+  if (!resultCount) {
     searchResults.innerHTML = `
       <p class="search-results-empty">
         검색 결과가 없습니다. 지도를 직접 클릭해도 됩니다.
@@ -1799,25 +2175,42 @@ function renderSearchResults(items, providerLabel) {
   searchResults.innerHTML = "";
 
   items.forEach((item) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "result-item";
-    button.innerHTML = `
+    const article = document.createElement("article");
+    article.className = `result-item${
+      state.pendingSearchSelectionId === (item.id || "") ? " is-active" : ""
+    }`;
+    const displayTitle = getSearchResultDisplayTitle(item);
+    const metaLines = getSearchResultMetaLines(item, providerLabel);
+    article.innerHTML = `
       <div class="result-title-row">
-        <div class="result-title">${escapeHtml(item.label)}</div>
+        <div class="result-title">${escapeHtml(displayTitle)}</div>
         <div class="result-badges">${createResultBadges(item)}</div>
       </div>
       <div class="result-meta">
-        ${escapeHtml(getSystemAddress(item) || "주소 정보 없음")}<br />
-        ${formatCoord(item.lat)}, ${formatCoord(item.lng)} / ${escapeHtml(providerLabel)}
+        ${metaLines.map((line) => escapeHtml(line)).join("<br />")}
+      </div>
+      <div class="result-actions">
+        <button type="button" class="result-action-button secondary-button" data-action="preview">
+          지도에서 보기
+        </button>
+        <button type="button" class="result-action-button" data-action="confirm">
+          이 주소 확정
+        </button>
       </div>
     `;
 
-    button.addEventListener("click", () => {
-      setSelectedLocation(item);
-    });
+    article
+      .querySelector('[data-action="preview"]')
+      ?.addEventListener("click", () => {
+        showSearchResultPreview(item);
+      });
+    article
+      .querySelector('[data-action="confirm"]')
+      ?.addEventListener("click", () => {
+        confirmSearchResult(item);
+      });
 
-    searchResults.append(button);
+    searchResults.append(article);
   });
 }
 
@@ -1825,6 +2218,13 @@ async function loadRuntimeConfig() {
   const response = await fetch("/api/config");
   state.runtimeConfig = await response.json();
   setProviderBadge();
+}
+
+function buildSearchCacheKey(query) {
+  return String(query || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
 }
 
 async function geocodeAddress(query, currentRequestId) {
@@ -1839,8 +2239,50 @@ async function geocodeAddress(query, currentRequestId) {
     throw new Error(payload.error || "주소 검색에 실패했습니다.");
   }
 
-  renderSearchResults(payload.results, payload.provider || "search");
   return payload;
+}
+
+function clearSelectionForSearch() {
+  clearPreviewMarker();
+  clearRangeDraftLayer();
+  state.manualRangePoints = [];
+  state.pendingSearchSelectionId = "";
+  state.activeSelectionKey = "";
+  state.selectedLocation = null;
+  state.siteContext = null;
+  state.siteContextOptionsSignature = "";
+  state.buildingRegister = null;
+  state.landInfo = null;
+  state.landInfoDetails = null;
+  state.latestSpec = null;
+  state.searchResultItems = [];
+
+  if (state.map) {
+    state.map.closePopup();
+  }
+
+  if (state.marker && state.map) {
+    state.map.removeLayer(state.marker);
+    state.marker = null;
+  }
+
+  clearContextLayers();
+  renderSelectionSummary();
+  renderSelectionMeta();
+  renderSiteContextMeta();
+  renderLandInfo();
+  renderBuildingRegister();
+  syncSelectionModeFormState();
+  selectionSummary.textContent = "아직 선택된 위치가 없습니다.";
+  siteContextNote.textContent =
+    "주소를 검색하거나 지도에서 위치를 클릭하면 필지 경계와 건물 외곽선을 미리 볼 수 있습니다.";
+  landInfoNote.textContent =
+    "위치를 선택하면 토지이음 요약을 불러옵니다.";
+
+  if (state.runtimeConfig?.futureSources?.hasBuildingHubKey) {
+    buildingRegisterNote.textContent =
+      "위치를 선택하면 건축물대장 요약을 불러옵니다.";
+  }
 }
 
 async function reverseGeocode(lat, lng) {
@@ -1866,11 +2308,34 @@ async function reverseGeocode(lat, lng) {
 }
 
 function normalizeContourInterval(value) {
-  return MIN_CONTOUR_INTERVAL_METERS;
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue)) {
+    return MIN_CONTOUR_INTERVAL_METERS;
+  }
+
+  return Math.max(
+    MIN_CONTOUR_INTERVAL_METERS,
+    Number(numericValue.toFixed(3))
+  );
+}
+
+function normalizeExportFormat(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+
+  if (normalized === "3dm" || normalized === "dxf" || normalized === "skp") {
+    return normalized;
+  }
+
+  return "obj";
+}
+
+function describeTerrainMode(value) {
+  return value === "mesh" ? "완만한 일체형" : "등고층 매스";
 }
 
 function syncContourIntervalInput() {
-  const contourField = modelForm?.querySelector('input[name="contourInterval"]');
+  const contourField = modelForm?.querySelector('[name="contourInterval"]');
 
   if (!contourField) {
     return MIN_CONTOUR_INTERVAL_METERS;
@@ -1888,32 +2353,206 @@ function syncContourIntervalInput() {
 
 function collectModelOptions() {
   const formData = new FormData(modelForm);
+  const contourInterval = syncContourIntervalInput();
 
   return {
     shape: "rectangle",
     radius: Number(formData.get("radius")),
-    contourInterval: MIN_CONTOUR_INTERVAL_METERS,
+    contourInterval,
     terrainMode: "contour",
-    includeContours: formData.get("includeContours") === "on",
-    includeBuildings:
-      formData.has("includeBuildings")
-        ? formData.get("includeBuildings") === "on"
-        : true,
-    includeRoads: formData.get("includeRoads") === "on",
-    includeParcelBoundary: formData.get("includeParcelBoundary") === "on",
+    buildingPlacement:
+      String(formData.get("buildingPlacement") || "").toLowerCase() ===
+      "embed-lowest"
+        ? "embed-lowest"
+        : "dominant",
+    exportFormat: normalizeExportFormat(formData.get("exportFormat")),
+    includeContours: true,
+    includeBuildings: true,
+    includeRoads: true,
+    includeParcelBoundary: true,
+    splitParcelBoundary: formData.get("splitParcelBoundary") === "on",
   };
 }
 
-function buildModelOptionsSignature(options = collectModelOptions()) {
-  return JSON.stringify({
+function buildModelOptionsSignature(
+  options = collectModelOptions(),
+  signatureOptions = {}
+) {
+  const includeExportOnly = signatureOptions.includeExportOnly === true;
+  const signature = {
     radius: Number(options.radius) || 0,
-    contourInterval: MIN_CONTOUR_INTERVAL_METERS,
+    contourInterval: Number(options.contourInterval) || MIN_CONTOUR_INTERVAL_METERS,
     terrainMode: "contour",
-    includeContours: options.includeContours !== false,
-    includeBuildings: options.includeBuildings !== false,
-    includeRoads: options.includeRoads === true,
-    includeParcelBoundary: options.includeParcelBoundary !== false,
-  });
+    includeContours: true,
+    includeBuildings: true,
+    includeRoads: true,
+    includeParcelBoundary: true,
+  };
+
+  if (includeExportOnly) {
+    signature.buildingPlacement =
+      options.buildingPlacement === "embed-lowest"
+        ? "embed-lowest"
+        : "dominant";
+    signature.splitParcelBoundary = options.splitParcelBoundary === true;
+    signature.exportFormat = normalizeExportFormat(options.exportFormat);
+  }
+
+  return JSON.stringify(signature);
+}
+
+function buildSiteContextRequestOptions(
+  options = collectModelOptions(),
+  requestOptions = {}
+) {
+  return {
+    ...options,
+    splitParcelBoundary:
+      requestOptions.previewOnly === true ? false : options.splitParcelBoundary === true,
+  };
+}
+
+function describeExportFormat(value) {
+  const normalized = normalizeExportFormat(value);
+
+  if (normalized === "3dm") {
+    return "3DM";
+  }
+
+  if (normalized === "dxf") {
+    return "DXF";
+  }
+
+  if (normalized === "skp") {
+    return "SKP";
+  }
+
+  return "OBJ";
+}
+
+function describeBuildingPlacement(value) {
+  return value === "embed-lowest" ? "최저 레벨" : "기준 레벨";
+}
+
+function buildAppliedModelSummary(
+  siteContext = state.siteContext,
+  options = collectModelOptions()
+) {
+  if (!options) {
+    return "범위 설정을 누르면 현재 반경과 추출 조건이 여기에 표시됩니다.";
+  }
+
+  const requestedInterval = normalizeContourInterval(options.contourInterval);
+  const effectiveInterval = Number(
+    siteContext?.stats?.effectiveContourBandInterval ||
+      siteContext?.stats?.requestedContourInterval ||
+      requestedInterval
+  );
+  const intervalLabel = Number.isFinite(effectiveInterval)
+    ? effectiveInterval
+    : requestedInterval;
+  const intervalText =
+    Number.isFinite(effectiveInterval) && Math.abs(effectiveInterval - requestedInterval) > 0.0001
+      ? `${requestedInterval}m (출력 ${effectiveInterval}m)`
+      : `${intervalLabel}m`;
+  const parts = [
+    `범위 ${Number(options.radius) || 0}m`,
+    `등고 간격 ${intervalText}`,
+    `건물 배치 ${describeBuildingPlacement(options.buildingPlacement)}`,
+  ];
+  const stats = siteContext?.stats || {};
+
+  if (Number.isFinite(stats.parcelAreaSqm) && stats.parcelAreaSqm > 0) {
+    parts.push(`대지 ${formatArea(stats.parcelAreaSqm)}`);
+  }
+
+  if (
+    Number.isFinite(stats.minElevation) &&
+    Number.isFinite(stats.maxElevation)
+  ) {
+    parts.push(`표고 ${formatElevationRange(stats.minElevation, stats.maxElevation)}`);
+  }
+
+  if (Number.isFinite(stats.buildingCount)) {
+    const targetCount = Number(stats.targetBuildingCount || 0);
+    parts.push(
+      `건물 ${Number(stats.buildingCount || 0)}개${
+        targetCount > 0 ? ` (대지 내부 ${targetCount}개)` : ""
+      }`
+    );
+  }
+
+  return parts.join(", ");
+}
+
+function describeProgressScope(scope) {
+  return scope === "export" ? "download" : "preview";
+}
+
+function getModelProgressElements(scope = "preview") {
+  if (scope === "export") {
+    return {
+      bar: exportProgressBar,
+      fill: exportProgressFill,
+      label: exportProgressLabel,
+    };
+  }
+
+  return {
+    bar: modelProgressBar,
+    fill: modelProgressFill,
+    label: modelProgressLabel,
+  };
+}
+
+function resolveProgressScope(operationKey = "") {
+  return String(operationKey || "").startsWith("export-") ? "export" : "preview";
+}
+
+function ensureExportProgressUi(exportSection) {
+  if (!exportSection) {
+    return;
+  }
+
+  let progress = exportSection.querySelector("#exportProgressBar");
+
+  if (!progress) {
+    progress = document.createElement("div");
+    progress.id = "exportProgressBar";
+    progress.className = "model-progress export-progress";
+    progress.dataset.state = "idle";
+    progress.innerHTML = `
+      <div class="model-progress-track">
+        <div class="model-progress-fill" id="exportProgressFill"></div>
+      </div>
+      <p class="model-progress-label" id="exportProgressLabel">
+        파일 형식과 옵션을 고른 뒤 3D 파일 다운로드를 누르면 여기에서 진행 상태가 표시됩니다.
+      </p>
+    `;
+  }
+
+  const downloadGrid = exportSection.querySelector(".download-action-grid");
+
+  if (downloadGrid && progress.parentElement !== exportSection) {
+    exportSection.insertBefore(progress, downloadGrid);
+  }
+
+  exportProgressBar = progress;
+  exportProgressFill = progress.querySelector("#exportProgressFill");
+  exportProgressLabel = progress.querySelector("#exportProgressLabel");
+}
+
+function buildSelectionPreviewOptions() {
+  return {
+    ...buildSiteContextRequestOptions(collectModelOptions(), {
+      previewOnly: true,
+    }),
+    includeContours: false,
+    includeRoads: false,
+    includeBuildings: true,
+    includeParcelBoundary: true,
+    splitParcelBoundary: false,
+  };
 }
 
 function hasFreshSiteContextForCurrentOptions() {
@@ -1921,6 +2560,53 @@ function hasFreshSiteContextForCurrentOptions() {
     Boolean(state.siteContext) &&
     state.siteContextOptionsSignature === buildModelOptionsSignature()
   );
+}
+
+function syncSelectionModeFormState() {
+  const radiusField = modelForm?.querySelector('input[name="radius"]');
+  const radiusLabel = radiusField?.closest("label");
+  const splitParcelField = modelForm?.querySelector(
+    'input[name="splitParcelBoundary"]'
+  );
+  const splitParcelLabel = splitParcelField?.closest("label");
+  const disableRadius = isRangeSelection();
+
+  if (radiusField) {
+    radiusField.disabled = disableRadius;
+  }
+
+  if (splitParcelField) {
+    splitParcelField.disabled = disableRadius;
+  }
+
+  radiusLabel?.classList.toggle("is-disabled", disableRadius);
+  splitParcelLabel?.classList.toggle("is-disabled", disableRadius);
+}
+
+function showRangeDraftBounds(bounds) {
+  clearRangeDraftLayer();
+
+  if (!state.map || !bounds) {
+    return null;
+  }
+
+  const rectangle = L.rectangle(
+    [
+      [bounds.minLat, bounds.minLng],
+      [bounds.maxLat, bounds.maxLng],
+    ],
+    {
+      color: "#c5622e",
+      weight: 3,
+      dashArray: "10 6",
+      fillColor: "#d28845",
+      fillOpacity: 0.12,
+    }
+  ).addTo(state.map);
+
+  state.layers.rangeDraft = rectangle;
+  rectangle.bringToFront();
+  return rectangle;
 }
 
 function selectionHasParcelReference(location = state.selectedLocation) {
@@ -1932,17 +2618,28 @@ function selectionHasParcelReference(location = state.selectedLocation) {
   );
 }
 
-function markModelOptionsDirty() {
-  state.latestSpec = null;
-  resetModelProgress(
-    "범위 설정을 누르면 지도에 버퍼가 반영되고 추출 준비 상태가 갱신됩니다."
+function hasSelectionPreviewForCurrentSelection(selectionKey = state.activeSelectionKey) {
+  return Boolean(
+    isSelectionRequestCurrent(selectionKey) &&
+      state.siteContext?.layerMode === "selection-preview" &&
+      state.siteContext?.parcelBoundary
   );
+}
 
-  if (!state.selectedLocation || !state.siteContext) {
+function markModelOptionsDirty() {
+  const previewStillFresh = hasFreshSiteContextForCurrentOptions();
+  state.latestSpec = null;
+
+  if (previewStillFresh) {
+    if (state.siteContext) {
+      specPreview.textContent = buildAppliedModelSummary(state.siteContext);
+    }
     return;
   }
 
-  if (hasFreshSiteContextForCurrentOptions()) {
+  resetModelProgress("범위 설정을 누르면 지도에 버퍼가 반영되고 추출 준비 상태가 갱신됩니다.");
+
+  if (!state.selectedLocation || !state.siteContext) {
     return;
   }
 
@@ -1961,74 +2658,125 @@ async function loadSiteContext(
   }
 
   const location = { ...state.selectedLocation };
-  const options = collectModelOptions();
-
-  const requestInit = {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
+  const options = buildSiteContextRequestOptions(
+    {
+      ...collectModelOptions(),
+      ...(requestOptions.optionOverrides || {}),
     },
-    body: JSON.stringify({
-      location,
-      options,
-    }),
-  };
-  const response = requestOptions.useModelProgress
-    ? await fetchWithModelProgress(
-        "/api/site-context",
-        requestInit,
-        "대지 컨텍스트 요청에 실패했습니다.",
-        {
-          rangeStart: requestOptions.rangeStart ?? 0,
-          rangeEnd: requestOptions.rangeEnd ?? 100,
-        }
-      )
-    : await fetchWithDiagnostics(
-        "/api/site-context",
-        requestInit,
-        "대지 컨텍스트 요청에 실패했습니다."
-      );
+    requestOptions
+  );
+  const requestKey = JSON.stringify({
+    selectionKey,
+    location: {
+      lat: Number(location.lat || 0).toFixed(6),
+      lng: Number(location.lng || 0).toFixed(6),
+    },
+    options: buildModelOptionsSignature(options),
+    previewOnly: requestOptions.previewOnly === true,
+    useModelProgress: requestOptions.useModelProgress === true,
+    rangeStart: Number(requestOptions.rangeStart ?? 0),
+    rangeEnd: Number(requestOptions.rangeEnd ?? 100),
+  });
 
-  let payload;
+  if (state.siteContextRequest?.key === requestKey && state.siteContextRequest.promise) {
+    return state.siteContextRequest.promise;
+  }
+
+  const requestPromise = (async () => {
+    const requestInit = {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        location,
+        options,
+        customBounds: isRangeSelection(location) ? location.customBounds : null,
+        previewOnly: requestOptions.previewOnly === true,
+      }),
+    };
+    const response = requestOptions.useModelProgress
+      ? await fetchWithModelProgress(
+          "/api/site-context",
+          requestInit,
+          "대지 컨텍스트 요청에 실패했습니다.",
+          {
+            rangeStart: requestOptions.rangeStart ?? 0,
+            rangeEnd: requestOptions.rangeEnd ?? 100,
+          }
+        )
+      : await fetchWithDiagnostics(
+          "/api/site-context",
+          requestInit,
+          "대지 컨텍스트 요청에 실패했습니다."
+        );
+
+    let payload;
+
+    try {
+      payload = await response.json();
+    } catch (error) {
+      console.error("[request] /api/site-context returned invalid JSON", error);
+      throw new Error(
+        "대지 컨텍스트 응답을 해석하지 못했습니다. /api/site-context 응답이 JSON 형식인지 확인해주세요."
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(payload.error || "대지 컨텍스트 요청에 실패했습니다.");
+    }
+
+    if (!isSelectionRequestCurrent(selectionKey)) {
+      return payload;
+    }
+
+    const layerMode = requestOptions.layerMode || "site-context";
+    const parcelProperties = payload.parcelBoundary?.properties || {};
+    state.siteContext = {
+      ...payload,
+      layerMode,
+      disableAutoFit:
+        requestOptions.previewOnly === true
+          ? true
+          : payload.disableAutoFit === true,
+    };
+    const siteContextSignature = buildModelOptionsSignature(options);
+    state.siteContextOptionsSignature =
+      requestOptions.previewOnly === true
+        ? `preview:${siteContextSignature}`
+        : siteContextSignature;
+    state.selectedLocation = {
+      ...state.selectedLocation,
+      pnu:
+        state.selectedLocation?.pnu ||
+        parcelProperties.pnu ||
+        parcelProperties.PNU ||
+        "",
+      parcelAddress:
+        state.selectedLocation?.parcelAddress || parcelProperties.addr || "",
+    };
+    renderSiteContextMeta();
+    updateContextLayers(state.siteContext);
+    renderSelectionMeta();
+    renderSelectionSummary();
+    return state.siteContext;
+  })();
+
+  state.siteContextRequest = {
+    key: requestKey,
+    promise: requestPromise,
+  };
 
   try {
-    payload = await response.json();
-  } catch (error) {
-    console.error("[request] /api/site-context returned invalid JSON", error);
-    throw new Error(
-      "대지 컨텍스트 응답을 해석하지 못했습니다. /api/site-context 응답이 JSON 형식인지 확인해주세요."
-    );
+    return await requestPromise;
+  } finally {
+    if (state.siteContextRequest?.key === requestKey) {
+      state.siteContextRequest = null;
+    }
   }
-
-  if (!response.ok) {
-    throw new Error(payload.error || "대지 컨텍스트 요청에 실패했습니다.");
-  }
-
-  if (!isSelectionRequestCurrent(selectionKey)) {
-    return payload;
-  }
-
-  const parcelProperties = payload.parcelBoundary?.properties || {};
-  state.siteContext = payload;
-  state.siteContextOptionsSignature = buildModelOptionsSignature(options);
-  state.selectedLocation = {
-    ...state.selectedLocation,
-    pnu:
-      state.selectedLocation?.pnu ||
-      parcelProperties.pnu ||
-      parcelProperties.PNU ||
-      "",
-    parcelAddress:
-      state.selectedLocation?.parcelAddress || parcelProperties.addr || "",
-  };
-  renderSiteContextMeta();
-  updateContextLayers(payload);
-  renderSelectionMeta();
-  renderSelectionSummary();
-  return payload;
 }
 
-async function loadBuildingRegisterLegacy(
+async function loadBuildingRegisterCore(
   silent = false,
   selectionKey = getSelectionRequestKey()
 ) {
@@ -2158,176 +2906,9 @@ function downloadJson(filename, payload) {
   );
 }
 
-function openPendingWindowLegacy() {
-  const popup = window.open("", "_blank", "noopener,noreferrer");
-
-  if (!popup) {
-    return null;
-  }
-
-  popup.document.write(`
-    <!doctype html>
-    <html lang="ko">
-      <head>
-        <meta charset="utf-8" />
-        <title>불러오는 중</title>
-        <style>
-          body { font-family: 'Segoe UI', sans-serif; padding: 32px; color: #2e241c; }
-        </style>
-      </head>
-      <body>
-        <p>결과를 준비하는 중입니다...</p>
-      </body>
-    </html>
-  `);
-  popup.document.close();
-  return popup;
-}
-
-function renderPrintWindowLegacy(printWindow, title, bodyHtml) {
-  if (!printWindow || printWindow.closed) {
-    const fallbackDocument = window.document;
-    const originalHtml = fallbackDocument.documentElement.innerHTML;
-    fallbackDocument.open();
-    fallbackDocument.write(`
-      <!doctype html>
-      <html lang="ko">
-        <head>
-          <meta charset="utf-8" />
-          <title>${escapeHtml(title)}</title>
-          <style>
-            body { font-family: 'Pretendard Variable', 'Segoe UI', sans-serif; margin: 32px; color: #2e241c; }
-            h1, h2, p { margin: 0; }
-            h1 { font-size: 24px; margin-bottom: 8px; }
-            .meta { color: #6c5a49; margin-bottom: 20px; line-height: 1.6; }
-            .section { margin-top: 24px; }
-            .card { border: 1px solid #d7c5b2; border-radius: 16px; padding: 16px; margin-bottom: 14px; }
-            .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
-            .grid strong { display: block; font-size: 12px; color: #6c5a49; margin-bottom: 4px; }
-            .notice { margin-top: 24px; color: #6c5a49; font-size: 12px; }
-          </style>
-        </head>
-        <body>${bodyHtml}</body>
-      </html>
-    `);
-    fallbackDocument.close();
-    window.focus();
-    window.setTimeout(() => {
-      window.print();
-      window.location.reload();
-    }, 250);
-    return;
-  }
-
-  printWindow.document.write(`
-    <!doctype html>
-    <html lang="ko">
-      <head>
-        <meta charset="utf-8" />
-        <title>${escapeHtml(title)}</title>
-        <style>
-          body { font-family: 'Pretendard Variable', 'Segoe UI', sans-serif; margin: 32px; color: #2e241c; }
-          h1, h2, p { margin: 0; }
-          h1 { font-size: 24px; margin-bottom: 8px; }
-          .meta { color: #6c5a49; margin-bottom: 20px; line-height: 1.6; }
-          .section { margin-top: 24px; }
-          .card { border: 1px solid #d7c5b2; border-radius: 16px; padding: 16px; margin-bottom: 14px; }
-          .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
-          .grid strong { display: block; font-size: 12px; color: #6c5a49; margin-bottom: 4px; }
-          .notice { margin-top: 24px; color: #6c5a49; font-size: 12px; }
-        </style>
-      </head>
-      <body>${bodyHtml}</body>
-    </html>
-  `);
-  printWindow.document.close();
-  printWindow.focus();
-  window.setTimeout(() => {
-    printWindow.print();
-  }, 250);
-}
-
 async function ensureSiteContextLoaded(requestOptions = {}) {
   if (!hasFreshSiteContextForCurrentOptions()) {
     await loadSiteContext(getSelectionRequestKey(), requestOptions);
-  }
-}
-
-async function loadLandInfoLegacy(selectionKey = getSelectionRequestKey()) {
-  if (!state.selectedLocation) {
-    throw new Error("먼저 위치를 선택하세요.");
-  }
-
-  const location = { ...state.selectedLocation };
-  state.isLandInfoRequesting = true;
-
-  try {
-    let siteContext = state.siteContext;
-    let response = await fetch("/api/land-info", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        location,
-        siteContext,
-      }),
-    });
-    let payload = await response.json();
-
-    if (!response.ok && !selectionHasParcelReference(location) && !siteContext) {
-      await loadSiteContext(selectionKey);
-      siteContext = state.siteContext;
-
-      response = await fetch("/api/land-info", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          location,
-          siteContext,
-        }),
-      });
-      payload = await response.json();
-    }
-
-    if (
-      !response.ok &&
-      String(payload.error || "").includes("필지 식별정보") &&
-      !siteContext
-    ) {
-      await loadSiteContext(selectionKey);
-      siteContext = state.siteContext;
-
-      response = await fetch("/api/land-info", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          location,
-          siteContext,
-        }),
-      });
-      payload = await response.json();
-    }
-
-    if (!response.ok) {
-      throw new Error(payload.error || "토지정보 조회에 실패했습니다.");
-    }
-
-    if (!isSelectionRequestCurrent(selectionKey)) {
-      return payload;
-    }
-
-    state.landInfo = payload;
-    state.landInfoDetails = null;
-    renderLandInfo();
-    syncPanelStatusChips();
-    return payload;
-  } finally {
-    state.isLandInfoRequesting = false;
   }
 }
 
@@ -2505,38 +3086,6 @@ async function ensureLandInfoDetailsLoaded() {
   return state.landInfoDetails || state.landInfo;
 }
 
-async function refreshSelectionDataLegacy(selectionKey) {
-  const tasks = [
-    Promise.resolve().catch((error) => {
-      if (isSelectionRequestCurrent(selectionKey)) {
-        siteContextNote.textContent =
-          error instanceof Error ? error.message : "대지 컨텍스트를 불러오지 못했습니다.";
-      }
-    }),
-    loadLandInfo(selectionKey).catch((error) => {
-      if (isSelectionRequestCurrent(selectionKey)) {
-        landInfoNote.textContent =
-          error instanceof Error ? error.message : "토지정보를 불러오지 못했습니다.";
-      }
-    }),
-  ];
-
-  if (state.runtimeConfig?.futureSources?.hasBuildingHubKey) {
-    tasks.push(
-      loadBuildingRegister(true, selectionKey).catch((error) => {
-        if (isSelectionRequestCurrent(selectionKey)) {
-          buildingRegisterNote.textContent =
-            error instanceof Error
-              ? error.message
-              : "건축물대장 요약을 불러오지 못했습니다.";
-        }
-      })
-    );
-  }
-
-  await Promise.allSettled(tasks);
-}
-
 function buildLandInfoHandoffUrl(landInfo) {
   const params = new URLSearchParams({
     pnu: landInfo?.parcelReference?.pnu || "",
@@ -2545,40 +3094,6 @@ function buildLandInfoHandoffUrl(landInfo) {
   });
 
   return `/handoff/eum?${params.toString()}`;
-}
-
-async function openLandUseDetailLegacy(popup = null) {
-  await ensureLandInfoLoaded();
-  const targetUrl = buildLandInfoHandoffUrl(state.landInfo);
-
-  if (popup && !popup.closed) {
-    popup.location.replace(targetUrl);
-    return;
-  }
-
-  window.location.assign(targetUrl);
-}
-
-async function openLandMapLegacy(popup = null) {
-  await ensureLandInfoLoaded();
-
-  if (popup && !popup.closed) {
-    popup.location.replace(state.landInfo.official.mapUrl);
-    return;
-  }
-
-  window.location.assign(state.landInfo.official.mapUrl);
-}
-
-async function openLandIssueLegacy(popup = null) {
-  await ensureLandInfoLoaded();
-
-  if (popup && !popup.closed) {
-    popup.location.replace(state.landInfo.official.issueUrl);
-    return;
-  }
-
-  window.location.assign(state.landInfo.official.issueUrl);
 }
 
 function showPopupBlockedMessage() {
@@ -2715,465 +3230,45 @@ async function openLandIssue(popup = null) {
   popup.location.replace(state.landInfo.official.issueUrl);
 }
 
-async function generateModelSpecLegacy() {
-  if (!state.selectedLocation) {
-    window.alert("먼저 위치를 선택하세요.");
-    return;
-  }
-
-  await ensureSiteContextLoaded();
-
-  const options = collectModelOptions();
-  const response = await fetch("/api/model-spec", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      location: state.selectedLocation,
-      options,
-      siteContext: state.siteContext,
-    }),
-  });
-
-  const payload = await response.json();
-
-  if (!response.ok) {
-    throw new Error(payload.error || "3D 스펙 생성에 실패했습니다.");
-  }
-
-  state.latestSpec = payload;
-  const exportFormat = String(options.exportFormat || "3dm").toUpperCase();
-  specPreview.textContent =
-    `3D 추출 준비가 완료되었습니다. ` +
-    `범위 사각 ${Number(payload.options?.radius || 0).toLocaleString("ko-KR")}m, ` +
-    `대지 ${Number(payload.siteContextSummary?.parcelAreaSqm || 0).toLocaleString("ko-KR")}㎡, ` +
-    `표고 ${formatElevationRange(
-      payload.siteContextSummary?.minElevation,
-      payload.siteContextSummary?.maxElevation
-    )}, ` +
-    `건물 ${payload.siteContextSummary?.buildingCount || 0}개입니다. ` +
-    `${exportFormat} 파일 다운로드 버튼으로 바로 추출하세요.`;
-}
-
 async function downloadSiteContext() {
   await ensureSiteContextLoaded();
   downloadJson(`site-context-${Date.now()}.json`, state.siteContext);
 }
 
-async function downloadObjLegacy() {
-  if (!state.selectedLocation) {
-    window.alert("먼저 위치를 선택하세요.");
-    return;
-  }
-
-  await ensureSiteContextLoaded();
-  const options = collectModelOptions();
-
-  const response = await fetchWithDiagnostics(
-    "/api/export-model",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        location: state.selectedLocation,
-        options,
-        siteContext: state.siteContext,
-      }),
-    },
-    "3D 파일 다운로드에 실패했습니다."
-  );
-
-  if (!response.ok) {
-    const payload = await response.json();
-    throw new Error(payload.error || "3D 파일 다운로드에 실패했습니다.");
-  }
-
-  const filename =
-    response.headers.get("X-Export-Filename") ||
-    `site-context-${Date.now()}.${options.exportFormat || "3dm"}`;
-  const blob = await response.blob();
-  downloadBlob(filename, blob);
-}
-
-async function generateModelSpec() {
-  if (!state.selectedLocation) {
-    window.alert("먼저 위치를 선택해 주세요.");
-    return;
-  }
-
-  startModelProgress("preview", "범위와 버퍼를 계산하는 중입니다...");
-  specPreview.textContent = "현재 범위 조건으로 대지, 지형, 건물 컨텍스트를 다시 불러오는 중입니다.";
-
-  try {
-    await loadSiteContext(getSelectionRequestKey(), {
-      useModelProgress: true,
-      rangeStart: 6,
-      rangeEnd: 96,
-    });
-    advanceModelProgress(82, "추출 범위를 지도에 반영하는 중입니다...");
-    state.latestSpec = {
-      appliedAt: new Date().toISOString(),
-      options: collectModelOptions(),
-      siteContextSummary: state.siteContext?.stats || {},
-    };
-    specPreview.textContent = `${buildAppliedModelSummary()} OBJ 또는 3DM 다운로드로 바로 추출할 수 있습니다.`;
-    finishModelProgress("범위 적용이 완료되었습니다.");
-  } catch (error) {
-    failModelProgress(
-      error instanceof Error ? error.message : "범위 적용 중 문제가 발생했습니다."
-    );
-    throw error;
-  }
-}
-
-async function downloadObj(exportFormat = "obj") {
-  if (!state.selectedLocation) {
-    window.alert("먼저 위치를 선택해 주세요.");
-    return;
-  }
-
-  const normalizedFormat =
-    String(exportFormat || "obj").toLowerCase() === "3dm" ? "3dm" : "obj";
-  const needsFreshSiteContext = !hasFreshSiteContextForCurrentOptions();
-  const progressOperationKey =
-    normalizedFormat === "3dm"
-      ? needsFreshSiteContext
-        ? "export-3dm"
-        : "export-3dm-cached"
-      : needsFreshSiteContext
-        ? "export-obj"
-        : "export-obj-cached";
-
-  startModelProgress(
-    progressOperationKey,
-    normalizedFormat === "3dm"
-      ? "3DM 파일을 준비하는 중입니다..."
-      : "OBJ 파일을 준비하는 중입니다..."
-  );
-  advanceModelProgress(
-    18,
-    needsFreshSiteContext
-      ? "현재 범위의 대지 컨텍스트를 계산하는 중입니다..."
-      : "저장된 대지 컨텍스트를 확인하는 중입니다..."
-  );
-
-  try {
-    await ensureSiteContextLoaded({
-      useModelProgress: true,
-      rangeStart: 6,
-      rangeEnd: 42,
-    });
-    advanceModelProgress(46, "3D 파일 생성 요청을 시작하는 중입니다...");
-
-    const options = {
-      ...collectModelOptions(),
-      exportFormat: normalizedFormat,
-    };
-    const response = await fetchWithModelProgress(
-      "/api/export-model",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          location: state.selectedLocation,
-          options,
-          siteContext: state.siteContext,
-        }),
-      },
-      "3D 파일 다운로드에 실패했습니다.",
-      {
-        rangeStart: needsFreshSiteContext ? 46 : 6,
-        rangeEnd: 96,
-      }
-    );
-
-    if (!response.ok) {
-      const payload = await response.json();
-      throw new Error(payload.error || "3D 파일 다운로드에 실패했습니다.");
-    }
-
-    const filename =
-      response.headers.get("X-Export-Filename") ||
-      `site-context-${Date.now()}.${normalizedFormat}`;
-    advanceModelProgress(98, "파일을 내려받을 준비를 하는 중입니다...");
-    const blob = await response.blob();
-    downloadBlob(filename, blob);
-    specPreview.textContent = `${buildAppliedModelSummary()} ${normalizedFormat.toUpperCase()} 다운로드를 시작했습니다.`;
-    finishModelProgress(
-      normalizedFormat === "3dm"
-        ? "3DM 다운로드를 시작했습니다."
-        : "OBJ 다운로드를 시작했습니다."
-    );
-  } catch (error) {
-    failModelProgress(
-      error instanceof Error ? error.message : "3D 파일 다운로드에 실패했습니다."
-    );
-    throw error;
-  }
-}
 
 function scheduleSearch() {
+  if (!searchInput || !searchResults) {
+    return;
+  }
+
   const query = searchInput.value.trim();
 
   if (state.searchDebounceId) {
     window.clearTimeout(state.searchDebounceId);
+    state.searchDebounceId = null;
   }
 
-  if (query.length < 2) {
-    searchResults.innerHTML =
-      '<p class="search-results-empty">두 글자 이상 입력하면 추천 검색 결과가 표시됩니다.</p>';
+  if (!query) {
+    clearPreviewMarker();
+    state.pendingSearchSelectionId = "";
+    state.searchResultItems = [];
+    searchResults.innerHTML = "";
+    setSearchSelectionCardVisible(false);
     return;
   }
 
-  state.searchDebounceId = window.setTimeout(async () => {
-    state.searchRequestId += 1;
-    const currentRequestId = state.searchRequestId;
-    searchResults.innerHTML =
-      '<p class="search-results-empty">추천 결과를 불러오는 중입니다...</p>';
-
-    try {
-      await geocodeAddress(query, currentRequestId);
-    } catch (error) {
-      if (currentRequestId !== state.searchRequestId) {
-        return;
-      }
-
-      searchResults.innerHTML = `
-        <p class="search-results-empty">
-          ${escapeHtml(error instanceof Error ? error.message : "검색에 실패했습니다.")}
-        </p>
-      `;
-    }
-  }, 280);
-}
-
-function attachEventsLegacy() {
-  searchForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-
-    const query = new FormData(searchForm).get("query")?.toString().trim();
-
-    if (!query) {
-      return;
-    }
-
-    state.searchRequestId += 1;
-    const currentRequestId = state.searchRequestId;
-    searchResults.innerHTML =
-      '<p class="search-results-empty">검색 결과를 불러오는 중입니다...</p>';
-
-    try {
-      await geocodeAddress(query, currentRequestId);
-    } catch (error) {
-      searchResults.innerHTML = `
-        <p class="search-results-empty">
-          ${escapeHtml(error instanceof Error ? error.message : "검색에 실패했습니다.")}
-        </p>
-      `;
-    }
-  });
-
-  searchInput.addEventListener("input", () => {
-    scheduleSearch();
-  });
-
-  modelForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-
-    try {
-      await generateModelSpec();
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : "3D 스펙 생성에 실패했습니다.");
-    }
-  });
-
-  modelForm.addEventListener("input", () => {
-    markModelOptionsDirty();
-  });
-
-  modelForm.addEventListener("change", () => {
-    markModelOptionsDirty();
-  });
-
-  loadSiteContextButton.addEventListener("click", async () => {
-    try {
-      await loadSiteContext();
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : "대지 컨텍스트 불러오기에 실패했습니다.");
-    }
-  });
-
-  previewSiteContextButton.addEventListener("click", async () => {
-    try {
-      await loadSiteContext();
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : "대지 컨텍스트 불러오기에 실패했습니다.");
-    }
-  });
-
-  downloadSiteContextButton.addEventListener("click", async () => {
-    try {
-      await downloadSiteContext();
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : "컨텍스트 JSON 다운로드에 실패했습니다.");
-    }
-  });
-
-  downloadObjButton.addEventListener("click", async () => {
-    try {
-      await downloadObj();
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : "3D 파일 다운로드에 실패했습니다.");
-    }
-  });
-
-  clearHistoryButton.addEventListener("click", () => {
-    state.history = [];
-    saveHistory();
-    renderHistory();
-  });
-
-  loadLandInfoButton.addEventListener("click", async () => {
-    try {
-      await loadLandInfo();
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : "토지정보 조회에 실패했습니다.");
-    }
-  });
-
-  document.querySelector("#showLandInfoDetailsButton")?.addEventListener("click", async () => {
-    const popup = openPendingWindow("토지이음 상세 정보");
-
-    try {
-      await openLandInfoDetails(popup);
-    } catch (error) {
-      if (popup && !popup.closed) {
-        popup.close();
-      }
-      window.alert(error instanceof Error ? error.message : "토지이음 상세 정보를 여는 데 실패했습니다.");
-    }
-  });
-
-  openLandUseDetailButton.addEventListener("click", async () => {
-    const popup = openPendingWindow();
-
-    try {
-      await openLandUseDetail(popup);
-    } catch (error) {
-      if (popup && !popup.closed) {
-        popup.close();
-      }
-      window.alert(error instanceof Error ? error.message : "토지이음 결과 열기에 실패했습니다.");
-    }
-  });
-
-  openLandMapButton.addEventListener("click", async () => {
-    const popup = openPendingWindow();
-
-    try {
-      await openLandMap(popup);
-    } catch (error) {
-      if (popup && !popup.closed) {
-        popup.close();
-      }
-      window.alert(error instanceof Error ? error.message : "도면 크게보기에 실패했습니다.");
-    }
-  });
-
-  openLandIssueButton.addEventListener("click", async () => {
-    const popup = openPendingWindow();
-
-    try {
-      await openLandIssue(popup);
-    } catch (error) {
-      if (popup && !popup.closed) {
-        popup.close();
-      }
-      window.alert(error instanceof Error ? error.message : "확인서 발급 안내 열기에 실패했습니다.");
-    }
-  });
-
-  loadBuildingRegisterButton.addEventListener("click", async () => {
-    try {
-      await loadBuildingRegister();
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : "건축물대장 조회에 실패했습니다.");
-    }
-  });
-
-  printBuildingRegisterButton.addEventListener("click", async () => {
-    const popup = openPendingWindow();
-
-    try {
-      await printBuildingRegister(popup);
-    } catch (error) {
-      if (popup && !popup.closed) {
-        popup.close();
-      }
-      window.alert(error instanceof Error ? error.message : "건축물대장 요약 인쇄에 실패했습니다.");
-    }
-  });
-
-  openOfficialBuildingRegisterButton.addEventListener("click", () => {
-    openOfficialBuildingRegister();
-  });
-}
-
-function createMapLegacy(config) {
-  const map = L.map("map", {
-    zoomControl: false,
-  }).setView(
-    [config.map.initialCenter.lat, config.map.initialCenter.lng],
-    config.map.initialZoom
-  );
-
-  L.control.zoom({ position: "bottomright" }).addTo(map);
-
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 20,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>',
-  }).addTo(map);
-
-  map.on("click", async (event) => {
-    const { lat, lng } = event.latlng;
-
-    selectionSummary.textContent = "선택한 위치의 주소를 확인하는 중입니다...";
-
-    try {
-      const location = await reverseGeocode(lat, lng);
-      setSelectedLocation(location, false);
-    } catch {
-      setSelectedLocation(
-        {
-          id: `manual-${lat}-${lng}`,
-          label: `${formatCoord(lat)}, ${formatCoord(lng)}`,
-          roadAddress: "",
-          parcelAddress: "",
-          lat,
-          lng,
-          provider: "manual",
-          searchType: "mixed",
-        },
-        false
-      );
-    }
-  });
-
-  state.map = map;
+  setActionFeedback("검색어를 입력한 뒤 검색 버튼을 눌러 결과를 확인하세요.");
 }
 
 function updateDownloadButtonLabel() {
   if (downloadObjButton) {
-    downloadObjButton.textContent = "OBJ 파일 다운로드";
+    downloadObjButton.textContent = "3D 파일 다운로드";
   }
 
   if (download3dmButton) {
-    download3dmButton.textContent = "3DM 파일 다운로드";
+    download3dmButton.classList.add("visually-hidden");
+    download3dmButton.setAttribute("aria-hidden", "true");
+    download3dmButton.disabled = true;
   }
 
   if (previewSiteContextButton) {
@@ -3207,84 +3302,372 @@ function syncPanelStatusChips() {
   }
 }
 
-function prepareModelFormUi() {
-  const terrainModeField = modelForm.querySelector('select[name="terrainMode"]');
-  const exportFormatField = modelForm.querySelector('select[name="exportFormat"]');
-  const contourIntervalField = modelForm.querySelector('input[name="contourInterval"]');
-  const submitButton = modelForm.querySelector('button[type="submit"]');
-  const sidePanel = document.querySelector(".side-panel");
-  const landCard = loadLandInfoButton?.closest(".card");
-  const buildingCard = loadBuildingRegisterButton?.closest(".card");
-  const modelCard = modelForm?.closest(".card");
-  const landHeader = landCard?.querySelector(".card-header > div");
-  const landCardHeader = landCard?.querySelector(".card-header");
-  const buildingHeader = buildingCard?.querySelector(".card-header > div");
-  const showLandInfoDetailsButton = document.querySelector("#showLandInfoDetailsButton");
+function createModelOptionLabel(name, title, options, value) {
+  const label = document.createElement("label");
+  const caption = document.createElement("span");
+  const select = document.createElement("select");
 
-  terrainModeField?.closest("label")?.remove();
-  exportFormatField?.closest("label")?.remove();
-  contourIntervalField?.closest("label")?.remove();
-  submitButton?.remove();
+  label.dataset.modelOption = name;
+  caption.textContent = title;
+  select.name = name;
 
-  modelCard?.classList.add("model-card");
-  buildingCard?.classList.add("building-card");
-  landCard?.classList.add("land-card");
+  for (const option of options) {
+    const optionElement = document.createElement("option");
+    optionElement.value = option.value;
+    optionElement.textContent = option.label;
 
-  if (sidePanel) {
-    [modelCard, buildingCard, landCard]
-      .filter(Boolean)
-      .forEach((card) => sidePanel.append(card));
-  }
-
-  if (loadBuildingRegisterButton) {
-    loadBuildingRegisterButton.textContent = "대장 요약";
-  }
-
-  if (showBuildingRegisterDetailsButton) {
-    showBuildingRegisterDetailsButton.textContent = "상세 정보";
-  }
-
-  printBuildingRegisterButton?.remove();
-
-  if (loadLandInfoButton) {
-    loadLandInfoButton.textContent = "토지 요약";
-  }
-
-  let detailButton = showLandInfoDetailsButton;
-
-  if (!detailButton && loadLandInfoButton) {
-    detailButton = document.createElement("button");
-    detailButton.type = "button";
-    detailButton.id = "showLandInfoDetailsButton";
-    detailButton.className = "secondary-button";
-    detailButton.textContent = "상세 정보";
-  }
-
-  detailButton?.classList.add("secondary-button");
-
-  if (openLandUseDetailButton) {
-    openLandUseDetailButton.textContent = "토지이음 공식 열람";
-    openLandUseDetailButton.classList.add("secondary-button");
-  }
-
-  openLandMapButton?.remove();
-  openLandIssueButton?.remove();
-
-  if (landCardHeader && loadLandInfoButton && detailButton && openLandUseDetailButton) {
-    let actionRow = landCardHeader.querySelector(".button-row.compact-row");
-
-    if (!actionRow) {
-      actionRow = document.createElement("div");
-      actionRow.className = "button-row compact-row";
-      landCardHeader.append(actionRow);
+    if (option.value === value) {
+      optionElement.selected = true;
     }
 
-    actionRow.replaceChildren(loadLandInfoButton, detailButton, openLandUseDetailButton);
+    select.append(optionElement);
   }
 
-  ensureStatusChip("landInfoStatusChip", landHeader);
-  document.querySelector("#buildingInfoStatusChip")?.remove();
-  syncPanelStatusChips();
+  label.append(caption, select);
+  return label;
+}
+
+function ensureModelFormOptionLayout() {
+  if (!modelForm) {
+    return;
+  }
+
+  const radiusLabel = modelForm.querySelector('input[name="radius"]')?.closest("label");
+  const contourLabel = modelForm
+    .querySelector('[name="contourInterval"]')
+    ?.closest("label");
+  const toggleGrid = modelForm.querySelector(".toggle-grid");
+  const splitParcelLabel = modelForm.querySelector(
+    '[data-model-option="splitParcelBoundary"]'
+  );
+  const splitParcelInput = splitParcelLabel?.querySelector(
+    'input[name="splitParcelBoundary"]'
+  );
+  const legacyTerrainLabel = modelForm.querySelector('[data-model-option="terrainMode"]');
+  const previewButtonRow = modelForm.querySelector(".button-row");
+  const legacyIncludeTitle =
+    toggleGrid?.previousElementSibling?.classList?.contains("form-section-title")
+      ? toggleGrid.previousElementSibling
+      : null;
+
+  if (legacyTerrainLabel) {
+    legacyTerrainLabel.remove();
+  }
+
+  if (splitParcelLabel && splitParcelInput) {
+    let caption = splitParcelLabel.querySelector(".checkbox-label");
+
+    if (!caption) {
+      caption = document.createElement("span");
+      caption.className = "checkbox-label";
+      splitParcelLabel.append(caption);
+    }
+
+    caption.textContent = "대지 경계 분할";
+  }
+
+  toggleGrid
+    ?.querySelectorAll('label.checkbox:not([data-model-option="splitParcelBoundary"])')
+    .forEach((label) => label.remove());
+  legacyIncludeTitle?.remove();
+  toggleGrid?.remove();
+
+  let buildingPlacementLabel = modelForm.querySelector(
+    '[data-model-option="buildingPlacement"]'
+  );
+
+  if (!buildingPlacementLabel) {
+    buildingPlacementLabel = createModelOptionLabel(
+      "buildingPlacement",
+      "건물 배치",
+      [
+        { value: "dominant", label: "기준 레벨" },
+        { value: "embed-lowest", label: "최저 레벨" },
+      ],
+      "dominant"
+    );
+  }
+
+  let exportLabel = modelForm.querySelector('[data-model-option="exportFormat"]');
+
+  if (!exportLabel) {
+    exportLabel = createModelOptionLabel(
+      "exportFormat",
+      "파일 형식",
+      [
+        { value: "3dm", label: "3DM" },
+        { value: "obj", label: "OBJ" },
+        { value: "dxf", label: "DXF (2D CAD)" },
+        { value: "skp", label: "SKP (SketchUp)" },
+      ],
+      "3dm"
+    );
+  }
+
+  contourLabel?.classList.add("contour-interval-field");
+  radiusLabel?.classList.add("range-field");
+  previewSiteContextButton?.classList.remove("secondary-button");
+  downloadObjButton?.classList.remove("secondary-button");
+  previewSiteContextButton?.classList.add("link-button", "primary-action-button");
+  downloadObjButton?.classList.add("link-button", "primary-action-button");
+
+  let rangeSection = modelForm.querySelector(".range-action-section");
+
+  if (!rangeSection) {
+    rangeSection = document.createElement("div");
+    rangeSection.className = "form-section range-action-section";
+    rangeSection.innerHTML = `
+      <p class="form-section-title">범위 설정</p>
+      <div class="range-action-grid"></div>
+    `;
+    modelForm.prepend(rangeSection);
+  }
+
+  const rangeGrid = rangeSection.querySelector(".range-action-grid");
+
+  if (rangeGrid && radiusLabel) {
+    rangeGrid.append(radiusLabel);
+  }
+
+  if (rangeGrid && contourLabel) {
+    rangeGrid.append(contourLabel);
+  }
+
+  let previewButtonWrap = modelForm.querySelector(".preview-button-wrap");
+
+  if (!previewButtonWrap) {
+    previewButtonWrap = document.createElement("div");
+    previewButtonWrap.className = "button-slot preview-button-wrap";
+  }
+
+  if (previewSiteContextButton && previewButtonWrap) {
+    previewButtonWrap.append(previewSiteContextButton);
+  }
+
+  if (rangeGrid && previewButtonWrap) {
+    rangeGrid.append(previewButtonWrap);
+  }
+
+  if (modelProgressBar && modelProgressBar.parentElement !== rangeSection) {
+    rangeSection.append(modelProgressBar);
+  }
+
+  let exportSection = modelForm.querySelector(".output-section");
+
+  if (!exportSection) {
+    exportSection = document.createElement("div");
+    exportSection.className = "form-section output-section";
+    exportSection.innerHTML = `
+      <p class="form-section-title">출력 옵션</p>
+      <div class="output-grid"></div>
+      <div class="download-action-grid"></div>
+    `;
+    modelForm.append(exportSection);
+  }
+
+  const outputGrid = exportSection.querySelector(".output-grid");
+
+  if (outputGrid) {
+    if (splitParcelLabel) {
+      outputGrid.append(splitParcelLabel);
+    }
+
+    outputGrid.append(buildingPlacementLabel, exportLabel);
+  }
+
+  let downloadButtonWrap = modelForm.querySelector(".download-button-wrap");
+
+  if (!downloadButtonWrap) {
+    downloadButtonWrap = document.createElement("div");
+    downloadButtonWrap.className = "button-slot download-button-wrap";
+  }
+
+  if (downloadObjButton && downloadButtonWrap) {
+    downloadButtonWrap.append(downloadObjButton);
+  }
+
+  ensureExportProgressUi(exportSection);
+  exportSection.querySelector(".download-action-grid")?.append(downloadButtonWrap);
+
+  if (previewButtonRow) {
+    previewButtonRow.remove();
+  }
+}
+
+function prepareModelFormUi() {
+  ensureModelFormOptionLayout();
+  syncContourIntervalInput();
+  syncSelectionModeFormState();
+
+  if (download3dmButton) {
+    download3dmButton.classList.add("visually-hidden");
+    download3dmButton.setAttribute("aria-hidden", "true");
+    download3dmButton.disabled = true;
+  }
+
+  if (state.latestSpec?.summary) {
+    specPreview.textContent = state.latestSpec.summary;
+    return;
+  }
+
+  if (state.siteContext) {
+    specPreview.textContent = buildAppliedModelSummary(state.siteContext);
+    return;
+  }
+
+  specPreview.textContent =
+    "범위 설정을 누르면 현재 반경, 표고, 포함 건물 수를 먼저 확인할 수 있습니다.";
+}
+
+function resolveDownloadFilename(response, fallbackFormat) {
+  const disposition = String(response.headers.get("Content-Disposition") || "");
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      // Fall through to the legacy filename parser.
+    }
+  }
+
+  const match = disposition.match(/filename=\"?([^\";]+)\"?/i);
+
+  if (match?.[1]) {
+    return match[1];
+  }
+
+  const options = collectModelOptions();
+  const location = state.selectedLocation || {};
+  const addressPart = (
+    normalizeSystemAddress(location.parcelAddress || location.roadAddress || location.label || "")
+      .replace(/[<>:"/\\|?*\u0000-\u001F]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim() || "site-context"
+  );
+  const radiusPart = `${Math.max(0, Math.round(Number(options.radius) || 0))}m`;
+  const intervalPart = `${normalizeContourInterval(options.contourInterval)}m`;
+  const parts = [addressPart, radiusPart, intervalPart];
+
+  if (options.splitParcelBoundary === true && !isRangeSelection(location)) {
+    parts.push("분절");
+  }
+
+  return `${parts.join("_")}.${normalizeExportFormat(fallbackFormat)}`;
+}
+
+async function generateModelSpec() {
+  if (!state.selectedLocation) {
+    throw new Error("먼저 위치를 선택하세요.");
+  }
+
+  const operationKey = "preview";
+  const startedAt = performance.now();
+  startModelProgress(operationKey, "대지, 지형, 건물 컨텍스트를 준비하는 중입니다.", {
+    startValue: 8,
+    maxValue: 94,
+  });
+
+  try {
+    const siteContext = await loadSiteContext(getSelectionRequestKey(), {
+      useModelProgress: true,
+      rangeStart: 10,
+      rangeEnd: 92,
+    });
+    const options = collectModelOptions();
+    const summary = buildAppliedModelSummary(siteContext, options);
+    state.latestSpec = {
+      generatedAt: Date.now(),
+      options,
+      summary,
+    };
+    specPreview.textContent = summary;
+    finishModelProgress("범위 적용이 완료되었습니다.");
+    rememberModelProgressEstimate(operationKey, performance.now() - startedAt);
+    return siteContext;
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "범위 적용에 실패했습니다.";
+    failModelProgress(message);
+    specPreview.textContent = message;
+    throw error;
+  }
+}
+
+async function downloadObj(format = collectModelOptions().exportFormat) {
+  if (!state.selectedLocation) {
+    throw new Error("먼저 위치를 선택하세요.");
+  }
+
+  const normalizedFormat = normalizeExportFormat(format);
+  const currentOptions = {
+    ...collectModelOptions(),
+    exportFormat: normalizedFormat,
+  };
+  const needsRefresh = !hasFreshSiteContextForCurrentOptions();
+  const operationKey = `export-${normalizedFormat}${needsRefresh ? "" : "-cached"}`;
+  const startedAt = performance.now();
+  startModelProgress(
+    operationKey,
+    `${describeExportFormat(normalizedFormat)} 파일을 준비하는 중입니다.`,
+    {
+      startValue: 8,
+      maxValue: 96,
+    }
+  );
+
+  try {
+    if (needsRefresh) {
+      await loadSiteContext(getSelectionRequestKey(), {
+        useModelProgress: true,
+        rangeStart: 10,
+        rangeEnd: 42,
+      });
+    }
+
+    const response = await fetchWithModelProgress(
+      "/api/export-model",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          location: state.selectedLocation,
+          siteContext: state.siteContext,
+          options: currentOptions,
+        }),
+      },
+      `${describeExportFormat(normalizedFormat)} 파일 다운로드에 실패했습니다.`,
+      {
+        rangeStart: 42,
+        rangeEnd: 98,
+      }
+    );
+
+    const blob = await response.blob();
+    const filename = resolveDownloadFilename(response, normalizedFormat);
+    downloadBlob(filename, blob);
+
+    const summary = buildAppliedModelSummary(state.siteContext, currentOptions);
+    state.latestSpec = {
+      generatedAt: Date.now(),
+      options: currentOptions,
+      summary,
+    };
+    specPreview.textContent = `${summary}, ${describeExportFormat(normalizedFormat)} 다운로드를 시작했습니다.`;
+    finishModelProgress(
+      `${describeExportFormat(normalizedFormat)} 파일 다운로드를 시작했습니다.`
+    );
+    rememberModelProgressEstimate(operationKey, performance.now() - startedAt);
+  } catch (error) {
+    const message =
+      error instanceof Error
+        ? error.message
+        : `${describeExportFormat(normalizedFormat)} 파일 다운로드에 실패했습니다.`;
+    failModelProgress(message);
+    throw error;
+  }
 }
 
 async function loadBuildingRegister(
@@ -3292,57 +3675,116 @@ async function loadBuildingRegister(
   selectionKey = getSelectionRequestKey()
 ) {
   try {
-    return await loadBuildingRegisterLegacy(silent, selectionKey);
+    return await loadBuildingRegisterCore(silent, selectionKey);
   } finally {
     syncPanelStatusChips();
   }
 }
 
 function attachEvents() {
-  searchForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
+  if (state.eventsBound) {
+    return;
+  }
 
-    const query = new FormData(searchForm).get("query")?.toString().trim();
+  state.eventsBound = true;
+  let searchSubmissionInFlight = false;
+  ensureSearchSelectionCard();
 
-    if (!query) {
+  console.info("[search-ui] events attached", {
+    hasSearchForm: Boolean(searchForm),
+    hasSearchInput: Boolean(searchInput),
+    hasSearchResults: Boolean(searchResults),
+  });
+
+  const runSearch = async (source = "submit") => {
+    if (searchSubmissionInFlight) {
       return;
     }
 
-    state.searchRequestId += 1;
-    const currentRequestId = state.searchRequestId;
-    searchResults.innerHTML =
-      '<p class="search-results-empty">검색 결과를 불러오는 중입니다...</p>';
+    if (state.searchDebounceId) {
+      window.clearTimeout(state.searchDebounceId);
+      state.searchDebounceId = null;
+    }
+
+    const query = searchInput?.value?.trim();
+
+    if (!query) {
+      setSearchSelectionCardVisible(false);
+      return;
+    }
+
+    searchSubmissionInFlight = true;
+    console.info(`[search-ui] ${source} query="${query}"`);
+    clearSelectionForSearch();
 
     try {
-      const payload = await geocodeAddress(query, currentRequestId);
+      state.searchRequestId += 1;
+      const currentRequestId = state.searchRequestId;
+      const cacheKey = buildSearchCacheKey(query);
+      const cachedPayload = state.searchCache.get(cacheKey) || null;
+      setSearchSelectionCardVisible(true);
+      searchResults.innerHTML =
+        '<p class="search-results-empty">검색 결과를 불러오는 중입니다...</p>';
+      const payload =
+        cachedPayload || (await geocodeAddress(query, currentRequestId));
 
-      if (payload?.results?.length) {
-        setSelectedLocation(payload.results[0]);
+      if (!cachedPayload && payload?.results) {
+        state.searchCache.set(cacheKey, payload);
+      }
+
+      console.info(
+        `[search-ui] results=${Number(payload?.results?.length || 0)} provider="${
+          payload?.provider || "unknown"
+        }"`
+      );
+
+      if ((payload?.results?.length || 0) === 1) {
+        const firstResult = payload.results[0];
+        state.pendingSearchSelectionId = firstResult.id || "";
+        renderSearchResults(payload.results, payload.provider || "search");
         setActionFeedback(
-          `검색 결과 1순위를 바로 선택했습니다: ${buildSelectionLabel(payload.results[0])}`
+          `검색 결과 1건을 찾았습니다. "${buildSelectionLabel(firstResult)}"를 지도에서 확인한 뒤 "이 주소 확정"을 눌러주세요.`
+        );
+        return;
+      } else if ((payload?.results?.length || 0) > 1) {
+        state.pendingSearchSelectionId = payload.results[0]?.id || "";
+        renderSearchResults(payload.results, payload.provider || "search");
+        setActionFeedback(
+          `검색 결과가 ${payload.results.length}개입니다. 목록에서 정확한 대상을 선택해 주세요.`
         );
       }
     } catch (error) {
+      console.error("[search-ui] failed", error);
       searchResults.innerHTML = `
         <p class="search-results-empty">
           ${escapeHtml(error instanceof Error ? error.message : "검색에 실패했습니다.")}
         </p>
       `;
+    } finally {
+      searchSubmissionInFlight = false;
     }
+  };
+
+  searchForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await runSearch("submit");
   });
 
-  searchInput.addEventListener("input", () => {
+  searchInput?.addEventListener("input", () => {
+    console.info("[search-ui] input");
     scheduleSearch();
   });
 
-  modelForm.addEventListener("input", () => {
+  modelForm?.addEventListener("input", () => {
     syncContourIntervalInput();
     markModelOptionsDirty();
+    updateDownloadButtonLabel();
   });
 
-  modelForm.addEventListener("change", () => {
+  modelForm?.addEventListener("change", () => {
     syncContourIntervalInput();
     markModelOptionsDirty();
+    updateDownloadButtonLabel();
   });
 
   loadSiteContextButton?.addEventListener("click", async () => {
@@ -3373,27 +3815,19 @@ function attachEvents() {
 
   downloadObjButton?.addEventListener("click", async () => {
     try {
-      await downloadObj("obj");
+      await downloadObj(collectModelOptions().exportFormat);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "OBJ 파일 다운로드에 실패했습니다.");
     }
   });
 
-  download3dmButton?.addEventListener("click", async () => {
-    try {
-      await downloadObj("3dm");
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : "3DM 파일 다운로드에 실패했습니다.");
-    }
-  });
-
-  clearHistoryButton.addEventListener("click", () => {
+  clearHistoryButton?.addEventListener("click", () => {
     state.history = [];
     saveHistory();
     renderHistory();
   });
 
-  loadLandInfoButton.addEventListener("click", async () => {
+  loadLandInfoButton?.addEventListener("click", async () => {
     try {
       await loadLandInfo();
     } catch (error) {
@@ -3427,7 +3861,7 @@ function attachEvents() {
     }
   });
 
-  loadBuildingRegisterButton.addEventListener("click", async () => {
+  loadBuildingRegisterButton?.addEventListener("click", async () => {
     try {
       await loadBuildingRegister();
     } catch (error) {
@@ -3463,9 +3897,136 @@ function attachEvents() {
     }
   });
 
-  openOfficialBuildingRegisterButton.addEventListener("click", () => {
+  openOfficialBuildingRegisterButton?.addEventListener("click", () => {
     openOfficialBuildingRegister();
   });
+}
+
+function updateMapModeControlUi() {
+  document
+    .querySelectorAll("[data-map-selection-mode]")
+    .forEach((button) => {
+      const isActive = button.dataset.mapSelectionMode === state.mapSelectionMode;
+      button.classList.toggle("is-active", isActive);
+      button.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
+}
+
+function setMapSelectionMode(mode = "address") {
+  state.mapSelectionMode = mode === "range" ? "range" : "address";
+  state.manualRangePoints = [];
+  clearPreviewMarker();
+  clearRangeDraftLayer();
+
+  if (state.map?.doubleClickZoom) {
+    if (state.mapSelectionMode === "range") {
+      state.map.doubleClickZoom.disable();
+    } else {
+      state.map.doubleClickZoom.enable();
+    }
+  }
+
+  updateMapModeControlUi();
+
+  setActionFeedback(
+    state.mapSelectionMode === "range"
+      ? "범위 지정 모드입니다. 지도에서 첫 번째 점과 두 번째 점을 차례로 클릭하면 사각형 범위가 확정됩니다."
+      : "주소 선택 모드입니다. 지도에서 위치를 클릭하면 해당 주소를 바로 선택합니다."
+  );
+}
+
+function ensureMapModeControl() {
+  const mapPanel = document.querySelector(".map-panel");
+
+  if (!mapPanel || mapPanel.querySelector(".map-mode-control")) {
+    updateMapModeControlUi();
+    return;
+  }
+
+  const control = document.createElement("div");
+  control.className = "map-mode-control";
+  control.innerHTML = `
+    <button type="button" class="map-mode-button is-active" data-map-selection-mode="address" aria-pressed="true">
+      주소 선택
+    </button>
+    <button type="button" class="map-mode-button" data-map-selection-mode="range" aria-pressed="false">
+      범위 지정
+    </button>
+  `;
+
+  control
+    .querySelectorAll("[data-map-selection-mode]")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        setMapSelectionMode(button.dataset.mapSelectionMode || "address");
+      });
+    });
+
+  mapPanel.append(control);
+  updateMapModeControlUi();
+}
+
+function buildRangeBoundsFromPoints(firstPoint, secondPoint) {
+  return normalizeRangeBounds({
+    minLat: Math.min(firstPoint.lat, secondPoint.lat),
+    maxLat: Math.max(firstPoint.lat, secondPoint.lat),
+    minLng: Math.min(firstPoint.lng, secondPoint.lng),
+    maxLng: Math.max(firstPoint.lng, secondPoint.lng),
+  });
+}
+
+async function handleRangeSelectionMapClick(latlng) {
+  if (!latlng) {
+    return;
+  }
+
+  state.manualRangePoints.push({
+    lat: Number(latlng.lat),
+    lng: Number(latlng.lng),
+  });
+
+  if (state.manualRangePoints.length === 1) {
+    clearRangeDraftLayer();
+
+    if (state.map) {
+      state.layers.rangeDraft = L.circleMarker([latlng.lat, latlng.lng], {
+        radius: 8,
+        color: "#c5622e",
+        weight: 3,
+        fillColor: "#d28845",
+        fillOpacity: 0.4,
+      }).addTo(state.map);
+    }
+
+    setActionFeedback(
+      "첫 번째 점을 저장했습니다. 사각형 범위를 만들 두 번째 점을 지도에서 클릭해주세요."
+    );
+    return;
+  }
+
+  const [firstPoint, secondPoint] = state.manualRangePoints.slice(-2);
+  const bounds = buildRangeBoundsFromPoints(firstPoint, secondPoint);
+  state.manualRangePoints = [];
+
+  if (!bounds) {
+    setActionFeedback("범위 좌표를 해석하지 못했습니다. 다시 시도해주세요.");
+    return;
+  }
+
+  clearRangeDraftLayer();
+  showRangeDraftBounds(bounds);
+
+  const rangeSelection = buildRangeSelection(bounds);
+
+  if (!rangeSelection) {
+    setActionFeedback("범위를 만들지 못했습니다. 다시 시도해주세요.");
+    return;
+  }
+
+  setSelectedLocation(rangeSelection, false);
+  setActionFeedback(
+    "범위가 지정되었습니다. 현재는 선택한 사각형만 지도에 표시됩니다. 범위 설정을 누르면 옵션에 따른 전체 컨텍스트를 계산합니다."
+  );
 }
 
 function createMap(config) {
@@ -3485,14 +4046,53 @@ function createMap(config) {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>',
   }).addTo(map);
 
+  const refreshMapSize = () => {
+    if (state.map) {
+      state.map.invalidateSize(false);
+    }
+  };
+
+  window.requestAnimationFrame(refreshMapSize);
+  window.setTimeout(refreshMapSize, 80);
+  window.addEventListener("resize", refreshMapSize, { passive: true });
+
   map.on("click", async (event) => {
+    if (state.mapSelectionMode === "range") {
+      await handleRangeSelectionMapClick(event.latlng);
+      return;
+    }
+
     const { lat, lng } = event.latlng;
 
     selectionSummary.textContent = "선택한 위치의 주소를 확인하는 중입니다...";
 
     try {
       const location = await reverseGeocode(lat, lng);
+      state.suppressNextAutoFit = true;
       setSelectedLocation(location, false);
+
+      const selectionKey = state.activeSelectionKey;
+      try {
+        const previewSiteContext = await loadSiteContext(selectionKey, {
+          optionOverrides: buildSelectionPreviewOptions(),
+          layerMode: "selection-preview",
+          previewOnly: true,
+        });
+
+        if (isSelectionRequestCurrent(selectionKey) && previewSiteContext) {
+          state.siteContext = {
+            ...previewSiteContext,
+            layerMode: "selection-preview",
+            disableAutoFit: true,
+          };
+          updateContextLayers(state.siteContext);
+          setActionFeedback(
+            "선택한 위치의 필지 경계와 건물 외곽선을 지도에 표시했습니다."
+          );
+        }
+      } catch {
+        // Keep the selected location even when preview loading fails.
+      }
     } catch {
       setSelectedLocation(
         {
@@ -3511,10 +4111,31 @@ function createMap(config) {
   });
 
   state.map = map;
+  ensureMapModeControl();
+
+  if (state.selectedLocation) {
+    if (!state.marker) {
+      state.marker = L.marker([
+        state.selectedLocation.lat,
+        state.selectedLocation.lng,
+      ]).addTo(state.map);
+    } else {
+      state.marker.setLatLng([
+        state.selectedLocation.lat,
+        state.selectedLocation.lng,
+      ]);
+    }
+
+    openPopup(state.selectedLocation);
+  }
 }
 
 function setSelectedLocation(location, moveMap = true) {
+  clearPreviewMarker();
+  state.pendingSearchSelectionId = "";
+  setSearchSelectionCardVisible(false);
   state.selectedLocation = location;
+  const rangeMode = isRangeSelection(location);
   state.activeSelectionKey = buildHistoryKey(location);
   state.siteContext = null;
   state.siteContextOptionsSignature = "";
@@ -3529,26 +4150,37 @@ function setSelectedLocation(location, moveMap = true) {
     "범위를 설정하면 지도 버퍼와 3D 추출 범위가 여기에 표시됩니다."
   );
 
-  if (!state.marker) {
-    state.marker = L.marker([location.lat, location.lng]).addTo(state.map);
-  } else {
-    state.marker.setLatLng([location.lat, location.lng]);
-  }
+  if (state.map) {
+    if (rangeMode) {
+      if (state.marker) {
+        state.map.removeLayer(state.marker);
+        state.marker = null;
+      }
+    } else {
+      if (moveMap) {
+        centerMapOnCoordinates(location.lat, location.lng);
+      }
 
-  if (moveMap) {
-    state.map.flyTo([location.lat, location.lng], 18, {
-      duration: 0.8,
-    });
+      if (!state.marker) {
+        state.marker = L.marker([location.lat, location.lng]).addTo(state.map);
+      } else {
+        state.marker.setLatLng([location.lat, location.lng]);
+      }
+    }
   }
 
   pushHistory(location);
-  clearContextLayers();
+  clearContextLayers({ preserveRangeDraft: rangeMode });
   renderSelectionSummary();
   renderSelectionMeta();
   renderSiteContextMeta();
   renderLandInfo();
   renderBuildingRegister();
-  openPopup(location);
+  syncSelectionModeFormState();
+
+  if (!rangeMode) {
+    openPopup(location);
+  }
   siteContextNote.textContent =
     "현재 위치가 선택되었습니다. 범위 설정을 누르면 현재 반경으로 버퍼와 건물 범위를 다시 계산합니다.";
   landInfoNote.textContent =
@@ -3559,7 +4191,114 @@ function setSelectedLocation(location, moveMap = true) {
       "선택한 위치 기준으로 건축물대장 요약을 자동으로 불러오는 중입니다.";
   }
 
-  void refreshSelectionData(state.activeSelectionKey);
+  if (rangeMode) {
+    landInfoNote.textContent =
+      "직접 지정 범위는 특정 필지 토지요약 대신 범위 안의 컨텍스트를 확인합니다.";
+    buildingRegisterNote.textContent =
+      "직접 지정 범위는 특정 건축물대장 대신 범위 안의 건물 컨텍스트를 확인합니다.";
+  }
+
+  [loadLandInfoButton, openLandUseDetailButton, loadBuildingRegisterButton].forEach(
+    (button) => {
+      if (button) {
+        button.disabled = rangeMode;
+      }
+    }
+  );
+
+  void hydrateSelectedLocationParcelReference(state.activeSelectionKey);
+}
+
+async function hydrateSelectedLocationParcelReference(selectionKey) {
+  if (!state.selectedLocation) {
+    return;
+  }
+
+  if (isRangeSelection()) {
+    state.siteContext = null;
+    state.siteContextOptionsSignature = "";
+    state.landInfo = null;
+    state.landInfoDetails = null;
+    state.buildingRegister = null;
+    renderSiteContextMeta();
+    renderLandInfo();
+    renderBuildingRegister();
+    syncPanelStatusChips();
+    landInfoNote.textContent =
+      "직접 지정 범위는 토지 요약 대신 범위 안의 필지/건물 컨텍스트를 지도에서 확인합니다.";
+    buildingRegisterNote.textContent =
+      "직접 지정 범위는 특정 건축물대장 대신 범위 안의 건물 컨텍스트를 지도에서 확인합니다.";
+    return;
+  }
+
+  if (!selectionHasParcelReference(state.selectedLocation)) {
+    try {
+      const enrichedLocation = await reverseGeocode(
+        state.selectedLocation.lat,
+        state.selectedLocation.lng
+      );
+
+      if (
+        isSelectionRequestCurrent(selectionKey) &&
+        selectionHasParcelReference(enrichedLocation)
+      ) {
+        state.selectedLocation = {
+          ...state.selectedLocation,
+          ...enrichedLocation,
+          pnu: enrichedLocation.pnu || state.selectedLocation.pnu || "",
+          juso: enrichedLocation.juso || state.selectedLocation.juso || null,
+          parcelAddress:
+            enrichedLocation.parcelAddress || state.selectedLocation.parcelAddress || "",
+          roadAddress:
+            enrichedLocation.roadAddress || state.selectedLocation.roadAddress || "",
+        };
+        renderSelectionSummary();
+        renderSelectionMeta();
+        openPopup(state.selectedLocation);
+      }
+    } catch {
+      // Keep the original selection when reverse-geocode enrichment is unavailable.
+    }
+  }
+
+  try {
+    const previewSiteContext = await loadSiteContext(selectionKey, {
+      optionOverrides: buildSelectionPreviewOptions(),
+      layerMode: "selection-preview",
+      previewOnly: true,
+    });
+    if (isSelectionRequestCurrent(selectionKey) && previewSiteContext) {
+      state.siteContext = {
+        ...previewSiteContext,
+        layerMode: "selection-preview",
+      };
+      updateContextLayers(state.siteContext);
+    }
+    setActionFeedback("선택한 주소의 필지 경계와 대지 내 건물 외곽선을 지도에 표시했습니다.");
+  } catch {
+    siteContextNote.textContent =
+      "선택한 주소의 필지 미리보기를 불러오지 못했습니다. 범위 설정으로 전체 컨텍스트를 다시 시도할 수 있습니다.";
+  }
+
+  return refreshSelectionDataSafely(selectionKey);
+}
+
+async function refreshSelectionDataSafely(selectionKey) {
+  if (!selectionHasParcelReference()) {
+    state.landInfo = null;
+    state.landInfoDetails = null;
+    renderLandInfo();
+    syncPanelStatusChips();
+
+    if (isSelectionRequestCurrent(selectionKey)) {
+      landInfoNote.textContent =
+        "필지 식별정보를 아직 확인하지 못해 토지정보 자동 조회를 건너뜁니다. 대지 컨텍스트를 먼저 불러온 뒤 다시 시도해주세요.";
+    }
+
+    return;
+  }
+
+  return refreshSelectionData(selectionKey);
 }
 
 async function refreshSelectionData(selectionKey) {
@@ -3573,6 +4312,18 @@ async function refreshSelectionData(selectionKey) {
   }
 
   if (state.runtimeConfig?.futureSources?.hasBuildingHubKey) {
+    if (!selectionHasParcelReference()) {
+      state.buildingRegister = null;
+      renderBuildingRegister();
+
+      if (isSelectionRequestCurrent(selectionKey)) {
+        buildingRegisterNote.textContent =
+          "필지 식별정보를 아직 확인하지 못해 건축물대장 자동 조회를 건너뜁니다. 대지 컨텍스트를 먼저 불러온 뒤 다시 시도해주세요.";
+      }
+
+      return;
+    }
+
     try {
       await loadBuildingRegister(true, selectionKey);
     } catch (error) {
@@ -3587,6 +4338,8 @@ async function refreshSelectionData(selectionKey) {
 }
 
 async function bootstrap() {
+  relocateSearchUiToSidePanel();
+  attachEvents();
   loadHistory();
   renderHistory();
   renderSelectionSummary();
@@ -3598,18 +4351,20 @@ async function bootstrap() {
   updateDownloadButtonLabel();
   resetModelProgress();
   syncContourIntervalInput();
+  syncSelectionModeFormState();
   specPreview.textContent =
     "범위 설정을 누르면 현재 반경, 표고, 포함 건물 수를 먼저 확인할 수 있습니다.";
   syncPanelStatusChips();
-  attachEvents();
   await loadRuntimeConfig();
   createMap(state.runtimeConfig);
 }
 
 bootstrap().catch((error) => {
+  console.error("[bootstrap] failed", error);
   providerBadge.textContent = "초기화 실패";
   specPreview.textContent =
     error instanceof Error
       ? `초기화 중 문제가 발생했습니다: ${error.message}`
       : "초기화 중 문제가 발생했습니다.";
 });
+

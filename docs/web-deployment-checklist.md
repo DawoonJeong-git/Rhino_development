@@ -11,6 +11,10 @@ Set these in the deployment environment instead of committing real values:
 - `BUILDING_HUB_SERVICE_KEY`
 - `LAW_API_OC`
 - `TERRAIN_DEM_PATH`
+- `TERRAIN_CONTOUR_PATH`
+- `TERRAIN_CONTOUR_CRS`
+- `SKP_EXPORT_ENGINE`
+- `SKP_EXPORTER_CLI`
 - `USE_NOMINATIM_FALLBACK`
 
 Recommended:
@@ -18,11 +22,13 @@ Recommended:
 - Set `VWORLD_API_DOMAIN` to the real production origin.
 - Keep `USE_NOMINATIM_FALLBACK=true` only as a safety net, not as the main search path.
 - Do not expose service keys in frontend code.
+- Leave `SKP_EXPORTER_CLI` empty unless the deployed host actually includes a standalone SKP exporter binary.
 
 ## 2. Production Runtime
 
 - Run the Node server behind HTTPS.
 - Put the app behind a reverse proxy so large 3D export responses are handled safely.
+- Mount the contour dataset into the container instead of baking nationwide shapefiles into the image.
 - Enable gzip or brotli for HTML, JS, CSS, and JSON responses.
 - Keep request logs for `/api/geocode`, `/api/reverse-geocode`, `/api/land-info`, `/api/land-info-details`, `/api/building-register`, `/api/site-context`, and `/api/export-model`.
 
@@ -48,6 +54,7 @@ Recommended:
 
 ## 5. Operational Checks
 
+- If you use Compose variable substitution for ports or bind mounts, start with `docker compose --env-file .env.production up -d --build`.
 - Verify health with `/api/config`
 - Confirm the production domain is registered in VWorld
 - Confirm building register keys are approved for the deployed server IP/domain policy

@@ -19,7 +19,7 @@ Example:
 
 ```json
 {
-  "TERRAIN_CONTOUR_PATH": "C:/Users/HDL/Documents/Rhino_develop/data/contours",
+  "TERRAIN_CONTOUR_PATH": "/opt/site-context-planner/data/contours",
   "TERRAIN_CONTOUR_CRS": "EPSG:5179"
 }
 ```

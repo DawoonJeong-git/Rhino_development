@@ -1,5 +1,18 @@
 # Deployment Runbook
 
+## Quick Order
+
+Use this exact sequence right before release:
+
+1. Copy `.env.production.example` to `.env.production` and fill in real keys.
+2. Confirm `VWORLD_API_DOMAIN` matches the real HTTPS origin.
+3. Copy the contour dataset to the server and set `TERRAIN_CONTOUR_HOST_PATH`, `TERRAIN_CONTOUR_PATH`, and `TERRAIN_CONTOUR_CRS`.
+4. If you need server-side `.skp`, provide a real standalone exporter binary and set `SKP_EXPORTER_CLI`. Otherwise leave it blank and use OBJ/3DM or `skp-payload`.
+5. Build and start the container with `docker compose --env-file .env.production up -d --build`.
+6. Verify `GET /api/health` and `GET /api/config`.
+7. Run one real parcel smoke test for search, land summary/detail, building summary/detail, `100m` preview, OBJ, and 3DM.
+8. Keep the previous image tag and one known-good parcel for rollback.
+
 ## Recommended Shape
 
 This app should run as a long-lived Node server, not as a static-only host and not as a serverless function.
@@ -41,11 +54,21 @@ Required environment variables:
 - `TERRAIN_CONTOUR_CRS`
 - `USE_NOMINATIM_FALLBACK`
 
+Optional, only if you want server-side `.skp` export:
+
+- `SKP_EXPORT_ENGINE`
+- `SKP_EXPORTER_CLI`
+
 You can start from:
 
 - `.env.production.example`
 - `compose.yaml`
 - `deploy/Caddyfile.example`
+
+Note:
+
+- `SKP_EXPORTER_CLI` should stay empty unless the deployment image or host actually provides a standalone exporter binary.
+- If `.skp` is not wired yet, keep OBJ/3DM enabled and use `skp-payload` for downstream conversion.
 
 ## Step 2. Copy the Contour Dataset
 
@@ -73,7 +96,7 @@ Or with Compose:
 ```bash
 cp .env.production.example .env.production
 # edit .env.production
-docker compose up -d --build
+docker compose --env-file .env.production up -d --build
 ```
 
 ## Step 4. Run the Container

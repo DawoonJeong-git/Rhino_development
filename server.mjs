@@ -1,7 +1,17 @@
 import { createServer } from "node:http";
-import { open, readFile, readdir, stat } from "node:fs/promises";
+import {
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 import earcut from "earcut";
 import polygonClipping from "polygon-clipping";
 import proj4 from "proj4";
@@ -15,19 +25,51 @@ const METERS_PER_DEGREE_LAT = 111_320;
 const OPEN_METEO_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
 const OPEN_METEO_MAX_POINTS_PER_REQUEST = 100;
 const SITE_CONTEXT_CACHE_TTL_MS = 1000 * 60 * 10;
+const GEOCODE_CACHE_TTL_MS = 1000 * 60 * 10;
 const TERRAIN_SOURCE_SPATIAL_RESOLUTION_METERS = 90;
-const MIN_CONTOUR_INTERVAL_METERS = 1;
+const MIN_CONTOUR_INTERVAL_METERS = 0.1;
 const TERRAIN_GRID_MIN_STEP_METERS = 10;
 const DEFAULT_TERRAIN_CONTOUR_CRS = "EPSG:5179";
 const RHINO6_FILE3DM_VERSION = 6;
 const REQUEST_PROGRESS_TTL_MS = 1000 * 60 * 20;
+const ROAD_SURFACE_OFFSET_METERS = 0.01;
+const ROAD_SURFACE_THICKNESS_METERS = 0.01;
+const TERRAIN_BAND_OVERLAP_METERS = 0.02;
+const SKETCHUP_METERS_TO_INCHES = 39.37007874015748;
+const SKETCHUP_EXPORT_TIMEOUT_MS = 1000 * 60 * 3;
+const DEFAULT_ROAD_WIDTH_METERS = 6;
+const ROAD_SURFACE_MAX_SEGMENT_METERS = 3;
+const CONTOUR_BAND_UNION_MAX_SLICES = 12000;
+const ROAD_LAYER_CANDIDATES = [
+  {
+    layer: "lt_c_upisuq151",
+    geometryType: "polygon",
+    provider: "vworld-road-polygons",
+  },
+  {
+    layer: "lt_l_moctlink",
+    geometryType: "line",
+    provider: "vworld-traffic-links",
+  },
+  {
+    layer: "lt_l_sprd",
+    geometryType: "line",
+    provider: "vworld-road-lines",
+  },
+];
 const openMeteoElevationCache = new Map();
+const geocodeCache = new Map();
 const siteContextCache = new Map();
 const terrainContourCatalogCache = new Map();
 const terrainContourDatasetCache = new Map();
+const terrainContourRecordIndexCache = new Map();
 const requestProgressStore = new Map();
 const contourBandGroupCache = new WeakMap();
+const contourCumulativeBandGroupCache = new WeakMap();
+const contourRenderableBandGroupCache = new WeakMap();
 const contourTopSurfaceCache = new WeakMap();
+const roadFootprintMultiPolygonCache = new WeakMap();
+const roadContourSurfaceGroupCache = new WeakMap();
 let rhino3dmInstancePromise = null;
 
 proj4.defs(
@@ -121,6 +163,315 @@ function quantizeAbsoluteElevation(height, interval) {
   return Number((bandIndex * normalizedInterval).toFixed(3));
 }
 
+function quantizeAbsoluteElevationUpward(height, interval) {
+  if (!Number.isFinite(height)) {
+    return height;
+  }
+
+  const normalizedInterval = normalizeContourInterval(interval);
+  const bandIndex = Math.ceil(height / normalizedInterval - 1e-9);
+
+  return Number((bandIndex * normalizedInterval).toFixed(3));
+}
+
+function nextContourIntervalStep(interval) {
+  const normalized = normalizeContourInterval(interval);
+  const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20];
+
+  for (const step of steps) {
+    if (step > normalized + 1e-9) {
+      return step;
+    }
+  }
+
+  return Number((normalized * 2).toFixed(3));
+}
+
+function estimateContourBandComplexity(siteContext, interval) {
+  const terrainGrid = siteContext?.terrainGrid;
+
+  if (!terrainGrid?.elevations?.length) {
+    return 0;
+  }
+
+  const cellCount = Math.max(
+    1,
+    (Math.max(0, (terrainGrid.xValues?.length || 0) - 1) *
+      Math.max(0, (terrainGrid.yValues?.length || 0) - 1))
+  );
+  const bandCount = estimateContourBandCount(siteContext, interval);
+
+  return cellCount * bandCount;
+}
+
+function estimateContourBandCount(siteContext, interval) {
+  const terrainGrid = siteContext?.terrainGrid;
+
+  if (!terrainGrid?.elevations?.length) {
+    return 0;
+  }
+
+  const heightSpan = Math.max(
+    0,
+    Number(terrainGrid.maxElevation || 0) - Number(terrainGrid.minElevation || 0)
+  );
+  return Math.max(
+    1,
+    Math.ceil(heightSpan / normalizeContourInterval(interval))
+  );
+}
+
+function resolveContourBandCountBudget(exportFormat, radiusMeters) {
+  let maxBandCount =
+    exportFormat === "skp" || exportFormat === "skp-payload"
+      ? 240
+      : exportFormat === "3dm"
+        ? 220
+        : exportFormat === "obj"
+          ? 180
+          : 200;
+
+  if (radiusMeters <= 90) {
+    maxBandCount += 50;
+  } else if (radiusMeters <= 140) {
+    maxBandCount += 20;
+  } else if (radiusMeters >= 260) {
+    maxBandCount -= 40;
+  }
+
+  return Math.max(60, Math.round(maxBandCount));
+}
+
+function resolveMinimumRenderableContourBandInterval(sourceContourInterval) {
+  if (!(sourceContourInterval > 0)) {
+    return MIN_CONTOUR_INTERVAL_METERS;
+  }
+
+  // Allow finer interpolated terrace bands than the source contour interval.
+  // Actual safety is enforced by the contour complexity budget, not by a hard
+  // source/10 floor, otherwise a 5m source can never render at 0.1m.
+  return MIN_CONTOUR_INTERVAL_METERS;
+}
+
+function inferSourceContourIntervalFromContourLines(contourCollection) {
+  const elevations = [...new Set(
+    (contourCollection?.features || [])
+      .map((feature) => Number(feature?.properties?.elevation))
+      .filter((value) => Number.isFinite(value))
+      .map((value) => Number(value.toFixed(3)))
+  )].sort((left, right) => left - right);
+
+  if (elevations.length < 2) {
+    return null;
+  }
+
+  let minPositiveDelta = Number.POSITIVE_INFINITY;
+
+  for (let index = 1; index < elevations.length; index += 1) {
+    const delta = Number((elevations[index] - elevations[index - 1]).toFixed(3));
+
+    if (delta > 1e-6) {
+      minPositiveDelta = Math.min(minPositiveDelta, delta);
+    }
+  }
+
+  if (!Number.isFinite(minPositiveDelta)) {
+    return null;
+  }
+
+  return normalizeContourInterval(minPositiveDelta);
+}
+
+function resolveSourceContourInterval(siteContext) {
+  const configuredInterval = normalizeContourInterval(
+    siteContext?.dataSources?.contours?.interval ||
+      siteContext?.stats?.sourceContourInterval ||
+      siteContext?.stats?.effectiveContourBandInterval ||
+      siteContext?.options?.contourInterval
+  );
+  const inferredInterval = inferSourceContourIntervalFromContourLines(
+    siteContext?.contourLines
+  );
+
+  if (Number.isFinite(inferredInterval) && inferredInterval > 0) {
+    return Math.max(configuredInterval, inferredInterval);
+  }
+
+  return configuredInterval;
+}
+
+function resolveRequestedContourDisplayInterval(siteContext) {
+  return normalizeContourInterval(
+    siteContext?.stats?.requestedContourInterval ||
+      siteContext?.options?.contourInterval
+  );
+}
+
+function shouldPreserveNativeContourDisplayLines(format) {
+  const normalizedFormat = String(format || "").trim().toLowerCase();
+  return (
+    normalizedFormat === "3dm" ||
+    normalizedFormat === "obj" ||
+    normalizedFormat === "skp" ||
+    normalizedFormat === "skp-payload"
+  );
+}
+
+function resolveEffectiveContourBandInterval(siteContext) {
+  const requestedInterval = normalizeContourInterval(
+    siteContext?.options?.contourInterval
+  );
+  const cachedRequestedInterval = normalizeContourInterval(
+    siteContext?.stats?.requestedContourInterval
+  );
+  const cachedEffectiveInterval = Number(
+    siteContext?.stats?.effectiveContourBandInterval
+  );
+  const exportFormat = String(siteContext?.options?.exportFormat || "")
+    .trim()
+    .toLowerCase();
+  const sourceContourInterval = resolveSourceContourInterval(siteContext);
+  const radiusMeters = Math.max(30, Number(siteContext?.options?.radius) || 120);
+  const maxBandCount = resolveContourBandCountBudget(
+    exportFormat,
+    radiusMeters
+  );
+  let effectiveInterval =
+    Number.isFinite(cachedEffectiveInterval) &&
+    Math.abs(cachedRequestedInterval - requestedInterval) <= 1e-9
+      ? normalizeContourInterval(cachedEffectiveInterval)
+      : requestedInterval;
+  let maxComplexity =
+    exportFormat === "skp" || exportFormat === "skp-payload"
+      ? 12_000_000
+      : exportFormat === "3dm"
+        ? 10_000_000
+      : exportFormat === "obj"
+        ? 4_000_000
+        : 6_000_000;
+  const precisionBudgetBoost =
+    requestedInterval <= 0.1
+      ? radiusMeters <= 120
+        ? 22
+        : radiusMeters <= 180
+          ? 12
+          : radiusMeters <= 260
+            ? 6
+            : 1
+      : requestedInterval <= 0.5
+        ? radiusMeters <= 160
+          ? 8
+          : radiusMeters <= 240
+            ? 4
+            : 1
+        : requestedInterval <= 1
+          ? radiusMeters <= 220
+            ? 3
+            : 1
+          : 1;
+  maxComplexity = Math.round(maxComplexity * precisionBudgetBoost);
+  effectiveInterval = Math.max(
+    effectiveInterval,
+    resolveMinimumRenderableContourBandInterval(sourceContourInterval)
+  );
+
+  while (
+    (estimateContourBandComplexity(siteContext, effectiveInterval) >
+      maxComplexity ||
+      estimateContourBandCount(siteContext, effectiveInterval) > maxBandCount) &&
+    effectiveInterval < 20
+  ) {
+    effectiveInterval = nextContourIntervalStep(effectiveInterval);
+  }
+
+  if (effectiveInterval > requestedInterval + 1e-9) {
+    console.warn(
+      `[terrain-band] interval relaxed requested=${requestedInterval} effective=${effectiveInterval} source=${sourceContourInterval} bandCount=${estimateContourBandCount(
+        siteContext,
+        effectiveInterval
+      )}/${maxBandCount} complexity=${estimateContourBandComplexity(
+        siteContext,
+        requestedInterval
+      )} format=${exportFormat || "default"}`
+    );
+  }
+
+  return effectiveInterval;
+}
+
+function getContourBandCacheKey(siteContext) {
+  return `${String(resolveEffectiveContourBandInterval(siteContext))}|${buildTerrainGridCacheSignature(
+    siteContext?.terrainGrid
+  )}`;
+}
+
+function buildTerrainGridCacheSignature(terrainGrid) {
+  if (!terrainGrid?.elevations?.length) {
+    return "no-grid";
+  }
+
+  const xValues = terrainGrid.xValues || [];
+  const yValues = terrainGrid.yValues || [];
+  const lastX = xValues.length ? xValues[xValues.length - 1] : 0;
+  const lastY = yValues.length ? yValues[yValues.length - 1] : 0;
+
+  return [
+    Number(terrainGrid.minElevation || 0).toFixed(3),
+    Number(terrainGrid.maxElevation || 0).toFixed(3),
+    xValues.length,
+    yValues.length,
+    Number(xValues[0] || 0).toFixed(3),
+    Number(yValues[0] || 0).toFixed(3),
+    Number(lastX || 0).toFixed(3),
+    Number(lastY || 0).toFixed(3),
+  ].join("|");
+}
+
+function buildLocationCacheKey(location) {
+  return `${Number(location?.lat || 0).toFixed(6)}|${Number(
+    location?.lng || 0
+  ).toFixed(6)}`;
+}
+
+function resolveContourCacheOwner(siteContext) {
+  if (siteContext?.terrainGrid && typeof siteContext.terrainGrid === "object") {
+    return siteContext.terrainGrid;
+  }
+
+  return siteContext && typeof siteContext === "object" ? siteContext : null;
+}
+
+function resolveRenderableContourCacheOwner(siteContext) {
+  if (siteContext?.buildings && typeof siteContext.buildings === "object") {
+    return siteContext.buildings;
+  }
+
+  return resolveContourCacheOwner(siteContext);
+}
+
+function resolveRoadGeometryCacheOwner(siteContext) {
+  if (siteContext?.roads && typeof siteContext.roads === "object") {
+    return siteContext.roads;
+  }
+
+  return resolveContourCacheOwner(siteContext);
+}
+
+function getOrCreateWeakMapEntry(cacheStore, owner) {
+  if (!owner || typeof owner !== "object") {
+    return null;
+  }
+
+  let entry = cacheStore.get(owner);
+
+  if (!(entry instanceof Map)) {
+    entry = new Map();
+    cacheStore.set(owner, entry);
+  }
+
+  return entry;
+}
+
 function resolveTerrainSampleStep(widthMeters, heightMeters, options = {}) {
   const longestSide = Math.max(widthMeters, heightMeters);
   const areaSquareMeters = Math.max(1, widthMeters * heightMeters);
@@ -156,18 +507,99 @@ function resolveTerrainSampleStep(widthMeters, heightMeters, options = {}) {
   );
 }
 
-function buildSiteContextCacheKey(location = {}, options = {}) {
+function normalizeCustomBounds(bounds) {
+  if (!bounds || typeof bounds !== "object") {
+    return null;
+  }
+
+  const minLat = Number(bounds.minLat ?? bounds.south ?? bounds.swLat);
+  const maxLat = Number(bounds.maxLat ?? bounds.north ?? bounds.neLat);
+  const minLng = Number(bounds.minLng ?? bounds.west ?? bounds.swLng);
+  const maxLng = Number(bounds.maxLng ?? bounds.east ?? bounds.neLng);
+
+  if (
+    !Number.isFinite(minLat) ||
+    !Number.isFinite(maxLat) ||
+    !Number.isFinite(minLng) ||
+    !Number.isFinite(maxLng)
+  ) {
+    return null;
+  }
+
+  return {
+    minLat: Math.min(minLat, maxLat),
+    maxLat: Math.max(minLat, maxLat),
+    minLng: Math.min(minLng, maxLng),
+    maxLng: Math.max(minLng, maxLng),
+  };
+}
+
+function buildSiteContextCacheKey(location = {}, options = {}, customBounds = null) {
+  const normalizedCustomBounds = normalizeCustomBounds(
+    customBounds || location?.customBounds
+  );
+
   return JSON.stringify({
     lat: Number(location.lat || 0).toFixed(6),
     lng: Number(location.lng || 0).toFixed(6),
+    customBounds: normalizedCustomBounds,
     radius: Math.max(30, Number(options.radius) || 120),
     contourInterval: normalizeContourInterval(options.contourInterval),
-    terrainMode: options.terrainMode || "contour",
+    terrainMode: options.terrainMode === "flat" ? "flat" : "contour",
+    buildingPlacement:
+      options.buildingPlacement === "embed-lowest" ? "embed-lowest" : "dominant",
     includeContours: options.includeContours !== false,
     includeBuildings: options.includeBuildings !== false,
     includeParcelBoundary: options.includeParcelBoundary !== false,
     includeRoads: options.includeRoads === true,
+    previewOnly: options.previewOnly === true,
   });
+}
+
+function isSiteContextCompatibleForExport(
+  siteContext,
+  requestedLocation = {},
+  requestedOptions = {}
+) {
+  if (!siteContext?.location || !siteContext?.options) {
+    return false;
+  }
+
+  const providedKey = buildSiteContextCacheKey(
+    siteContext.location,
+    siteContext.options
+  );
+  const requestedKey = buildSiteContextCacheKey(
+    requestedLocation?.lat || requestedLocation?.lng
+      ? requestedLocation
+      : siteContext.location,
+    requestedOptions
+  );
+
+  if (providedKey !== requestedKey) {
+    return false;
+  }
+
+  if (
+    requestedOptions.includeParcelBoundary !== false &&
+    !siteContext.parcelBoundary
+  ) {
+    return false;
+  }
+
+  if (requestedOptions.includeContours !== false && !siteContext.contourLines) {
+    return false;
+  }
+
+  if (requestedOptions.includeBuildings !== false && !siteContext.buildings) {
+    return false;
+  }
+
+  if (requestedOptions.includeRoads === true && !siteContext.roads) {
+    return false;
+  }
+
+  return true;
 }
 
 function buildRuntimeConfig(localConfig) {
@@ -200,6 +632,17 @@ function buildRuntimeConfig(localConfig) {
       process.env.TERRAIN_CONTOUR_CRS ||
         localConfig.TERRAIN_CONTOUR_CRS ||
         DEFAULT_TERRAIN_CONTOUR_CRS
+    ),
+    skpExportEngine: normalizeConfigString(
+      process.env.SKP_EXPORT_ENGINE ||
+        localConfig.SKP_EXPORT_ENGINE ||
+        "auto"
+    ),
+    skpExporterCli: normalizeConfigString(
+      process.env.SKP_EXPORTER_CLI || localConfig.SKP_EXPORTER_CLI || ""
+    ),
+    sketchUpExe: normalizeConfigString(
+      process.env.SKETCHUP_EXE || localConfig.SKETCHUP_EXE || ""
     ),
     useNominatimFallback:
       String(
@@ -337,6 +780,32 @@ function sendJson(response, statusCode, payload) {
   response.end(JSON.stringify(payload, null, 2));
 }
 
+function encodeHttpHeaderFilename(filename) {
+  return encodeURIComponent(String(filename || "download"))
+    .replace(/['()]/g, (character) =>
+      `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+    )
+    .replace(/\*/g, "%2A");
+}
+
+function buildAsciiHeaderFilename(filename) {
+  const ascii = String(filename || "download")
+    .normalize("NFKD")
+    .replace(/[^\x20-\x7E]+/g, "_")
+    .replace(/["\\]/g, "_")
+    .replace(/[;\r\n]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return ascii || "download";
+}
+
+function buildContentDispositionHeader(filename) {
+  const asciiFilename = buildAsciiHeaderFilename(filename);
+  const encodedFilename = encodeHttpHeaderFilename(filename);
+  return `attachment; filename="${asciiFilename}"; filename*=UTF-8''${encodedFilename}`;
+}
+
 function sendText(response, statusCode, payload, filename = null) {
   const headers = {
     "Content-Type": "text/plain; charset=utf-8",
@@ -344,8 +813,7 @@ function sendText(response, statusCode, payload, filename = null) {
   };
 
   if (filename) {
-    headers["Content-Disposition"] = `attachment; filename="${filename}"`;
-    headers["X-Export-Filename"] = filename;
+    headers["Content-Disposition"] = buildContentDispositionHeader(filename);
   }
 
   response.writeHead(statusCode, headers);
@@ -365,8 +833,7 @@ function sendBinary(
   };
 
   if (filename) {
-    headers["Content-Disposition"] = `attachment; filename="${filename}"`;
-    headers["X-Export-Filename"] = filename;
+    headers["Content-Disposition"] = buildContentDispositionHeader(filename);
   }
 
   response.writeHead(statusCode, headers);
@@ -517,6 +984,37 @@ function buildSystemAddress(location) {
   return normalizeSystemAddress(
     location?.roadAddress || location?.parcelAddress || location?.label || ""
   );
+}
+
+function buildGeocodeCacheKey(query) {
+  return String(query || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+function readGeocodeCache(query) {
+  const cacheKey = buildGeocodeCacheKey(query);
+  const cachedEntry = geocodeCache.get(cacheKey);
+
+  if (!cachedEntry) {
+    return null;
+  }
+
+  if (cachedEntry.expiresAt <= Date.now()) {
+    geocodeCache.delete(cacheKey);
+    return null;
+  }
+
+  return cachedEntry.payload;
+}
+
+function writeGeocodeCache(query, payload) {
+  const cacheKey = buildGeocodeCacheKey(query);
+  geocodeCache.set(cacheKey, {
+    payload,
+    expiresAt: Date.now() + GEOCODE_CACHE_TTL_MS,
+  });
 }
 
 async function readEncodedResponseText(response, encoding) {
@@ -1198,6 +1696,16 @@ function createCoordinateTransformer(sourceCrs) {
   return (point) => proj4(normalizedSource, "EPSG:4326", point);
 }
 
+function createCoordinateTransformerToSource(sourceCrs) {
+  const normalizedSource = normalizeCrsId(sourceCrs);
+
+  if (normalizedSource === "EPSG:4326") {
+    return (point) => [Number(point[0]), Number(point[1])];
+  }
+
+  return (point) => proj4("EPSG:4326", normalizedSource, point);
+}
+
 function normalizeLineStringCoordinates(lineString, transformPoint) {
   const normalized = [];
 
@@ -1258,6 +1766,112 @@ function buildContourFeatureRecord(geometry, properties = {}, transformPoint = n
         : { type: "MultiLineString", coordinates: lineStrings },
     bounds: buildBoundsFromLineStrings(lineStrings),
   };
+}
+
+function createDataViewFromBuffer(buffer) {
+  return new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+}
+
+function parsePolylineGeometryFromShapefileRecord(buffer) {
+  const view = createDataViewFromBuffer(buffer);
+  const type = view.getInt32(0, true);
+
+  if (![3, 13, 23].includes(type)) {
+    return null;
+  }
+
+  const partCount = view.getInt32(36, true);
+  const pointCount = view.getInt32(40, true);
+
+  if (partCount <= 0 || pointCount <= 1) {
+    return null;
+  }
+
+  let offset = 44;
+  const parts = new Array(partCount);
+  const points = new Array(pointCount);
+
+  for (let index = 0; index < partCount; index += 1, offset += 4) {
+    parts[index] = view.getInt32(offset, true);
+  }
+
+  for (let index = 0; index < pointCount; index += 1, offset += 16) {
+    points[index] = [view.getFloat64(offset, true), view.getFloat64(offset + 8, true)];
+  }
+
+  return partCount === 1
+    ? { type: "LineString", coordinates: points }
+    : {
+        type: "MultiLineString",
+        coordinates: parts.map((partOffset, index) => points.slice(partOffset, parts[index + 1])),
+      };
+}
+
+function buildBoundsFromSourceBounds(sourceBounds, transformPoint) {
+  if (!sourceBounds || typeof transformPoint !== "function") {
+    return null;
+  }
+
+  const corners = [
+    [sourceBounds.minX, sourceBounds.minY],
+    [sourceBounds.minX, sourceBounds.maxY],
+    [sourceBounds.maxX, sourceBounds.minY],
+    [sourceBounds.maxX, sourceBounds.maxY],
+  ].map((point) => transformPoint(point));
+
+  return buildBoundsFromPoints(corners);
+}
+
+function buildSourceBoundsFromClipBounds(clipBounds, sourceCrs) {
+  if (!clipBounds) {
+    return null;
+  }
+
+  const transformPoint = createCoordinateTransformerToSource(sourceCrs);
+  const corners = [
+    [clipBounds.minLng, clipBounds.minLat],
+    [clipBounds.minLng, clipBounds.maxLat],
+    [clipBounds.maxLng, clipBounds.minLat],
+    [clipBounds.maxLng, clipBounds.maxLat],
+  ].map((point) => transformPoint(point));
+
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (const point of corners) {
+    const x = Number(point?.[0]);
+    const y = Number(point?.[1]);
+
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      continue;
+    }
+
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+  }
+
+  if (!Number.isFinite(minX) || !Number.isFinite(minY)) {
+    return null;
+  }
+
+  return { minX, minY, maxX, maxY };
+}
+
+function sourceBoundsOverlap(leftBounds, rightBounds) {
+  if (!leftBounds || !rightBounds) {
+    return false;
+  }
+
+  return !(
+    leftBounds.maxX < rightBounds.minX ||
+    leftBounds.minX > rightBounds.maxX ||
+    leftBounds.maxY < rightBounds.minY ||
+    leftBounds.minY > rightBounds.maxY
+  );
 }
 
 function pointsMatchOnBounds(a, b, tolerance = 1e-10) {
@@ -1457,6 +2071,159 @@ async function loadShapefileTerrainContourDataset(filePath, sourceCrs) {
   };
 }
 
+async function buildShapefileTerrainContourRecordIndex(filePath, sourceCrs) {
+  const metadata = await stat(filePath);
+  const cacheKey = JSON.stringify({
+    path: filePath,
+    mtimeMs: metadata.mtimeMs,
+    size: metadata.size,
+    crs: normalizeCrsId(sourceCrs),
+    kind: "record-index",
+  });
+  const cachedIndex = terrainContourRecordIndexCache.get(cacheKey);
+
+  if (cachedIndex) {
+    return cachedIndex;
+  }
+
+  const dbfPath = resolveSiblingFilePath(filePath, ".dbf");
+  const shpHandle = await open(filePath, "r");
+  let dbfSource = null;
+
+  try {
+    console.log(`[contours] indexing ${path.basename(filePath)}`);
+    dbfSource = await shapefile.openDbf(dbfPath, { encoding: "utf-8" });
+    const entries = [];
+    let offsetBytes = 100;
+    let recordIndex = 0;
+
+    while (offsetBytes + 8 <= metadata.size) {
+      const header = Buffer.alloc(8);
+      const headerResult = await shpHandle.read(header, 0, 8, offsetBytes);
+
+      if (headerResult.bytesRead < 8) {
+        break;
+      }
+
+      const contentLengthBytes = header.readInt32BE(4) * 2;
+
+      if (contentLengthBytes <= 0) {
+        break;
+      }
+
+      const previewLength = Math.min(contentLengthBytes, 44);
+      const preview = Buffer.alloc(previewLength);
+      const previewResult = await shpHandle.read(preview, 0, previewLength, offsetBytes + 8);
+
+      if (previewResult.bytesRead < 4) {
+        break;
+      }
+
+      const dbfRecord = await dbfSource.read();
+      const shapeType = preview.readInt32LE(0);
+
+      if ([3, 13, 23].includes(shapeType) && previewResult.bytesRead >= 36) {
+        const sourceBounds = {
+          minX: preview.readDoubleLE(4),
+          minY: preview.readDoubleLE(12),
+          maxX: preview.readDoubleLE(20),
+          maxY: preview.readDoubleLE(28),
+        };
+        const elevation = normalizeContourElevation(dbfRecord?.value || {});
+
+        entries.push({
+          recordIndex,
+          offsetBytes,
+          contentLengthBytes,
+          sourceBounds,
+          properties: Number.isFinite(elevation) ? { elevation } : {},
+        });
+      }
+
+      offsetBytes += 8 + contentLengthBytes;
+      recordIndex += 1;
+    }
+
+    const index = {
+      path: filePath,
+      sourceCrs: normalizeCrsId(sourceCrs),
+      entries,
+    };
+
+    console.log(
+      `[contours] indexed ${path.basename(filePath)} records=${entries.length}`
+    );
+    terrainContourRecordIndexCache.set(cacheKey, index);
+    return index;
+  } finally {
+    if (dbfSource?.cancel) {
+      await dbfSource.cancel().catch(() => null);
+    }
+
+    await shpHandle.close();
+  }
+}
+
+async function loadIndexedShapefileTerrainContourDataset(filePath, sourceCrs, clipBounds) {
+  const contourIndex = await buildShapefileTerrainContourRecordIndex(filePath, sourceCrs);
+  const clipSourceBounds = buildSourceBoundsFromClipBounds(clipBounds, sourceCrs);
+  const transformPoint = createCoordinateTransformer(sourceCrs);
+  const candidateEntries = clipSourceBounds
+    ? contourIndex.entries.filter((entry) =>
+        sourceBoundsOverlap(entry.sourceBounds, clipSourceBounds)
+      )
+    : contourIndex.entries;
+  const shpHandle = await open(filePath, "r");
+
+  try {
+    const features = [];
+
+    for (const entry of candidateEntries) {
+      const body = Buffer.alloc(entry.contentLengthBytes);
+      const result = await shpHandle.read(
+        body,
+        0,
+        entry.contentLengthBytes,
+        entry.offsetBytes + 8
+      );
+
+      if (result.bytesRead < entry.contentLengthBytes) {
+        continue;
+      }
+
+      const geometry = parsePolylineGeometryFromShapefileRecord(body);
+
+      if (!geometry) {
+        continue;
+      }
+
+      const record = buildContourFeatureRecord(
+        geometry,
+        entry.properties,
+        transformPoint
+      );
+
+      if (!record?.bounds || !polygonBoundsOverlap(record.bounds, clipBounds)) {
+        continue;
+      }
+
+      features.push(record);
+    }
+
+    return {
+      path: filePath,
+      sourceCrs: normalizeCrsId(sourceCrs),
+      sourceType: "shapefile",
+      provider: "official-contours",
+      mode: "file",
+      note: "Contour map comes from a local official source file.",
+      features,
+    };
+  } finally {
+    await shpHandle.close();
+  }
+}
+
 async function loadTerrainContourDatasetByPath(filePath, sourceCrs) {
   const metadata = await stat(filePath);
   const cacheKey = JSON.stringify({
@@ -1517,6 +2284,114 @@ async function collectContourSourceFiles(rootPath) {
   return files.sort();
 }
 
+function buildTerrainRegionHints(location = {}) {
+  const admCdSource =
+    normalizeDigits(location.juso?.admCd) ||
+    normalizeDigits(String(location.pnu || "").slice(0, 10));
+  const provinceCode = admCdSource.slice(0, 2);
+  const provinceCodeHints = {
+    "11": ["서울"],
+    "26": ["부산"],
+    "27": ["대구"],
+    "28": ["인천"],
+    "29": ["광주"],
+    "30": ["대전"],
+    "31": ["울산"],
+    "36": ["세종"],
+    "41": ["경기"],
+    "42": ["강원", "강원특별자치도"],
+    "43": ["충북"],
+    "44": ["충남"],
+    "45": ["전북", "전북특별자치도"],
+    "46": ["전남"],
+    "47": ["경북"],
+    "48": ["경남"],
+    "50": ["제주"],
+  };
+
+  if (provinceCodeHints[provinceCode]?.length) {
+    return provinceCodeHints[provinceCode];
+  }
+
+  const raw = [
+    location.label,
+    location.parcelAddress,
+    location.roadAddress,
+    location.juso?.siNm,
+    location.juso?.sggNm,
+    location.juso?.emdNm,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const aliases = [
+    ["서울", ["서울"]],
+    ["서울특별시", ["서울"]],
+    ["부산", ["부산"]],
+    ["부산광역시", ["부산"]],
+    ["대구", ["대구"]],
+    ["대구광역시", ["대구"]],
+    ["인천", ["인천"]],
+    ["인천광역시", ["인천"]],
+    ["광주", ["광주"]],
+    ["광주광역시", ["광주"]],
+    ["대전", ["대전"]],
+    ["대전광역시", ["대전"]],
+    ["울산", ["울산"]],
+    ["울산광역시", ["울산"]],
+    ["세종", ["세종"]],
+    ["세종특별자치시", ["세종"]],
+    ["경기", ["경기"]],
+    ["경기도", ["경기"]],
+    ["강원", ["강원", "강원특별자치도"]],
+    ["강원도", ["강원", "강원특별자치도"]],
+    ["강원특별자치도", ["강원", "강원특별자치도"]],
+    ["충북", ["충북"]],
+    ["충청북도", ["충북"]],
+    ["충남", ["충남"]],
+    ["충청남도", ["충남"]],
+    ["전북", ["전북", "전북특별자치도"]],
+    ["전라북도", ["전북", "전북특별자치도"]],
+    ["전북특별자치도", ["전북", "전북특별자치도"]],
+    ["전남", ["전남"]],
+    ["전라남도", ["전남"]],
+    ["경북", ["경북"]],
+    ["경상북도", ["경북"]],
+    ["경남", ["경남"]],
+    ["경상남도", ["경남"]],
+    ["제주", ["제주"]],
+    ["제주특별자치도", ["제주"]],
+  ];
+
+  for (const [needle, hints] of aliases) {
+    if (raw.includes(needle)) {
+      return hints;
+    }
+  }
+
+  return [];
+}
+
+async function pickPreferredContourRoots(rootPath, location = {}) {
+  const hints = buildTerrainRegionHints(location);
+
+  if (!hints.length) {
+    return [rootPath];
+  }
+
+  try {
+    const entries = await readdir(rootPath, { withFileTypes: true });
+    const matchedRoots = entries
+      .filter((entry) => entry.isDirectory())
+      .filter((entry) => hints.some((hint) => entry.name.includes(hint)))
+      .map((entry) => path.join(rootPath, entry.name));
+
+    return matchedRoots.length ? matchedRoots : [rootPath];
+  } catch {
+    return [rootPath];
+  }
+}
+
 async function readShapefileHeaderBounds(filePath, sourceCrs) {
   const handle = await open(filePath, "r");
 
@@ -1566,13 +2441,14 @@ async function buildTerrainContourCatalogEntry(filePath, sourceCrs) {
   };
 }
 
-async function buildTerrainContourCatalog(contourPath, sourceCrs) {
+async function buildTerrainContourCatalog(contourPath, sourceCrs, location = {}) {
   const metadata = await stat(contourPath);
   const cacheKey = JSON.stringify({
     path: contourPath,
     mtimeMs: metadata.mtimeMs,
     size: metadata.size,
     crs: normalizeCrsId(sourceCrs),
+    regionHints: buildTerrainRegionHints(location),
   });
   const cachedCatalog = terrainContourCatalogCache.get(cacheKey);
 
@@ -1580,9 +2456,19 @@ async function buildTerrainContourCatalog(contourPath, sourceCrs) {
     return cachedCatalog;
   }
 
-  const sourceFiles = metadata.isDirectory()
-    ? await collectContourSourceFiles(contourPath)
-    : [contourPath];
+  let sourceFiles = [];
+
+  if (metadata.isDirectory()) {
+    const preferredRoots = await pickPreferredContourRoots(contourPath, location);
+
+    for (const preferredRoot of preferredRoots) {
+      const files = await collectContourSourceFiles(preferredRoot);
+      sourceFiles.push(...files);
+    }
+  } else {
+    sourceFiles = [contourPath];
+  }
+
   const entries = [];
 
   for (const filePath of sourceFiles) {
@@ -1609,7 +2495,7 @@ async function buildTerrainContourCatalog(contourPath, sourceCrs) {
   return catalog;
 }
 
-async function resolveOfficialContourCollection(clipFeature, config) {
+async function resolveOfficialContourCollection(location, clipFeature, config) {
   if (!config.terrainContourPath) {
     return null;
   }
@@ -1623,7 +2509,8 @@ async function resolveOfficialContourCollection(clipFeature, config) {
   const clipBounds = polygonBounds(clipRing);
   const catalog = await buildTerrainContourCatalog(
     config.terrainContourPath,
-    config.terrainContourCrs
+    config.terrainContourCrs,
+    location
   );
   const overlappingEntries = catalog.entries.filter(
     (entry) => entry.bounds && polygonBoundsOverlap(entry.bounds, clipBounds)
@@ -1632,13 +2519,20 @@ async function resolveOfficialContourCollection(clipFeature, config) {
     overlappingEntries,
     clipBounds
   );
+  console.log(
+    `[contours] area-matched files=${candidateEntries.length}/${catalog.entries.length}`
+  );
   const features = [];
 
   for (const entry of candidateEntries) {
-    const dataset = await loadTerrainContourDatasetByPath(
-      entry.path,
-      catalog.sourceCrs
-    );
+    const dataset =
+      entry.extension === ".shp"
+        ? await loadIndexedShapefileTerrainContourDataset(
+            entry.path,
+            catalog.sourceCrs,
+            clipBounds
+          )
+        : await loadTerrainContourDatasetByPath(entry.path, catalog.sourceCrs);
 
     for (const record of dataset.features || []) {
       if (!record?.bounds || !polygonBoundsOverlap(record.bounds, clipBounds)) {
@@ -1668,18 +2562,119 @@ async function resolveOfficialContourCollection(clipFeature, config) {
   };
 }
 
-function pickPolygonFeature(features, location) {
-  const point = [location.lng, location.lat];
+function buildLocationParcelLookup(location = {}) {
+  const directPnu = extractPnuFromValue(location?.pnu);
+  const jusoPnu = buildPnuFromParts(
+    location?.juso?.admCd,
+    location?.juso?.mtYn,
+    location?.juso?.lnbrMnnm,
+    location?.juso?.lnbrSlno
+  );
+  const pnu = directPnu || jusoPnu || "";
+  const parcelReference = decomposePnu(pnu);
+  const parcelAddressKey = normalizeAddressKey(location?.parcelAddress);
+  const jibunKeys = new Set();
 
-  for (const feature of features) {
-    const ring = getOuterRing(feature);
+  if (parcelReference) {
+    const mainNumber = String(Number(parcelReference.bun || 0));
+    const subNumber = String(Number(parcelReference.ji || 0));
+    const plainJibun = subNumber === "0" ? mainNumber : `${mainNumber}-${subNumber}`;
+    jibunKeys.add(normalizeAddressKey(plainJibun));
 
-    if (ring && pointInRing(point, ring)) {
-      return feature;
+    if (parcelReference.platGbCd === "1") {
+      jibunKeys.add(normalizeAddressKey(`산 ${plainJibun}`));
     }
   }
 
-  return features.find((feature) => Boolean(getOuterRing(feature))) || null;
+  return {
+    pnu,
+    parcelAddressKey,
+    jibunKeys,
+  };
+}
+
+function scoreParcelFeatureCandidate(feature, lookup, point, index) {
+  const ring = getOuterRing(feature);
+
+  if (!ring) {
+    return null;
+  }
+
+  const properties = feature?.properties || {};
+  const featurePnu = extractPnuFromProperties(properties);
+  const addressKey = normalizeAddressKey(properties.addr || properties.ADDR || "");
+  const jibunKey = normalizeAddressKey(properties.jibun || properties.JIBUN || "");
+  const pointInside = Number.isFinite(point?.[0]) && Number.isFinite(point?.[1])
+    ? isPointInsideFeature(point, feature)
+    : false;
+  const areaSquareMeters = Math.max(
+    0,
+    polygonAreaSquareMeters(ring) || Number.POSITIVE_INFINITY
+  );
+  const centroid = centroidOfRing(ring);
+  let centroidDistanceSquared = Number.POSITIVE_INFINITY;
+
+  if (centroid && Number.isFinite(point?.[0]) && Number.isFinite(point?.[1])) {
+    const [dx, dy] = localMetersFromLngLat(centroid, {
+      lng: point[0],
+      lat: point[1],
+    });
+    centroidDistanceSquared = dx * dx + dy * dy;
+  }
+
+  return {
+    feature,
+    index,
+    pnuMatch: Boolean(lookup.pnu && featurePnu === lookup.pnu),
+    addressExactMatch: Boolean(
+      lookup.parcelAddressKey &&
+        addressKey &&
+        addressKey === lookup.parcelAddressKey
+    ),
+    addressPartialMatch: Boolean(
+      lookup.parcelAddressKey &&
+        addressKey &&
+        (addressKey.includes(lookup.parcelAddressKey) ||
+          lookup.parcelAddressKey.includes(addressKey))
+    ),
+    jibunMatch: Boolean(
+      lookup.jibunKeys.size &&
+        ((jibunKey && lookup.jibunKeys.has(jibunKey)) ||
+          [...lookup.jibunKeys].some(
+            (candidate) => candidate && addressKey && addressKey.includes(candidate)
+          ))
+    ),
+    pointInside,
+    areaSquareMeters,
+    centroidDistanceSquared,
+  };
+}
+
+function pickPolygonFeature(features, location) {
+  const lookup = buildLocationParcelLookup(location);
+  const point = [Number(location?.lng), Number(location?.lat)];
+  const scoredFeatures = (features || [])
+    .map((feature, index) =>
+      scoreParcelFeatureCandidate(normalizeParcelFeature(feature), lookup, point, index)
+    )
+    .filter(Boolean);
+
+  if (!scoredFeatures.length) {
+    return features.find((feature) => Boolean(getOuterRing(feature))) || null;
+  }
+
+  scoredFeatures.sort((left, right) =>
+    Number(right.pnuMatch) - Number(left.pnuMatch) ||
+    Number(right.addressExactMatch) - Number(left.addressExactMatch) ||
+    Number(right.jibunMatch) - Number(left.jibunMatch) ||
+    Number(right.pointInside) - Number(left.pointInside) ||
+    Number(right.addressPartialMatch) - Number(left.addressPartialMatch) ||
+    left.areaSquareMeters - right.areaSquareMeters ||
+    left.centroidDistanceSquared - right.centroidDistanceSquared ||
+    left.index - right.index
+  );
+
+  return scoredFeatures[0]?.feature || null;
 }
 
 async function fetchVWorldFeatureCollection(
@@ -1782,10 +2777,131 @@ function mapVWorldSearchItems(items, searchType) {
     );
 }
 
-function dedupeSearchItems(items) {
-  const seen = new Set();
+function buildSearchQueryHints(query) {
+  const normalizedQuery = normalizeAddressKey(query);
+  const parcelReference = parseParcelAddressReference(query);
+  const roadAddressQuery = /(?:로|길|대로)\d/u.test(String(query || "").replace(/\s+/g, ""));
+  const areaQuery = parcelReference
+    ? String(query || "")
+        .replace(/(?:^|\s)(\uC0B0)?\s*\d+(?:-\d+)?\s*$/u, "")
+        .trim()
+    : "";
 
-  return items.filter((item) => {
+  return {
+    normalizedQuery,
+    parcelReference,
+    mainNumber: normalizeDigits(parcelReference?.bun),
+    subNumber: normalizeDigits(parcelReference?.ji),
+    mtYn: parcelReference?.mtYn || "0",
+    roadAddressQuery,
+    areaQuery,
+    normalizedAreaQuery: normalizeAddressKey(areaQuery),
+  };
+}
+
+function extractSearchItemParcelReference(item) {
+  const pnuReference = decomposePnu(item?.pnu);
+
+  if (pnuReference) {
+    return {
+      mtYn: pnuReference.platGbCd === "1" ? "1" : "0",
+      bun: normalizeDigits(pnuReference.bun),
+      ji: normalizeDigits(pnuReference.ji),
+    };
+  }
+
+  if (normalizeDigits(item?.juso?.admCd, 10).length === 10) {
+    return {
+      mtYn: String(item?.juso?.mtYn ?? "0"),
+      bun: normalizeDigits(item?.juso?.lnbrMnnm),
+      ji: normalizeDigits(item?.juso?.lnbrSlno),
+    };
+  }
+
+  return parseParcelAddressReference(item?.parcelAddress || "");
+}
+
+function scoreSearchItemQueryMatch(item, query) {
+  const hints =
+    query && typeof query === "object" ? query : buildSearchQueryHints(query || "");
+
+  if (!hints.normalizedQuery && !hints.parcelReference) {
+    return 0;
+  }
+
+  const parcelAddressKey = normalizeAddressKey(item?.parcelAddress);
+  const roadAddressKey = normalizeAddressKey(item?.roadAddress);
+  const labelKey = normalizeAddressKey(item?.label);
+  let score = 0;
+
+  if (hints.normalizedQuery) {
+    if (parcelAddressKey && parcelAddressKey === hints.normalizedQuery) {
+      score += 1200;
+    } else if (roadAddressKey && roadAddressKey === hints.normalizedQuery) {
+      score += 700;
+    } else if (
+      parcelAddressKey &&
+      (parcelAddressKey.includes(hints.normalizedQuery) ||
+        hints.normalizedQuery.includes(parcelAddressKey))
+    ) {
+      score += 400;
+    } else if (
+      roadAddressKey &&
+      (roadAddressKey.includes(hints.normalizedQuery) ||
+        hints.normalizedQuery.includes(roadAddressKey))
+    ) {
+      score += 220;
+    } else if (labelKey && labelKey.includes(hints.normalizedQuery)) {
+      score += 80;
+    }
+  }
+
+  if (hints.parcelReference) {
+    const itemReference = extractSearchItemParcelReference(item);
+    const mainMatch =
+      normalizeDigits(itemReference?.bun) === hints.mainNumber && hints.mainNumber;
+    const subMatch =
+      normalizeDigits(itemReference?.ji) === hints.subNumber &&
+      normalizeDigits(hints.subNumber) === normalizeDigits(itemReference?.ji);
+    const mtMatch = String(itemReference?.mtYn ?? "0") === hints.mtYn;
+
+    if (mainMatch && subMatch && mtMatch) {
+      score += 3000;
+    } else if (mainMatch && subMatch) {
+      score += 1800;
+    } else if (mainMatch) {
+      score += 650;
+    }
+
+    if (item?.searchType === "parcel") {
+      score += 150;
+    }
+
+    if (item?.parcelAddress) {
+      score += 120;
+    } else if (item?.roadAddress) {
+      score -= 80;
+    }
+  }
+
+  return score;
+}
+
+function scoreSearchItemParcelConfidence(item, query = "") {
+  return (
+    (extractPnuFromValue(item?.pnu) ? 1000 : 0) +
+    (normalizeDigits(item?.juso?.admCd, 10).length === 10 ? 250 : 0) +
+    (item?.parcelAddress ? 40 : 0) +
+    (item?.searchType === "parcel" ? 20 : 0) +
+    (String(item?.provider || "").includes("juso") ? 10 : 0) +
+    scoreSearchItemQueryMatch(item, query)
+  );
+}
+
+function dedupeSearchItems(items, query = "") {
+  const bestByKey = new Map();
+
+  for (const item of items || []) {
     const key = [
       item.label,
       item.roadAddress,
@@ -1793,14 +2909,18 @@ function dedupeSearchItems(items) {
       item.lat.toFixed(6),
       item.lng.toFixed(6),
     ].join("|");
+    const existing = bestByKey.get(key);
 
-    if (seen.has(key)) {
-      return false;
+    if (
+      !existing ||
+      scoreSearchItemParcelConfidence(item, query) >
+        scoreSearchItemParcelConfidence(existing, query)
+    ) {
+      bestByKey.set(key, item);
     }
+  }
 
-    seen.add(key);
-    return true;
-  });
+  return [...bestByKey.values()];
 }
 
 function normalizeAddressKey(value) {
@@ -1842,6 +2962,25 @@ function getVWorldResponseErrorText(payload) {
     payload?.response?.message ||
     payload?.message ||
     ""
+  );
+}
+
+function isVWorldNoResultStatus(status, errorText = "") {
+  const normalizedStatus = String(status || "").trim().toUpperCase();
+  const normalizedErrorText = normalizeAddressKey(errorText);
+
+  if (!normalizedStatus) {
+    return false;
+  }
+
+  return (
+    normalizedStatus === "NOT_FOUND" ||
+    normalizedStatus === "NO_DATA" ||
+    normalizedStatus === "NO_RESULT" ||
+    normalizedStatus === "EMPTY" ||
+    normalizedErrorText.includes("검색결과가없습니다") ||
+    normalizedErrorText.includes("조회결과가없습니다") ||
+    normalizedErrorText.includes("결과가없습니다")
   );
 }
 
@@ -2005,13 +3144,29 @@ async function geocodeJusoCandidate(item, config) {
   let result = null;
 
   if (config.vworldApiKey) {
-    const roadResults = item.roadAddress
-      ? await searchVWorldCategory(item.roadAddress, "road", config)
-      : [];
-    const parcelResults =
-      roadResults.length === 0 && item.parcelAddress
-        ? await searchVWorldCategory(item.parcelAddress, "parcel", config)
-        : [];
+    let roadResults = [];
+    let parcelResults = [];
+
+    if (item.roadAddress) {
+      try {
+        roadResults = await searchVWorldCategory(item.roadAddress, "road", config);
+      } catch {
+        roadResults = [];
+      }
+    }
+
+    if (roadResults.length === 0 && item.parcelAddress) {
+      try {
+        parcelResults = await searchVWorldCategory(
+          item.parcelAddress,
+          "parcel",
+          config
+        );
+      } catch {
+        parcelResults = [];
+      }
+    }
+
     result = roadResults[0] || parcelResults[0] || null;
   }
 
@@ -2036,22 +3191,273 @@ async function geocodeJusoCandidate(item, config) {
   };
 }
 
+function hasSearchParcelReference(item) {
+  const pnu = extractPnuFromValue(item?.pnu);
+  const admCd = normalizeDigits(item?.juso?.admCd, 10);
+  return Boolean(pnu || admCd.length === 10);
+}
+
+function mergeSearchReference(baseItem, enrichedItem) {
+  if (!enrichedItem) {
+    return baseItem;
+  }
+
+  return {
+    ...baseItem,
+    provider: enrichedItem.provider || baseItem.provider,
+    roadAddress: enrichedItem.roadAddress || baseItem.roadAddress || "",
+    parcelAddress: enrichedItem.parcelAddress || baseItem.parcelAddress || "",
+    pnu: enrichedItem.pnu || baseItem.pnu || "",
+    juso: enrichedItem.juso || baseItem.juso || null,
+    buildingName: enrichedItem.buildingName || baseItem.buildingName || "",
+  };
+}
+
+async function hydrateSearchItemsWithReverse(items, config, limit = 5) {
+  if (!config.vworldApiKey || !Array.isArray(items) || !items.length) {
+    return items;
+  }
+
+  const hydrated = [];
+
+  for (const item of items) {
+    if (
+      hydrated.length >= limit ||
+      hasSearchParcelReference(item) ||
+      !Number.isFinite(item?.lat) ||
+      !Number.isFinite(item?.lng)
+    ) {
+      hydrated.push(item);
+      continue;
+    }
+
+    try {
+      const reverseResult = await reverseWithVWorld(item.lat, item.lng, config);
+      hydrated.push(mergeSearchReference(item, reverseResult));
+    } catch {
+      hydrated.push(item);
+    }
+  }
+
+  return hydrated;
+}
+
+function sortSearchItemsByParcelConfidence(items, query = "") {
+  return [...items]
+    .map((item, index) => ({
+      item,
+      index,
+      score: scoreSearchItemParcelConfidence(item, query),
+    }))
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .map((entry) => entry.item);
+}
+
+function buildSearchItemParcelKey(item) {
+  const pnu = extractPnuFromValue(item?.pnu);
+
+  if (pnu) {
+    return `pnu:${pnu}`;
+  }
+
+  const reference = extractSearchItemParcelReference(item);
+  const admCd = normalizeDigits(item?.juso?.admCd, 10);
+
+  if (reference?.bun) {
+    return `ref:${admCd}:${reference.mtYn || "0"}:${reference.bun}:${reference.ji || "0"}`;
+  }
+
+  const parcelAddressKey = normalizeAddressKey(item?.parcelAddress);
+
+  if (parcelAddressKey) {
+    return `addr:${parcelAddressKey}`;
+  }
+
+  return `coord:${Number(item?.lat || 0).toFixed(6)}:${Number(item?.lng || 0).toFixed(6)}`;
+}
+
+function collapseSearchItemsByParcel(items, query = "") {
+  const bestByKey = new Map();
+
+  for (const item of items || []) {
+    const key = buildSearchItemParcelKey(item);
+    const existing = bestByKey.get(key);
+
+    if (
+      !existing ||
+      scoreSearchItemParcelConfidence(item, query) >
+        scoreSearchItemParcelConfidence(existing, query)
+    ) {
+      bestByKey.set(key, item);
+    }
+  }
+
+  return [...bestByKey.values()];
+}
+
+function normalizeSearchResultsForQuery(items, query = "") {
+  const sorted = sortSearchItemsByParcelConfidence(
+    dedupeSearchItems(items, query),
+    query
+  );
+  const hints = buildSearchQueryHints(query);
+
+  if (hints.roadAddressQuery) {
+    const roadOnly = sorted.filter((item) => item?.searchType === "road");
+    return roadOnly.length ? roadOnly : sorted;
+  }
+
+  if (!hints.parcelReference) {
+    return sorted;
+  }
+
+  const explicitParcelCandidates = sorted.filter(
+    (item) => item?.searchType === "parcel"
+  );
+  const parcelCandidates = explicitParcelCandidates.length
+    ? explicitParcelCandidates
+    : sorted.filter(
+        (item) =>
+          Boolean(extractSearchItemParcelReference(item)) ||
+          Boolean(extractPnuFromValue(item?.pnu))
+      );
+  const scopedCandidates = parcelCandidates.length ? parcelCandidates : sorted;
+
+  let filtered = scopedCandidates;
+  const mainMatches = filtered.filter(
+    (item) =>
+      normalizeDigits(extractSearchItemParcelReference(item)?.bun) ===
+      hints.mainNumber
+  );
+
+  if (mainMatches.length) {
+    filtered = mainMatches;
+  }
+
+  if (hints.subNumber) {
+    const subMatches = filtered.filter(
+      (item) =>
+        normalizeDigits(extractSearchItemParcelReference(item)?.ji) ===
+        normalizeDigits(hints.subNumber)
+    );
+
+    if (subMatches.length) {
+      filtered = subMatches;
+    }
+  }
+
+  const mtMatches = filtered.filter(
+    (item) =>
+      String(extractSearchItemParcelReference(item)?.mtYn || "0") === hints.mtYn
+  );
+
+  if (mtMatches.length) {
+    filtered = mtMatches;
+  } else if (hints.mtYn === "1") {
+    const textualMtMatches = filtered.filter((item) =>
+      normalizeAddressKey(item?.parcelAddress || item?.label || "").includes(
+        "산"
+      )
+    );
+
+    if (textualMtMatches.length) {
+      filtered = textualMtMatches;
+    }
+  }
+
+  return sortSearchItemsByParcelConfidence(
+    collapseSearchItemsByParcel(filtered, query),
+    query
+  );
+}
+
+async function finalizeSearchResults(primaryResults, query, config) {
+  const baseResults = normalizeSearchResultsForQuery(primaryResults, query);
+  const hints = buildSearchQueryHints(query);
+
+  if (!hints.parcelReference || !config.vworldApiKey || !baseResults.length) {
+    return baseResults;
+  }
+
+  try {
+    const parcelFallbackResults = await geocodeParcelQueryWithDataFallback(
+      query,
+      baseResults,
+      config
+    );
+
+    if (!parcelFallbackResults.length) {
+      return baseResults;
+    }
+
+    return normalizeSearchResultsForQuery(
+      [...parcelFallbackResults, ...baseResults],
+      query
+    );
+  } catch (error) {
+    console.warn(
+      `[search] parcel merge fallback failed query="${query}" error="${error?.message || error}"`
+    );
+    return baseResults;
+  }
+}
+
 async function geocodeWithPreferredProviders(query, config) {
+  const hints = buildSearchQueryHints(query);
   let vworldItems = [];
   let jusoItems = [];
+  const providerErrors = [];
 
   if (config.vworldApiKey) {
     try {
       vworldItems = await geocodeWithVWorld(query, config);
     } catch (error) {
+      providerErrors.push(error);
       if (!config.useNominatimFallback) {
         throw error;
       }
     }
   }
 
-  if (config.jusoConfirmKey) {
-    jusoItems = await searchJuso(query, config);
+  if (hints.parcelReference) {
+    if (vworldItems.length) {
+      const hydrated = await hydrateSearchItemsWithReverse(vworldItems, config);
+      return {
+        provider: "vworld",
+        results: await finalizeSearchResults(hydrated, query, config),
+      };
+    }
+
+    try {
+      const parcelFallbackResults = await geocodeParcelQueryWithDataFallback(
+        query,
+        [],
+        config
+      );
+
+      if (parcelFallbackResults.length) {
+        return {
+          provider: "vworld-data",
+          results: normalizeSearchResultsForQuery(parcelFallbackResults, query),
+        };
+      }
+    } catch (error) {
+      console.warn(
+        `[search] direct parcel fallback failed query="${query}" error="${error?.message || error}"`
+      );
+    }
+  }
+
+  if (config.jusoConfirmKey && !hints.parcelReference) {
+    try {
+      jusoItems = await searchJuso(query, config);
+    } catch (error) {
+      providerErrors.push(error);
+
+      if (!config.useNominatimFallback) {
+        throw error;
+      }
+    }
   }
 
   if (vworldItems.length && jusoItems.length) {
@@ -2066,14 +3472,23 @@ async function geocodeWithPreferredProviders(query, config) {
       }
     }
 
+    const combined = await hydrateSearchItemsWithReverse(
+      [...merged, ...hydrated],
+      config
+    );
+
     return {
       provider: hydrated.length ? "vworld+juso" : "vworld",
-      results: dedupeSearchItems([...merged, ...hydrated]),
+      results: await finalizeSearchResults(combined, query, config),
     };
   }
 
   if (vworldItems.length) {
-    return { provider: "vworld", results: dedupeSearchItems(vworldItems) };
+    const hydrated = await hydrateSearchItemsWithReverse(vworldItems, config);
+    return {
+      provider: "vworld",
+      results: await finalizeSearchResults(hydrated, query, config),
+    };
   }
 
   if (jusoItems.length) {
@@ -2089,15 +3504,46 @@ async function geocodeWithPreferredProviders(query, config) {
 
     return {
       provider: hydrated.length ? "juso+geocoded" : "juso",
-      results: dedupeSearchItems(hydrated),
+      results: await finalizeSearchResults(hydrated, query, config),
     };
   }
 
   if (config.useNominatimFallback) {
+    let fallbackResults = [];
+
+    try {
+      fallbackResults = await geocodeWithNominatim(query);
+    } catch (error) {
+      providerErrors.push(error);
+    }
+
+    let parcelFallbackResults = [];
+
+    try {
+      parcelFallbackResults = await geocodeParcelQueryWithDataFallback(
+        query,
+        fallbackResults,
+        config
+      );
+    } catch (error) {
+      console.warn(
+        `[search] parcel fallback bypassed query="${query}" error="${error?.message || error}"`
+      );
+    }
+
     return {
-      provider: "nominatim",
-      results: await geocodeWithNominatim(query),
+      provider: parcelFallbackResults.length ? "nominatim+vworld-data" : "nominatim",
+      results: normalizeSearchResultsForQuery(
+        parcelFallbackResults.length ? parcelFallbackResults : fallbackResults,
+        query
+      ),
     };
+  }
+
+  if (providerErrors.length) {
+    console.warn(
+      `[search] no provider returned results query="${query}" lastError="${providerErrors.at(-1)?.message || providerErrors.at(-1)}"`
+    );
   }
 
   return {
@@ -2147,6 +3593,179 @@ function normalizeParcelFeature(feature) {
       jibun: properties.jibun || properties.JIBUN || "",
     },
   };
+}
+
+function buildFeatureMapKey(feature, preferredPropertyKeys = []) {
+  const properties = feature?.properties || {};
+
+  for (const key of preferredPropertyKeys) {
+    const value = String(properties?.[key] || "").trim();
+
+    if (value) {
+      return value;
+    }
+  }
+
+  return String(
+    feature?.id || properties?.pk || properties?.fid || JSON.stringify(feature?.geometry || {})
+  );
+}
+
+function inferRoadWidthMeters(properties = {}) {
+  const directWidthCandidates = [
+    properties.width,
+    properties.road_width,
+    properties.roadWidth,
+    properties.width_m,
+    properties.r_wd,
+    properties.rd_wd,
+    properties.ln_wd,
+    properties.lane_wd,
+  ]
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 1 && value <= 80);
+
+  if (directWidthCandidates.length) {
+    return directWidthCandidates[0];
+  }
+
+  const laneCountCandidates = [
+    properties.lane_cnt,
+    properties.laneCount,
+    properties.lanes,
+    properties.lane_co,
+    properties.car_lane,
+  ]
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0 && value <= 20);
+
+  if (laneCountCandidates.length) {
+    return Math.max(4, laneCountCandidates[0] * 3.25);
+  }
+
+  return DEFAULT_ROAD_WIDTH_METERS;
+}
+
+function inferOsmRoadWidthMeters(highway = "") {
+  const normalized = String(highway || "").trim().toLowerCase();
+
+  switch (normalized) {
+    case "motorway":
+    case "motorway_link":
+      return 12;
+    case "trunk":
+    case "trunk_link":
+      return 10;
+    case "primary":
+    case "primary_link":
+      return 8.5;
+    case "secondary":
+    case "secondary_link":
+      return 7.5;
+    case "tertiary":
+    case "tertiary_link":
+      return 6.5;
+    case "residential":
+    case "living_street":
+    case "service":
+    case "unclassified":
+      return 5.5;
+    case "track":
+      return 4.5;
+    case "cycleway":
+    case "footway":
+    case "path":
+    case "pedestrian":
+      return 3;
+    default:
+      return DEFAULT_ROAD_WIDTH_METERS;
+  }
+}
+
+function normalizeRoadFeature(feature, sourceLayer = "") {
+  const properties = feature?.properties || {};
+
+  return {
+    ...feature,
+    properties: {
+      ...properties,
+      roadId: buildFeatureMapKey(feature, [
+        "link_id",
+        "LINK_ID",
+        "id",
+        "ID",
+        "uid",
+        "UID",
+      ]),
+      roadName: String(
+        properties.road_nm ||
+          properties.ROAD_NM ||
+          properties.name ||
+          properties.NAME ||
+          properties.rd_nm ||
+          properties.RD_NM ||
+          ""
+      ).trim(),
+      widthMeters: Number(inferRoadWidthMeters(properties).toFixed(2)),
+      sourceLayer,
+    },
+  };
+}
+
+function mapOverpassRoadCollection(payload) {
+  const elements = Array.isArray(payload?.elements) ? payload.elements : [];
+
+  return featureCollection(
+    elements
+      .filter(
+        (element) =>
+          element?.type === "way" &&
+          Array.isArray(element?.geometry) &&
+          element.geometry.length >= 2
+      )
+      .map((element) =>
+        lineFeature(
+          element.geometry.map((point) => [Number(point.lon), Number(point.lat)]),
+          {
+            roadId: String(element.id || ""),
+            roadName: String(element?.tags?.name || "").trim(),
+            highway: String(element?.tags?.highway || "").trim(),
+            widthMeters: inferOsmRoadWidthMeters(element?.tags?.highway),
+            sourceLayer: "overpass-highway",
+          }
+        )
+      )
+  );
+}
+
+async function fetchOverpassRoadCollection(clipFeature) {
+  const clipRing = getOuterRing(clipFeature);
+
+  if (!clipRing?.length) {
+    return featureCollection([]);
+  }
+
+  const bounds = polygonBounds(clipRing);
+  const body = `[out:json][timeout:25];
+(
+  way["highway"]["area"!~"yes"](${bounds.minLat},${bounds.minLng},${bounds.maxLat},${bounds.maxLng});
+);
+out geom;`;
+  const response = await fetch("https://overpass-api.de/api/interpreter", {
+    method: "POST",
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "User-Agent": "site-context-planner/0.1 (local development)",
+    },
+    body,
+  });
+
+  if (!response.ok) {
+    throw new Error(`Overpass road request failed with ${response.status}`);
+  }
+
+  const payload = await response.json();
+  return mapOverpassRoadCollection(payload);
 }
 
 function buildVWorldBuildingAddress(properties) {
@@ -2981,10 +4600,15 @@ async function searchVWorldCategory(query, category, config) {
 
   const payload = await response.json();
   const status = getVWorldResponseStatus(payload);
+  const errorText = getVWorldResponseErrorText(payload);
 
   if (status && status !== "OK") {
+    if (isVWorldNoResultStatus(status, errorText)) {
+      return [];
+    }
+
     throw new Error(
-      getVWorldResponseErrorText(payload) ||
+      errorText ||
         `VWorld ${category} geocode returned ${status}`
     );
   }
@@ -2996,12 +4620,35 @@ async function searchVWorldCategory(query, category, config) {
 }
 
 async function geocodeWithVWorld(query, config) {
-  const [roadItems, parcelItems] = await Promise.all([
-    searchVWorldCategory(query, "road", config),
-    searchVWorldCategory(query, "parcel", config),
-  ]);
+  const hints = buildSearchQueryHints(query);
+  const categories = hints.parcelReference
+    ? ["parcel"]
+    : hints.roadAddressQuery
+      ? ["road"]
+      : ["road", "parcel"];
+  const settledResults = await Promise.allSettled(
+    categories.map((category) => searchVWorldCategory(query, category, config))
+  );
+  const recoveredItems = [];
+  const errors = [];
 
-  return dedupeSearchItems([...roadItems, ...parcelItems]);
+  for (const result of settledResults) {
+    if (result.status === "fulfilled") {
+      recoveredItems.push(...(result.value || []));
+    } else {
+      errors.push(result.reason);
+    }
+  }
+
+  if (recoveredItems.length) {
+    return dedupeSearchItems(recoveredItems, query);
+  }
+
+  if (errors.length) {
+    throw errors[0];
+  }
+
+  return [];
 }
 
 async function geocodeWithNominatim(query) {
@@ -3036,7 +4683,201 @@ async function geocodeWithNominatim(query) {
     lng: Number(item.lon),
     provider: "nominatim",
     searchType: "mixed",
+    boundingbox: Array.isArray(item.boundingbox)
+      ? item.boundingbox.map((value) => Number(value))
+      : [],
+    osmType: item.osm_type || "",
+    placeType: item.type || item.addresstype || "",
+    className: item.class || "",
   }));
+}
+
+function estimateSearchAnchorBufferMeters(anchor) {
+  const lat = Number(anchor?.lat);
+  const lng = Number(anchor?.lng);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return 800;
+  }
+
+  const boundingbox = Array.isArray(anchor?.boundingbox)
+    ? anchor.boundingbox.map((value) => Number(value))
+    : [];
+
+  if (boundingbox.length !== 4 || boundingbox.some((value) => !Number.isFinite(value))) {
+    return 1200;
+  }
+
+  const [south, north, west, east] = boundingbox;
+  const center = { lat, lng };
+  const corners = [
+    [west, south],
+    [west, north],
+    [east, south],
+    [east, north],
+  ];
+  let maxDistance = 0;
+
+  for (const corner of corners) {
+    const [dx, dy] = localMetersFromLngLat(corner, center);
+    maxDistance = Math.max(maxDistance, Math.sqrt(dx * dx + dy * dy));
+  }
+
+  return Math.max(300, Math.min(6000, Math.ceil(maxDistance + 200)));
+}
+
+function buildSearchItemFromParcelFeature(feature, areaAnchor) {
+  const normalizedFeature = normalizeParcelFeature(feature);
+  const ring = getOuterRing(normalizedFeature);
+  const centroid = ring ? centroidOfRing(ring) : null;
+  const properties = normalizedFeature?.properties || {};
+
+  return {
+    id: properties.pnu || `parcel-data-${Math.random().toString(36).slice(2, 10)}`,
+    label: properties.addr || properties.jibun || areaAnchor?.label || "Parcel search result",
+    roadAddress: "",
+    parcelAddress: properties.addr || properties.jibun || "",
+    lat: Number(centroid?.[1] ?? areaAnchor?.lat ?? 0),
+    lng: Number(centroid?.[0] ?? areaAnchor?.lng ?? 0),
+    provider: "vworld-data",
+    searchType: "parcel",
+    pnu: properties.pnu || "",
+  };
+}
+
+async function geocodeParcelQueryWithDataFallback(query, fallbackResults, config) {
+  if (!config.vworldApiKey) {
+    return [];
+  }
+
+  const hints = buildSearchQueryHints(query);
+  const anchorMap = new Map();
+
+  if (!hints.parcelReference || !hints.mainNumber) {
+    return [];
+  }
+
+  for (const anchor of fallbackResults || []) {
+    if (!Number.isFinite(anchor?.lat) || !Number.isFinite(anchor?.lng)) {
+      continue;
+    }
+
+    const key = `${Number(anchor.lat).toFixed(6)}:${Number(anchor.lng).toFixed(6)}`;
+
+    if (!anchorMap.has(key)) {
+      anchorMap.set(key, anchor);
+    }
+  }
+
+  if (hints.areaQuery) {
+    for (const category of ["parcel", "road"]) {
+      try {
+        const areaAnchors = await searchVWorldCategory(
+          hints.areaQuery,
+          category,
+          config
+        );
+
+        for (const anchor of areaAnchors.slice(0, 4)) {
+          if (!Number.isFinite(anchor?.lat) || !Number.isFinite(anchor?.lng)) {
+            continue;
+          }
+
+          const key = `${Number(anchor.lat).toFixed(6)}:${Number(anchor.lng).toFixed(6)}`;
+
+          if (!anchorMap.has(key)) {
+            anchorMap.set(key, anchor);
+          }
+        }
+      } catch {
+        // Ignore area-anchor lookup failures and keep the current fallback anchors.
+      }
+    }
+  }
+
+  const anchors = [...anchorMap.values()];
+
+  if (!anchors.length) {
+    return [];
+  }
+
+  const rankedCandidates = [];
+
+  for (const anchor of anchors.slice(0, 6)) {
+    if (!Number.isFinite(anchor?.lat) || !Number.isFinite(anchor?.lng)) {
+      continue;
+    }
+
+    const bufferMeters = Math.max(1200, estimateSearchAnchorBufferMeters(anchor));
+    let collection = null;
+
+    try {
+      collection = await fetchAllVWorldFeatureCollections(
+        "LP_PA_CBND_BUBUN",
+        `POINT(${anchor.lng} ${anchor.lat})`,
+        bufferMeters,
+        config,
+        250,
+        10
+      );
+    } catch (error) {
+      console.warn(
+        `[search] parcel data fallback failed query="${query}" anchor="${anchor?.label || ""}" error="${error?.message || error}"`
+      );
+      continue;
+    }
+
+    const areaAnchorKey = normalizeAddressKey(
+      anchor?.parcelAddress || anchor?.roadAddress || anchor?.label || ""
+    );
+
+    for (const feature of collection.features || []) {
+      const searchItem = buildSearchItemFromParcelFeature(feature, anchor);
+      const matchScore = scoreSearchItemQueryMatch(searchItem, hints);
+
+      if (matchScore < 650) {
+        continue;
+      }
+
+      const parcelAddressKey = normalizeAddressKey(searchItem.parcelAddress);
+      let score = scoreSearchItemParcelConfidence(searchItem, hints);
+
+      if (
+        hints.normalizedAreaQuery &&
+        parcelAddressKey &&
+        parcelAddressKey.includes(hints.normalizedAreaQuery)
+      ) {
+        score += 1200;
+      } else if (
+        hints.normalizedAreaQuery &&
+        areaAnchorKey &&
+        areaAnchorKey.includes(hints.normalizedAreaQuery)
+      ) {
+        score += 300;
+      }
+
+      rankedCandidates.push({
+        item: searchItem,
+        score,
+        areaSquareMeters: Math.max(
+          0,
+          polygonAreaSquareMeters(getOuterRing(normalizeParcelFeature(feature))) ||
+            Number.POSITIVE_INFINITY
+        ),
+      });
+    }
+  }
+
+  return rankedCandidates
+    .sort(
+      (left, right) =>
+        right.score - left.score || left.areaSquareMeters - right.areaSquareMeters
+    )
+    .map((entry) => entry.item)
+    .filter((item, index, array) =>
+      array.findIndex((candidate) => candidate.pnu === item.pnu) === index
+    )
+    .slice(0, 8);
 }
 
 function parseParcelAddressReference(value) {
@@ -3164,7 +5005,27 @@ async function reverseWithNominatim(lat, lng) {
   };
 }
 
-function buildClipBoundary(location, options, parcelFeature) {
+function buildClipBoundary(location, options, parcelFeature, customBounds = null) {
+  const normalizedBounds = normalizeCustomBounds(customBounds);
+
+  if (normalizedBounds) {
+    return polygonFeature(
+      [
+        [
+          [normalizedBounds.minLng, normalizedBounds.minLat],
+          [normalizedBounds.maxLng, normalizedBounds.minLat],
+          [normalizedBounds.maxLng, normalizedBounds.maxLat],
+          [normalizedBounds.minLng, normalizedBounds.maxLat],
+          [normalizedBounds.minLng, normalizedBounds.minLat],
+        ],
+      ],
+      {
+        shape: "rectangle",
+        selectionMode: "range",
+      }
+    );
+  }
+
   const radius = Math.max(30, Number(options.radius) || 120);
   return polygonFeature(createRectangleRing(location, radius * 2, radius * 2), {
     shape: "rectangle",
@@ -3239,9 +5100,31 @@ function quantizeTerrainHeight(siteContext, height) {
     return height;
   }
 
-  return quantizeAbsoluteElevation(
+  const interval = resolveEffectiveContourBandInterval(siteContext);
+
+  return quantizeAbsoluteElevationUpward(height, interval);
+}
+
+function resolveBuildingPlacementContourInterval(siteContext) {
+  return normalizeContourInterval(
+    siteContext?.stats?.effectiveContourBandInterval ??
+      siteContext?.stats?.requestedContourInterval ??
+      siteContext?.options?.contourInterval
+  );
+}
+
+function quantizeBuildingPlacementHeight(siteContext, height) {
+  if (!Number.isFinite(height)) {
+    return height;
+  }
+
+  if (siteContext?.options?.terrainMode !== "contour") {
+    return height;
+  }
+
+  return quantizeAbsoluteElevationUpward(
     height,
-    siteContext.options?.contourInterval
+    resolveBuildingPlacementContourInterval(siteContext)
   );
 }
 
@@ -3639,28 +5522,30 @@ function distanceSquaredPointToContourRecord(xMeters, yMeters, contourRecord) {
 function resolveContourDrivenSampleStep(widthMeters, heightMeters, contourInterval) {
   const longestSide = Math.max(widthMeters, heightMeters, 1);
   const longestSideStep =
-    longestSide <= 300
-      ? 2
-      : longestSide <= 600
-        ? 2.5
+    longestSide <= 120
+      ? 0.75
+      : longestSide <= 300
+        ? 1
+        : longestSide <= 600
+          ? 1.5
         : longestSide <= 1000
-          ? 3.5
+          ? 2.5
           : longestSide <= 1600
-            ? 5
-            : 7;
+            ? 4
+            : 6;
   const intervalStep =
     contourInterval <= 1
-      ? 1.5
+      ? 0.75
       : contourInterval <= 2
-        ? 2
+        ? 1
         : contourInterval <= 5
-          ? 2
+          ? 1.5
           : contourInterval <= 10
-            ? 3
-            : 8;
+            ? 2.5
+            : 6;
 
   return Number(
-    Math.max(1.5, Math.min(10, Math.max(longestSideStep, intervalStep))).toFixed(3)
+    Math.max(0.75, Math.min(8, Math.max(longestSideStep, intervalStep))).toFixed(3)
   );
 }
 
@@ -3854,11 +5739,29 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
     options.contourInterval
   );
   let contourSource = null;
+  const terrainDebugPrefix = `[terrain] lat=${Number(location?.lat || 0).toFixed(6)} lng=${Number(location?.lng || 0).toFixed(6)} radius=${Math.max(30, Number(options?.radius) || 120)}`;
+
+  console.log(`${terrainDebugPrefix} start includeContours=${options.includeContours !== false}`);
 
   if (options.includeContours !== false) {
     try {
-      contourSource = await resolveOfficialContourCollection(clipFeature, config);
+      console.log(`${terrainDebugPrefix} official-contours loading`);
+      contourSource = await resolveOfficialContourCollection(
+        location,
+        clipFeature,
+        config
+      );
+      console.log(
+        `${terrainDebugPrefix} official-contours loaded features=${Number(
+          contourSource?.collection?.features?.length || 0
+        )} interval=${Number(contourSource?.interval || 0)}`
+      );
     } catch (error) {
+      console.log(
+        `${terrainDebugPrefix} official-contours error=${
+          error instanceof Error ? error.message : "unknown"
+        }`
+      );
       contourSource = {
         provider: "official-contours",
         mode: "error",
@@ -3874,6 +5777,7 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
     contourSource?.interval || requestedContourInterval
   );
   if (options.terrainMode === "flat") {
+    console.log(`${terrainDebugPrefix} flat-mode return`);
     return {
       provider: "flat",
       mode: "generated",
@@ -3889,10 +5793,21 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
     };
   }
 
+  console.log(`${terrainDebugPrefix} synthetic-fallback-grid building`);
   const sampleFallbackGrid = buildSyntheticTerrainGrid(location, clipFeature, options);
+  console.log(
+    `${terrainDebugPrefix} synthetic-fallback-grid ready step=${Number(
+      sampleFallbackGrid?.step || 0
+    )} rows=${Number(sampleFallbackGrid?.elevations?.length || 0)}`
+  );
 
   if (contourSource?.collection?.features?.length) {
     try {
+      console.log(
+        `${terrainDebugPrefix} contour-derivation building features=${Number(
+          contourSource.collection.features.length || 0
+        )}`
+      );
       const contourTerrainGrid = buildTerrainGridFromContourCollection(
         location,
         clipFeature,
@@ -3901,6 +5816,11 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
       );
 
       if (contourTerrainGrid?.elevations?.length) {
+        console.log(
+          `${terrainDebugPrefix} contour-derivation ready step=${Number(
+            contourTerrainGrid?.step || 0
+          )} rows=${Number(contourTerrainGrid?.elevations?.length || 0)}`
+        );
         return {
           provider: "official-contours",
           mode: "derived",
@@ -3916,6 +5836,11 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
         };
       }
     } catch (error) {
+      console.log(
+        `${terrainDebugPrefix} contour-derivation error=${
+          error instanceof Error ? error.message : "unknown"
+        }`
+      );
       contourSource = {
         ...contourSource,
         note:
@@ -3927,14 +5852,22 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
   }
 
   try {
+    console.log(`${terrainDebugPrefix} sampled-grid building`);
     const sampleGrid = buildTerrainSampleGrid(location, clipFeature, options);
+    console.log(
+      `${terrainDebugPrefix} sampled-grid ready step=${Number(
+        sampleGrid?.step || 0
+      )} points=${Number(sampleGrid?.points?.length || 0)}`
+    );
     let elevations;
     let provider = "open-meteo";
     let note = "실제 표고 샘플을 바탕으로 지형 메쉬를 생성했습니다.";
 
     try {
+      console.log(`${terrainDebugPrefix} open-meteo request`);
       elevations = await fetchOpenMeteoElevations(sampleGrid.points);
     } catch {
+      console.log(`${terrainDebugPrefix} open-meteo failed -> opentopodata`);
       elevations = await fetchOpenTopoDataElevations(sampleGrid.points);
       provider = "opentopodata";
       note = "실제 표고 샘플을 바탕으로 지형 메쉬를 생성했습니다. 보조 표고 소스를 사용했습니다.";
@@ -3972,6 +5905,11 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
       terrainGrid,
     };
   } catch (error) {
+    console.log(
+      `${terrainDebugPrefix} sampled-grid error=${
+        error instanceof Error ? error.message : "unknown"
+      }`
+    );
     const contourCollection =
       options.includeContours === false
         ? featureCollection([])
@@ -4277,14 +6215,10 @@ function createContourLinesFromTerrainGrid(location, terrainGrid, options) {
   }
 
   return featureCollection(
-    rawSegments.map((segment) =>
-      lineFeature(
-        segment.points.map((point) => lngLatFromMeters(location, point[0], point[1])),
-        {
-          provider: segment.provider || "open-meteo",
-          elevation: Number(segment.elevation || 0),
-        }
-      )
+    buildMergedContourLineFeatures(
+      location,
+      rawSegments,
+      Math.max(0.5, Math.min(2, Number(interval || 1)))
     )
   );
 }
@@ -4301,6 +6235,57 @@ async function resolveParcelBoundary(location, config) {
   }
 
   try {
+    const lookup = buildLocationParcelLookup(location);
+    const searchBuffers = lookup.pnu ? [3, 12, 30] : [3];
+    let bestFeature = null;
+
+    for (const buffer of searchBuffers) {
+      const collection = await fetchAllVWorldFeatureCollections(
+        "LP_PA_CBND_BUBUN",
+        `POINT(${location.lng} ${location.lat})`,
+        buffer,
+        config,
+        150,
+        lookup.pnu ? 4 : 2
+      );
+      const parcelFeature = pickPolygonFeature(collection.features, location);
+      const selectedPnu = extractPnuFromProperties(parcelFeature?.properties || {});
+
+      console.log(
+        `[parcel] lat=${Number(location.lat || 0).toFixed(6)} lng=${Number(
+          location.lng || 0
+        ).toFixed(6)} buffer=${buffer} features=${Number(
+          collection.features?.length || 0
+        )} expectedPnu=${lookup.pnu || "none"} selectedPnu=${selectedPnu || "none"}`
+      );
+
+      if (!parcelFeature) {
+        continue;
+      }
+
+      if (!bestFeature) {
+        bestFeature = parcelFeature;
+      }
+
+      if (!lookup.pnu || selectedPnu === lookup.pnu) {
+        return {
+          feature: normalizeParcelFeature(parcelFeature),
+          provider: "vworld",
+          isFallback: false,
+          note: "브이월드에서 실제 대지 경계를 불러왔습니다.",
+        };
+      }
+    }
+
+    if (bestFeature) {
+      return {
+        feature: normalizeParcelFeature(bestFeature),
+        provider: "vworld",
+        isFallback: false,
+        note: "브이월드에서 대지 경계 후보 중 가장 일치도가 높은 필지를 선택했습니다.",
+      };
+    }
+
     const collection = await fetchVWorldFeatureCollection(
       "LP_PA_CBND_BUBUN",
       `POINT(${location.lng} ${location.lat})`,
@@ -4404,6 +6389,332 @@ function buildBuildingQueryPlan(location, clipFeature) {
   });
 
   return plans;
+}
+
+async function resolveParcelContext(
+  location,
+  clipFeature,
+  parcelFeature,
+  config
+) {
+  if (!config.vworldApiKey) {
+    return {
+      collection: featureCollection([]),
+      provider: "unavailable",
+      isFallback: true,
+      note: "VWorld key missing; parcel context unavailable.",
+    };
+  }
+
+  try {
+    const clipRing = getOuterRing(clipFeature);
+    const queryPlan = buildBuildingQueryPlan(location, clipFeature);
+    const featureMap = new Map();
+    const targetPnu = extractPnuFromProperties(parcelFeature?.properties || {});
+
+    for (const query of queryPlan) {
+      const collection = await fetchAllVWorldFeatureCollections(
+        "LP_PA_CBND_BUBUN",
+        `POINT(${query.lng} ${query.lat})`,
+        Math.max(80, query.buffer),
+        config,
+        250,
+        Math.max(4, query.maxPages)
+      );
+
+      for (const feature of collection.features || []) {
+        const normalizedFeature = normalizeParcelFeature(feature);
+        const pnu = extractPnuFromProperties(normalizedFeature.properties);
+        const key = pnu || buildFeatureMapKey(normalizedFeature, ["pk", "PK"]);
+
+        if (!featureMap.has(key)) {
+          featureMap.set(key, normalizedFeature);
+        }
+      }
+    }
+
+    const filteredFeatures = [...featureMap.values()]
+      .map((feature) => clipFeatureToRing(feature, clipRing, location))
+      .filter(Boolean)
+      .map((feature) => normalizeParcelFeature(feature))
+      .filter((feature) => {
+        const pnu = extractPnuFromProperties(feature.properties);
+        return !targetPnu || pnu !== targetPnu;
+      })
+      .map((feature) => ({
+        ...feature,
+        properties: {
+          ...(feature.properties || {}),
+          isTarget: false,
+          sourceLayer: "LP_PA_CBND_BUBUN",
+        },
+      }))
+      .sort((left, right) => {
+        const leftArea = polygonAreaSquareMeters(getOuterRing(left));
+        const rightArea = polygonAreaSquareMeters(getOuterRing(right));
+        return leftArea - rightArea;
+      });
+
+    return {
+      collection: featureCollection(filteredFeatures),
+      provider: "vworld",
+      isFallback: false,
+      note: `Loaded ${filteredFeatures.length} surrounding parcel boundaries from VWorld.`,
+    };
+  } catch (error) {
+    return {
+      collection: featureCollection([]),
+      provider: "unavailable",
+      isFallback: true,
+      note:
+        error instanceof Error
+          ? `Parcel context request failed: ${error.message}`
+          : "Parcel context request failed.",
+    };
+  }
+}
+
+function clipRoadFeatureToClipBoundary(feature, clipFeature, location, geometryType) {
+  const normalizedFeature = normalizeRoadFeature(
+    feature,
+    feature?.properties?.sourceLayer || ""
+  );
+
+  if (geometryType === "polygon") {
+    return clipFeatureToRing(normalizedFeature, getOuterRing(clipFeature), location);
+  }
+
+  const clipRing = getOuterRing(clipFeature);
+  const clipBounds = polygonBounds(clipRing);
+  const clippedGeometry = clipLineGeometryToBounds(
+    normalizedFeature.geometry,
+    clipBounds
+  );
+
+  if (!clippedGeometry) {
+    return null;
+  }
+
+  return {
+    ...normalizedFeature,
+    geometry: clippedGeometry,
+  };
+}
+
+async function resolveRoadContext(location, clipFeature, options, config) {
+  if (options.includeRoads !== true) {
+    return {
+      collection: featureCollection([]),
+      provider: "disabled",
+      isFallback: false,
+      note: "Road context disabled by option.",
+    };
+  }
+
+  if (!config.vworldApiKey) {
+    return {
+      collection: featureCollection([]),
+      provider: "unavailable",
+      isFallback: true,
+      note: "VWorld key missing; road context unavailable.",
+    };
+  }
+
+  const queryPlan = buildBuildingQueryPlan(location, clipFeature);
+  const fallbackBoundaryCandidate = ROAD_LAYER_CANDIDATES.find(
+    (candidate) => candidate.layer === "lt_l_sprd"
+  );
+
+  for (const candidate of ROAD_LAYER_CANDIDATES) {
+    if (candidate.layer === "lt_l_sprd") {
+      continue;
+    }
+
+    try {
+      const featureMap = new Map();
+
+      for (const query of queryPlan) {
+        const collection = await fetchAllVWorldFeatureCollections(
+          candidate.layer,
+          `POINT(${query.lng} ${query.lat})`,
+          Math.max(120, query.buffer),
+          config,
+          250,
+          Math.max(3, query.maxPages)
+        );
+
+        for (const feature of collection.features || []) {
+          const normalizedFeature = normalizeRoadFeature(feature, candidate.layer);
+          const key = buildFeatureMapKey(normalizedFeature, [
+            "roadId",
+            "ROAD_ID",
+            "link_id",
+            "LINK_ID",
+          ]);
+
+          if (!featureMap.has(key)) {
+            featureMap.set(key, normalizedFeature);
+          }
+        }
+      }
+
+      const filteredFeatures = [...featureMap.values()]
+        .map((feature) =>
+          clipRoadFeatureToClipBoundary(
+            {
+              ...feature,
+              properties: {
+                ...(feature.properties || {}),
+                sourceLayer: candidate.layer,
+              },
+            },
+            clipFeature,
+            location,
+            candidate.geometryType
+          )
+        )
+        .filter(Boolean)
+        .filter((feature) =>
+          candidate.geometryType === "polygon"
+            ? polygonAreaSquareMeters(getOuterRing(feature)) > 4
+            : getLineStringsFromGeometry(feature.geometry).some(
+                (lineString) => lineString.length >= 2
+              )
+        );
+
+      console.log(
+        `[roads] layer=${candidate.layer} features=${filteredFeatures.length} geometry=${candidate.geometryType}`
+      );
+
+      if (filteredFeatures.length) {
+        return {
+          collection: featureCollection(filteredFeatures),
+          provider: candidate.provider,
+          isFallback: false,
+          note: `Loaded ${filteredFeatures.length} road feature(s) from ${candidate.layer}.`,
+        };
+      }
+    } catch (error) {
+      console.warn(
+        `[roads] layer=${candidate.layer} failed: ${error instanceof Error ? error.message : error}`
+      );
+    }
+  }
+
+  try {
+    const collection = await fetchOverpassRoadCollection(clipFeature);
+    const filteredFeatures = (collection.features || [])
+      .map((feature) =>
+        clipRoadFeatureToClipBoundary(
+          feature,
+          clipFeature,
+          location,
+          "line"
+        )
+      )
+      .filter(Boolean)
+      .filter((feature) =>
+        getLineStringsFromGeometry(feature.geometry).some(
+          (lineString) => lineString.length >= 2
+        )
+      )
+      .map((feature) => normalizeRoadFeature(feature, "overpass-highway"));
+
+    console.log(`[roads] layer=overpass-highway features=${filteredFeatures.length} geometry=line`);
+
+    if (filteredFeatures.length) {
+      return {
+        collection: featureCollection(filteredFeatures),
+        provider: "openstreetmap-overpass",
+        isFallback: false,
+        note: `Loaded ${filteredFeatures.length} road feature(s) from Overpass.`,
+      };
+    }
+  } catch (error) {
+    console.warn(
+      `[roads] layer=overpass-highway failed: ${error instanceof Error ? error.message : error}`
+    );
+  }
+
+  if (fallbackBoundaryCandidate) {
+    try {
+      const featureMap = new Map();
+
+      for (const query of queryPlan) {
+        const collection = await fetchAllVWorldFeatureCollections(
+          fallbackBoundaryCandidate.layer,
+          `POINT(${query.lng} ${query.lat})`,
+          Math.max(120, query.buffer),
+          config,
+          250,
+          Math.max(3, query.maxPages)
+        );
+
+        for (const feature of collection.features || []) {
+          const normalizedFeature = normalizeRoadFeature(
+            feature,
+            fallbackBoundaryCandidate.layer
+          );
+          const key = buildFeatureMapKey(normalizedFeature, [
+            "roadId",
+            "ROAD_ID",
+            "link_id",
+            "LINK_ID",
+          ]);
+
+          if (!featureMap.has(key)) {
+            featureMap.set(key, normalizedFeature);
+          }
+        }
+      }
+
+      const filteredFeatures = [...featureMap.values()]
+        .map((feature) =>
+          clipRoadFeatureToClipBoundary(
+            {
+              ...feature,
+              properties: {
+                ...(feature.properties || {}),
+                sourceLayer: fallbackBoundaryCandidate.layer,
+              },
+            },
+            clipFeature,
+            location,
+            fallbackBoundaryCandidate.geometryType
+          )
+        )
+        .filter(Boolean)
+        .filter((feature) =>
+          getLineStringsFromGeometry(feature.geometry).some(
+            (lineString) => lineString.length >= 2
+          )
+        );
+
+      console.log(
+        `[roads] layer=${fallbackBoundaryCandidate.layer} features=${filteredFeatures.length} geometry=${fallbackBoundaryCandidate.geometryType}`
+      );
+
+      if (filteredFeatures.length) {
+        return {
+          collection: featureCollection(filteredFeatures),
+          provider: fallbackBoundaryCandidate.provider,
+          isFallback: false,
+          note: `Loaded ${filteredFeatures.length} road feature(s) from ${fallbackBoundaryCandidate.layer}.`,
+        };
+      }
+    } catch (error) {
+      console.warn(
+        `[roads] layer=${fallbackBoundaryCandidate.layer} failed: ${error instanceof Error ? error.message : error}`
+      );
+    }
+  }
+
+  return {
+    collection: featureCollection([]),
+    provider: "unavailable",
+    isFallback: true,
+    note: "No road-context layer returned usable features for the current area.",
+  };
 }
 
 async function resolveBuildingContext(
@@ -4517,7 +6828,13 @@ async function resolveBuildingContext(
 
 async function buildSiteContext(body, config, reportProgress = null) {
   const location = body.location || {};
-  const options = body.options || {};
+  const options = {
+    ...(body.options || {}),
+    previewOnly: body.previewOnly === true || body.options?.previewOnly === true,
+  };
+  const customBounds = normalizeCustomBounds(body.customBounds || location.customBounds);
+  const isManualRange = Boolean(customBounds);
+  const isSelectionPreview = options.previewOnly === true && !isManualRange;
   const lat = Number(location.lat);
   const lng = Number(location.lng);
   const progress =
@@ -4532,7 +6849,7 @@ async function buildSiteContext(body, config, reportProgress = null) {
     lat,
     lng,
   };
-  const cacheKey = buildSiteContextCacheKey(normalizedLocation, options);
+  const cacheKey = buildSiteContextCacheKey(normalizedLocation, options, customBounds);
   const cachedSiteContext = siteContextCache.get(cacheKey);
 
   if (
@@ -4544,26 +6861,64 @@ async function buildSiteContext(body, config, reportProgress = null) {
   }
 
   progress(10, "필지 경계를 불러오는 중입니다.");
-  const parcelResult = await resolveParcelBoundary(normalizedLocation, config);
+  const parcelResult = isManualRange
+    ? {
+        feature: buildClipBoundary(normalizedLocation, options, null, customBounds),
+        provider: "manual-range",
+        isFallback: false,
+        note: "User-defined rectangle range was applied.",
+      }
+    : await resolveParcelBoundary(normalizedLocation, config);
   progress(24, "대지 범위를 계산하는 중입니다.");
-  const clipBoundary = buildClipBoundary(
-    normalizedLocation,
-    options,
-    parcelResult.feature
-  );
+  const clipBoundary = isManualRange
+    ? parcelResult.feature
+    : isSelectionPreview
+      ? parcelResult.feature
+      : buildClipBoundary(
+          normalizedLocation,
+          options,
+          parcelResult.feature
+        );
   progress(42, "지형 데이터를 준비하는 중입니다.");
-  const terrainResult = await resolveTerrainContext(
-    normalizedLocation,
-    clipBoundary,
-    options,
-    config
-  );
+  const terrainResult = isSelectionPreview
+    ? {
+        provider: "preview",
+        mode: "skipped",
+        note: "Terrain loading skipped for address selection preview.",
+        contourCollection: featureCollection([]),
+        terrainGrid: null,
+        contourSource: null,
+        sourceContourInterval: null,
+      }
+    : await resolveTerrainContext(
+        normalizedLocation,
+        clipBoundary,
+        options,
+        config
+      );
   const contourCollection =
     options.includeContours === false
       ? featureCollection([])
       : terrainResult.contourCollection;
   progress(
-    58,
+    56,
+    isSelectionPreview ? "Skipping surrounding parcels for preview." : "Loading surrounding parcels."
+  );
+  const parcelContextResult = isSelectionPreview
+    ? {
+        collection: featureCollection([]),
+        provider: "preview",
+        isFallback: false,
+        note: "Surrounding parcel context skipped for address selection preview.",
+      }
+    : await resolveParcelContext(
+        normalizedLocation,
+        clipBoundary,
+        isManualRange ? null : parcelResult.feature,
+        config
+      );
+  progress(
+    68,
     options.includeBuildings === false
       ? "건물 컨텍스트를 생략하는 중입니다."
       : "건물 컨텍스트를 불러오는 중입니다."
@@ -4579,11 +6934,30 @@ async function buildSiteContext(body, config, reportProgress = null) {
       : await resolveBuildingContext(
           normalizedLocation,
           clipBoundary,
-          parcelResult.feature,
+          isManualRange ? null : parcelResult.feature,
           config
         );
   progress(
-    72,
+    80,
+    options.includeRoads === true
+      ? "Loading road context."
+      : "Skipping road context."
+  );
+  const roadResult = isSelectionPreview
+    ? {
+        collection: featureCollection([]),
+        provider: "preview",
+        isFallback: false,
+        note: "Road context skipped for address selection preview.",
+      }
+    : await resolveRoadContext(
+        normalizedLocation,
+        clipBoundary,
+        options,
+        config
+      );
+  progress(
+    88,
     options.includeBuildings === false
       ? "건물 컨텍스트를 생략하고 있습니다."
       : "건물 컨텍스트를 정리하는 중입니다."
@@ -4594,21 +6968,49 @@ async function buildSiteContext(body, config, reportProgress = null) {
   const clipArea = polygonAreaSquareMeters(clipRing);
   const parcelCenter = centroidOfRing(parcelRing);
   const buildingCount = buildingResult.collection.features.length;
-  const targetBuildingCount = buildingResult.collection.features.filter(
-    (feature) => feature.properties?.isTarget
-  ).length;
+  const targetBuildingCount = isManualRange
+    ? 0
+    : buildingResult.collection.features.filter((feature) => feature.properties?.isTarget)
+        .length;
+  const parcelContextCount = parcelContextResult.collection.features.length;
+  const roadCount = roadResult.collection.features.length;
+  const normalizedTargetParcelFeature = isManualRange
+    ? {
+        ...clipBoundary,
+        properties: {
+          ...(clipBoundary.properties || {}),
+          isTarget: false,
+          sourceLayer: "MANUAL_RANGE",
+        },
+      }
+    : normalizeParcelFeature(parcelResult.feature);
+  const targetParcelFeature = normalizedTargetParcelFeature
+    ? {
+        ...normalizedTargetParcelFeature,
+        properties: {
+          ...(normalizedTargetParcelFeature.properties || {}),
+          isTarget: isManualRange ? false : true,
+          sourceLayer: isManualRange ? "MANUAL_RANGE" : "LP_PA_CBND_BUBUN",
+        },
+      }
+    : null;
 
   const siteContext = {
+    selectionMode: isManualRange ? "range" : "address",
     location: normalizedLocation,
     options: {
       shape: "rectangle",
       radius: Math.max(30, Number(options.radius) || 120),
       contourInterval: normalizeContourInterval(options.contourInterval),
-      terrainMode: options.terrainMode || "contour",
+      terrainMode: options.terrainMode === "flat" ? "flat" : "contour",
+      previewOnly: isSelectionPreview,
+      buildingPlacement:
+        options.buildingPlacement === "embed-lowest" ? "embed-lowest" : "dominant",
       exportFormat: options.exportFormat || "obj",
       includeContours: options.includeContours !== false,
       includeBuildings: options.includeBuildings !== false,
       includeParcelBoundary: options.includeParcelBoundary !== false,
+      splitParcelBoundary: options.splitParcelBoundary === true,
       includeRoads: options.includeRoads === true,
     },
     dataSources: {
@@ -4616,6 +7018,11 @@ async function buildSiteContext(body, config, reportProgress = null) {
         provider: parcelResult.provider,
         mode: parcelResult.isFallback ? "fallback" : "live",
         note: parcelResult.note,
+      },
+      parcelContext: {
+        provider: parcelContextResult.provider,
+        mode: parcelContextResult.isFallback ? "fallback" : "live",
+        note: parcelContextResult.note,
       },
       terrain: {
         provider: terrainResult.provider,
@@ -4635,12 +7042,19 @@ async function buildSiteContext(body, config, reportProgress = null) {
         mode: buildingResult.isFallback ? "fallback" : "live",
         note: buildingResult.note,
       },
+      roads: {
+        provider: roadResult.provider,
+        mode: roadResult.isFallback ? "fallback" : "live",
+        note: roadResult.note,
+      },
     },
     stats: {
-      parcelAreaSqm: Number(parcelArea.toFixed(2)),
+      parcelAreaSqm: Number((isManualRange ? clipArea : parcelArea).toFixed(2)),
       clipAreaSqm: Number(clipArea.toFixed(2)),
+      contextParcelCount: parcelContextCount,
       contourCount: contourCollection.features.length,
       contourInterval: normalizeContourInterval(options.contourInterval),
+      sourceContourInterval: terrainResult.sourceContourInterval || null,
       minElevation: Number.isFinite(terrainResult.terrainGrid?.minElevation)
         ? terrainResult.terrainGrid.minElevation
         : null,
@@ -4649,15 +7063,34 @@ async function buildSiteContext(body, config, reportProgress = null) {
         : null,
       buildingCount,
       targetBuildingCount,
+      roadCount,
       parcelCenter,
     },
-    parcelBoundary: parcelResult.feature,
+    parcelBoundary: targetParcelFeature,
+    parcelContext: parcelContextResult.collection,
     clipBoundary,
     contourLines: contourCollection,
     terrainGrid: terrainResult.terrainGrid,
     buildings: buildingResult.collection,
-    roads: featureCollection([]),
+    roads: roadResult.collection,
   };
+
+  const effectiveContourBandInterval = resolveEffectiveContourBandInterval(
+    siteContext
+  );
+
+  siteContext.stats.effectiveContourBandInterval = effectiveContourBandInterval;
+
+  if (
+    effectiveContourBandInterval >
+    Number(siteContext.options?.contourInterval || effectiveContourBandInterval) +
+      1e-9
+  ) {
+    const relaxationNote = `Dense contour export was relaxed from ${siteContext.options.contourInterval}m to ${effectiveContourBandInterval}m for stability.`;
+    siteContext.dataSources.terrain.note = siteContext.dataSources.terrain.note
+      ? `${siteContext.dataSources.terrain.note} ${relaxationNote}`
+      : relaxationNote;
+  }
 
   siteContextCache.set(cacheKey, {
     cachedAt: Date.now(),
@@ -4676,7 +7109,7 @@ function syntheticHeightAtLocalPoint(xMeters, yMeters, seed) {
   );
 }
 
-function siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) {
+function resolveRawTerrainHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) {
   if (siteContext.options?.terrainMode === "flat") {
     return 0;
   }
@@ -4708,10 +7141,7 @@ function siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) {
           const ty = gy - y0;
           const top = q11 * (1 - tx) + q21 * tx;
           const bottom = q12 * (1 - tx) + q22 * tx;
-          return quantizeTerrainHeight(
-            siteContext,
-            top * (1 - ty) + bottom * ty
-          );
+          return top * (1 - ty) + bottom * ty;
         }
       }
     }
@@ -4739,72 +7169,133 @@ function siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) {
     }
 
     if (Number.isFinite(closestElevation)) {
-      return quantizeTerrainHeight(siteContext, closestElevation);
+      return closestElevation;
     }
   }
 
+  return syntheticHeightAtLocalPoint(xMeters, yMeters, seed);
+}
+
+function siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) {
   return quantizeTerrainHeight(
     siteContext,
-    syntheticHeightAtLocalPoint(xMeters, yMeters, seed)
+    resolveRawTerrainHeightAtLocalPoint(siteContext, xMeters, yMeters, seed)
   );
 }
 
-function estimateBuildingBaseElevationFromSamples(
+function collectBuildingFootprintElevationSamples(
   siteContext,
   ring,
   center,
-  seed
+  seed,
+  {
+    quantized = true,
+    includeBoundary = true,
+    includeCentroid = true,
+    centroidWeight = 2,
+    interiorWeight = 1,
+    maxInteriorSamples = 196,
+  } = {}
 ) {
-  if (!ring.length || siteContext.options?.terrainMode !== "contour") {
-    return null;
+  if (!ring.length) {
+    return [];
   }
 
-  const elevations = [];
+  const localRing = ring
+    .map((point) => localMetersFromLngLat(point, center))
+    .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
 
-  for (let index = 0; index < ring.length; index += 1) {
-    const point = ring[index];
-    const nextPoint = ring[(index + 1) % ring.length];
-    const samplePoints = [
-      point,
-      [
-        point[0] + (nextPoint[0] - point[0]) * 0.5,
-        point[1] + (nextPoint[1] - point[1]) * 0.5,
-      ],
-    ];
-
-    for (const samplePoint of samplePoints) {
-      const [xMeters, yMeters] = localMetersFromLngLat(samplePoint, center);
-      const elevation = siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed);
-
-      if (Number.isFinite(elevation)) {
-        elevations.push(Number(elevation.toFixed(3)));
-      }
-    }
+  if (localRing.length < 3) {
+    return [];
   }
 
-  const centroid = centroidOfRing(ring);
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
 
-  if (centroid) {
-    const [xMeters, yMeters] = localMetersFromLngLat(centroid, center);
-    const centroidElevation = siteHeightAtLocalPoint(
+  for (const [xMeters, yMeters] of localRing) {
+    minX = Math.min(minX, xMeters);
+    minY = Math.min(minY, yMeters);
+    maxX = Math.max(maxX, xMeters);
+    maxY = Math.max(maxY, yMeters);
+  }
+
+  const widthMeters = Math.max(0.1, maxX - minX);
+  const heightMeters = Math.max(0.1, maxY - minY);
+  const terrainStep = Math.max(0.5, Number(siteContext.terrainGrid?.step) || 0.5);
+  const budgetStep = Math.sqrt(
+    Math.max(0.25, (widthMeters * heightMeters) / Math.max(16, maxInteriorSamples))
+  );
+  const sampleStep = Math.max(
+    0.5,
+    Math.min(2, terrainStep, Number(budgetStep.toFixed(3)))
+  );
+  const samples = [];
+  const pushElevation = (xMeters, yMeters, weight = 1) => {
+    const rawHeight = resolveRawTerrainHeightAtLocalPoint(
       siteContext,
       xMeters,
       yMeters,
       seed
     );
+    const height = quantized
+      ? quantizeBuildingPlacementHeight(siteContext, rawHeight)
+      : rawHeight;
 
-    if (Number.isFinite(centroidElevation)) {
-      // Weight the interior of the footprint so single low edge samples
-      // do not bury the whole building into the terrain.
-      const normalizedCentroidElevation = Number(centroidElevation.toFixed(3));
-      elevations.push(
-        normalizedCentroidElevation,
-        normalizedCentroidElevation,
-        normalizedCentroidElevation
+    if (!Number.isFinite(height)) {
+      return;
+    }
+
+    for (let index = 0; index < weight; index += 1) {
+      samples.push(Number(height.toFixed(3)));
+    }
+  };
+
+  if (includeBoundary) {
+    for (let index = 0; index < localRing.length; index += 1) {
+      const point = localRing[index];
+      const nextPoint = localRing[(index + 1) % localRing.length];
+      pushElevation(point[0], point[1]);
+      pushElevation(
+        point[0] + (nextPoint[0] - point[0]) * 0.5,
+        point[1] + (nextPoint[1] - point[1]) * 0.5
       );
     }
   }
 
+  const centroid = centroidOfRing(ring);
+
+  if (centroid && includeCentroid) {
+    const [centroidX, centroidY] = localMetersFromLngLat(centroid, center);
+    pushElevation(centroidX, centroidY, centroidWeight);
+  }
+
+  let interiorSamples = 0;
+
+  for (
+    let yMeters = minY + sampleStep * 0.5;
+    yMeters < maxY && interiorSamples < 96;
+    yMeters += sampleStep
+  ) {
+    for (
+      let xMeters = minX + sampleStep * 0.5;
+      xMeters < maxX && interiorSamples < 96;
+      xMeters += sampleStep
+    ) {
+      if (!pointInRing([xMeters, yMeters], localRing)) {
+        continue;
+      }
+
+      pushElevation(xMeters, yMeters, interiorWeight);
+      interiorSamples += 1;
+    }
+  }
+
+  return samples;
+}
+
+function resolveDominantElevationFromValues(elevations) {
   if (!elevations.length) {
     return null;
   }
@@ -4830,10 +7321,233 @@ function estimateBuildingBaseElevationFromSamples(
 
   return Number.isFinite(dominantElevation)
     ? Number(dominantElevation.toFixed(3))
-    : Number(Math.min(...elevations).toFixed(3));
+    : null;
 }
 
-function buildingBaseElevationForRing(siteContext, ring, center, seed) {
+function estimateBuildingDominantTerraceElevationFromSamples(
+  siteContext,
+  ring,
+  center,
+  seed
+) {
+  if (!ring.length || siteContext.options?.terrainMode !== "contour") {
+    return null;
+  }
+
+  const terrainGrid = siteContext.terrainGrid;
+
+  if (!terrainGrid?.elevations?.length) {
+    return null;
+  }
+
+  const localRing = ring
+    .map((point) => localMetersFromLngLat(point, center))
+    .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+
+  if (localRing.length < 3) {
+    return null;
+  }
+
+  const elevations = [];
+  const xValues = terrainGrid.xValues || [];
+  const yValues = terrainGrid.yValues || [];
+
+  for (let rowIndex = 0; rowIndex < yValues.length - 1; rowIndex += 1) {
+    for (let columnIndex = 0; columnIndex < xValues.length - 1; columnIndex += 1) {
+      const centerPoint = [
+        (xValues[columnIndex] + xValues[columnIndex + 1]) / 2,
+        (yValues[rowIndex] + yValues[rowIndex + 1]) / 2,
+      ];
+
+      if (!pointInRing(centerPoint, localRing)) {
+        continue;
+      }
+
+      const cellValues = [
+        terrainGrid.elevations[rowIndex]?.[columnIndex],
+        terrainGrid.elevations[rowIndex]?.[columnIndex + 1],
+        terrainGrid.elevations[rowIndex + 1]?.[columnIndex + 1],
+        terrainGrid.elevations[rowIndex + 1]?.[columnIndex],
+      ].filter((value) => Number.isFinite(value));
+
+      if (!cellValues.length) {
+        continue;
+      }
+
+      const averagedCellHeight =
+        cellValues.reduce((sum, value) => sum + value, 0) / cellValues.length;
+      const elevation = quantizeBuildingPlacementHeight(
+        siteContext,
+        averagedCellHeight
+      );
+
+      if (Number.isFinite(elevation)) {
+        elevations.push(Number(elevation.toFixed(3)));
+      }
+    }
+  }
+
+  if (elevations.length) {
+    return resolveDominantElevationFromValues(elevations);
+  }
+
+  const sampledElevations = collectBuildingFootprintElevationSamples(
+    siteContext,
+    ring,
+    center,
+    seed,
+    {
+      quantized: true,
+      includeBoundary: false,
+      includeCentroid: true,
+      centroidWeight: 2,
+      interiorWeight: 1,
+      maxInteriorSamples: 256,
+    }
+  );
+
+  if (sampledElevations.length) {
+    return resolveDominantElevationFromValues(sampledElevations);
+  }
+
+  const fallbackElevations = collectBuildingFootprintElevationSamples(
+    siteContext,
+    ring,
+    center,
+    seed,
+    {
+      quantized: true,
+      includeBoundary: true,
+      includeCentroid: true,
+      centroidWeight: 3,
+      interiorWeight: 1,
+      maxInteriorSamples: 64,
+    }
+  );
+
+  return resolveDominantElevationFromValues(fallbackElevations);
+}
+
+function estimateBuildingDominantTerraceElevationFromCellOverlap(
+  siteContext,
+  ring,
+  center
+) {
+  if (!ring.length || siteContext.options?.terrainMode !== "contour") {
+    return null;
+  }
+
+  const terrainGrid = siteContext.terrainGrid;
+
+  if (!terrainGrid?.elevations?.length) {
+    return null;
+  }
+
+  const localRing = orientLocalPolygonCounterClockwise(
+    ring
+      .map((point) => localMetersFromLngLat(point, center))
+      .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]))
+  );
+
+  if (localRing.length < 3) {
+    return null;
+  }
+
+  const bounds = computeLocalBoundsFromPoints(localRing);
+  const xValues = terrainGrid.xValues || [];
+  const yValues = terrainGrid.yValues || [];
+  const areaByElevation = new Map();
+
+  if (!bounds || xValues.length < 2 || yValues.length < 2) {
+    return null;
+  }
+
+  for (let rowIndex = 0; rowIndex < yValues.length - 1; rowIndex += 1) {
+    const cellMinY = yValues[rowIndex];
+    const cellMaxY = yValues[rowIndex + 1];
+
+    if (cellMaxY <= bounds.minY || cellMinY >= bounds.maxY) {
+      continue;
+    }
+
+    for (let columnIndex = 0; columnIndex < xValues.length - 1; columnIndex += 1) {
+      const cellMinX = xValues[columnIndex];
+      const cellMaxX = xValues[columnIndex + 1];
+
+      if (cellMaxX <= bounds.minX || cellMinX >= bounds.maxX) {
+        continue;
+      }
+
+      const clippedPolygon = clipLocalPolygonToRect(
+        localRing,
+        cellMinX,
+        cellMinY,
+        cellMaxX,
+        cellMaxY
+      );
+      const overlapArea = Math.abs(computeLocalPolygonSignedArea(clippedPolygon));
+
+      if (overlapArea <= 1e-4) {
+        continue;
+      }
+
+      const cellValues = [
+        terrainGrid.elevations[rowIndex]?.[columnIndex],
+        terrainGrid.elevations[rowIndex]?.[columnIndex + 1],
+        terrainGrid.elevations[rowIndex + 1]?.[columnIndex + 1],
+        terrainGrid.elevations[rowIndex + 1]?.[columnIndex],
+      ].filter((value) => Number.isFinite(value));
+
+      if (!cellValues.length) {
+        continue;
+      }
+
+      const averagedCellHeight =
+        cellValues.reduce((sum, value) => sum + value, 0) / cellValues.length;
+      const elevation = quantizeBuildingPlacementHeight(
+        siteContext,
+        averagedCellHeight
+      );
+
+      if (!Number.isFinite(elevation)) {
+        continue;
+      }
+
+      areaByElevation.set(
+        elevation,
+        Number(((areaByElevation.get(elevation) || 0) + overlapArea).toFixed(6))
+      );
+    }
+  }
+
+  let dominantElevation = null;
+  let dominantArea = 0;
+
+  for (const [elevation, overlapArea] of areaByElevation.entries()) {
+    if (
+      overlapArea > dominantArea + 1e-6 ||
+      (Math.abs(overlapArea - dominantArea) <= 1e-6 &&
+        Number.isFinite(dominantElevation) &&
+        elevation > dominantElevation)
+    ) {
+      dominantArea = overlapArea;
+      dominantElevation = elevation;
+    } else if (!Number.isFinite(dominantElevation)) {
+      dominantArea = overlapArea;
+      dominantElevation = elevation;
+    }
+  }
+
+  return Number.isFinite(dominantElevation)
+    ? Number(dominantElevation.toFixed(3))
+    : null;
+}
+
+function estimateBuildingDominantTerraceElevationFromBandOverlap(
+  siteContext,
+  ring,
+  center
+) {
   if (!ring.length || siteContext.options?.terrainMode !== "contour") {
     return null;
   }
@@ -4841,56 +7555,334 @@ function buildingBaseElevationForRing(siteContext, ring, center, seed) {
   const localRing = ring
     .map((point) => localMetersFromLngLat(point, center))
     .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
-  const footprintRing = buildPolygonClippingRing(
+
+  if (localRing.length < 3) {
+    return null;
+  }
+
+  const buildingRing = buildPolygonClippingRing(
     orientLocalPolygonCounterClockwise(localRing)
   );
 
-  if (footprintRing) {
-    const footprintMultiPolygon = [[footprintRing]];
-    const topSurfaceGroups = getCachedContourTopSurfaceGroups(siteContext);
-    let dominantElevation = null;
-    let dominantAreaSqm = 0;
+  if (!buildingRing) {
+    return null;
+  }
 
-    for (const surfaceGroup of topSurfaceGroups) {
-      if (!surfaceGroup.multiPolygon?.length) {
-        continue;
-      }
+  const buildingBounds = computeLocalBoundsFromPoints(localRing);
+  const buildingMultiPolygon = [[buildingRing]];
+  let dominantElevation = null;
+  let dominantArea = 0;
 
-      let overlapMultiPolygon = [];
-
-      try {
-        overlapMultiPolygon =
-          polygonClipping.intersection(
-            footprintMultiPolygon,
-            surfaceGroup.multiPolygon
-          ) || [];
-      } catch (error) {
-        console.warn(
-          `[building-terrain] overlap intersection fallback elevation=${surfaceGroup.elevation} error=${formatErrorForLog(
-            error
-          )}`
-        );
-        continue;
-      }
-
-      const overlapAreaSqm = computeLocalMultiPolygonArea(overlapMultiPolygon);
-
-      if (
-        overlapAreaSqm > dominantAreaSqm + 0.001 ||
-        (Math.abs(overlapAreaSqm - dominantAreaSqm) <= 0.001 &&
-          surfaceGroup.elevation > dominantElevation)
-      ) {
-        dominantAreaSqm = overlapAreaSqm;
-        dominantElevation = surfaceGroup.elevation;
-      }
+  for (const group of getCachedContourBandGroups(siteContext)) {
+    if (!group?.multiPolygon?.length || !boundsOverlap(buildingBounds, group.bounds, 0.05)) {
+      continue;
     }
 
-    if (Number.isFinite(dominantElevation) && dominantAreaSqm > 0.001) {
-      return Number(dominantElevation.toFixed(3));
+    try {
+      const overlapMultiPolygon =
+        polygonClipping.intersection(group.multiPolygon, buildingMultiPolygon) || [];
+      const overlapArea = computeLocalMultiPolygonArea(overlapMultiPolygon);
+
+      if (
+        overlapArea > dominantArea + 1e-6 ||
+        (Math.abs(overlapArea - dominantArea) <= 1e-6 &&
+          Number.isFinite(group.topElevation) &&
+          group.topElevation > dominantElevation)
+      ) {
+        dominantArea = overlapArea;
+        dominantElevation = group.topElevation;
+      }
+    } catch (error) {
+      console.warn(
+        `[building-terrain] dominant-overlap fallback elevation=${Number(
+          group.topElevation || 0
+        )} error=${formatErrorForLog(error)}`
+      );
+      return null;
     }
   }
 
-  return estimateBuildingBaseElevationFromSamples(siteContext, ring, center, seed);
+  return dominantArea > 0 && Number.isFinite(dominantElevation)
+    ? Number(dominantElevation.toFixed(3))
+    : null;
+}
+
+function estimateBuildingDominantTerraceElevation(
+  siteContext,
+  ring,
+  center,
+  seed
+) {
+  return (
+    estimateBuildingDominantTerraceElevationFromCellOverlap(
+      siteContext,
+      ring,
+      center
+    ) ||
+    estimateBuildingDominantTerraceElevationFromSamples(
+      siteContext,
+      ring,
+      center,
+      seed
+    )
+  );
+}
+
+function estimateBuildingBaseElevationFromSamples(
+  siteContext,
+  ring,
+  center,
+  seed
+) {
+  if (!ring.length || siteContext.options?.terrainMode !== "contour") {
+    return null;
+  }
+
+  const elevations = collectBuildingFootprintElevationSamples(
+    siteContext,
+    ring,
+    center,
+    seed,
+    { quantized: true }
+  );
+
+  if (!elevations.length) {
+    return null;
+  }
+
+  return (
+    resolveDominantElevationFromValues(elevations) ||
+    Number(Math.min(...elevations).toFixed(3))
+  );
+}
+
+function estimateBuildingLowestElevationFromSamples(
+  siteContext,
+  ring,
+  center,
+  seed
+) {
+  if (!ring.length || siteContext.options?.terrainMode !== "contour") {
+    return null;
+  }
+  const elevations = collectBuildingFootprintElevationSamples(
+    siteContext,
+    ring,
+    center,
+    seed,
+    { quantized: false }
+  );
+
+  if (!elevations.length) {
+    return null;
+  }
+
+  return Number(Math.min(...elevations).toFixed(3));
+}
+
+function getBuildingPlacementCache(siteContext) {
+  if (!siteContext) {
+    return new Map();
+  }
+
+  if (!siteContext.__buildingPlacementCache) {
+    Object.defineProperty(siteContext, "__buildingPlacementCache", {
+      value: new Map(),
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
+
+  return siteContext.__buildingPlacementCache;
+}
+
+function buildBuildingPlacementCacheKey(siteContext, ring) {
+  const placementMode =
+    siteContext?.options?.buildingPlacement === "embed-lowest"
+      ? "embed-lowest"
+      : "dominant";
+  const interval = resolveEffectiveContourBandInterval(siteContext);
+  const ringKey = (ring || [])
+    .map((point) =>
+      Array.isArray(point) && point.length >= 2
+        ? `${Number(point[0]).toFixed(8)},${Number(point[1]).toFixed(8)}`
+        : "invalid"
+    )
+    .join(";");
+
+  return `${placementMode}|${interval}|${ringKey}`;
+}
+
+function resolveBuildingPlacementForRing(siteContext, ring, center, seed) {
+  if (!ring.length || siteContext.options?.terrainMode !== "contour") {
+    return null;
+  }
+
+  const cache = getBuildingPlacementCache(siteContext);
+  const cacheKey = buildBuildingPlacementCacheKey(siteContext, ring);
+
+  if (cache.has(cacheKey)) {
+    return cache.get(cacheKey);
+  }
+
+  const placementMode =
+    siteContext.options?.buildingPlacement === "embed-lowest"
+      ? "embed-lowest"
+      : "dominant";
+  const overlapDominantElevation = estimateBuildingDominantTerraceElevationFromCellOverlap(
+    siteContext,
+    ring,
+    center
+  );
+  const sampledDominantElevation = estimateBuildingDominantTerraceElevationFromSamples(
+    siteContext,
+    ring,
+    center,
+    seed
+  );
+  const fallbackDominantElevation = estimateBuildingBaseElevationFromSamples(
+    siteContext,
+    ring,
+    center,
+    seed
+  );
+  const lowestElevation = estimateBuildingLowestElevationFromSamples(
+    siteContext,
+    ring,
+    center,
+    seed
+  );
+
+  let finalBaseElevation = null;
+  let source = "unresolved";
+
+  if (placementMode === "embed-lowest") {
+    if (Number.isFinite(lowestElevation)) {
+      finalBaseElevation = lowestElevation;
+      source = "lowest-sample";
+    }
+  } else if (Number.isFinite(overlapDominantElevation)) {
+    finalBaseElevation = overlapDominantElevation;
+    source = "dominant-cell-overlap";
+  } else if (Number.isFinite(sampledDominantElevation)) {
+    finalBaseElevation = sampledDominantElevation;
+    source = "dominant-sample-grid";
+  } else if (Number.isFinite(fallbackDominantElevation)) {
+    finalBaseElevation = fallbackDominantElevation;
+    source = "dominant-sample";
+  } else if (Number.isFinite(lowestElevation)) {
+    finalBaseElevation = lowestElevation;
+    source = "lowest-sample-fallback";
+  }
+
+  const placementInfo = {
+    placementMode,
+    source,
+    dominantElevation: Number.isFinite(overlapDominantElevation)
+      ? Number(overlapDominantElevation.toFixed(3))
+      : null,
+    sampledDominantElevation: Number.isFinite(sampledDominantElevation)
+      ? Number(sampledDominantElevation.toFixed(3))
+      : null,
+    fallbackDominantElevation: Number.isFinite(fallbackDominantElevation)
+      ? Number(fallbackDominantElevation.toFixed(3))
+      : null,
+    lowestElevation: Number.isFinite(lowestElevation)
+      ? Number(lowestElevation.toFixed(3))
+      : null,
+    finalBaseElevation: Number.isFinite(finalBaseElevation)
+      ? Number(finalBaseElevation.toFixed(3))
+      : null,
+    effectiveContourInterval: resolveEffectiveContourBandInterval(siteContext),
+  };
+
+  cache.set(cacheKey, placementInfo);
+  return placementInfo;
+}
+
+function applyBuildingPlacementDebug(feature, placementInfo) {
+  if (!feature?.properties || !placementInfo) {
+    return;
+  }
+
+  feature.properties.buildingPlacementDebug = {
+    placementMode: placementInfo.placementMode,
+    source: placementInfo.source,
+    dominantElevation: placementInfo.dominantElevation,
+    sampledDominantElevation: placementInfo.sampledDominantElevation,
+    fallbackDominantElevation: placementInfo.fallbackDominantElevation,
+    lowestElevation: placementInfo.lowestElevation,
+    finalBaseElevation: placementInfo.finalBaseElevation,
+    effectiveContourInterval: placementInfo.effectiveContourInterval,
+  };
+}
+
+function buildingBaseElevationForRing(siteContext, ring, center, seed) {
+  const placementInfo = resolveBuildingPlacementForRing(
+    siteContext,
+    ring,
+    center,
+    seed
+  );
+  return placementInfo?.finalBaseElevation ?? null;
+}
+
+function buildBuildingPlacementDiagnostics(siteContext) {
+  if (
+    siteContext?.options?.terrainMode !== "contour" ||
+    siteContext?.options?.includeBuildings === false
+  ) {
+    return [];
+  }
+
+  const center = siteContext.location;
+  const seed = Math.round(
+    Math.abs(Number(center?.lat) * 1000) + Math.abs(Number(center?.lng) * 1000)
+  );
+  const targetFeatures = (siteContext.buildings?.features || []).filter(
+    (feature) => feature?.properties?.isTarget
+  );
+  const sampleFeatures =
+    targetFeatures.length > 0
+      ? targetFeatures
+      : (siteContext.buildings?.features || []).slice(0, 5);
+
+  return sampleFeatures
+    .map((feature, index) => {
+      const ring = getOpenRing(getOuterRing(feature));
+      const placementInfo = resolveBuildingPlacementForRing(
+        siteContext,
+        ring,
+        center,
+        seed
+      );
+
+      applyBuildingPlacementDebug(feature, placementInfo);
+
+      if (!placementInfo) {
+        return null;
+      }
+
+      return {
+        index,
+        isTarget: Boolean(feature?.properties?.isTarget),
+        name:
+          feature?.properties?.buildingName ||
+          feature?.properties?.buildingId ||
+          feature?.properties?.roadAddress ||
+          "BUILDING",
+        placementMode: placementInfo.placementMode,
+        source: placementInfo.source,
+        dominantElevation: placementInfo.dominantElevation,
+        sampledDominantElevation: placementInfo.sampledDominantElevation,
+        fallbackDominantElevation: placementInfo.fallbackDominantElevation,
+        lowestElevation: placementInfo.lowestElevation,
+        finalBaseElevation: placementInfo.finalBaseElevation,
+        effectiveContourInterval: placementInfo.effectiveContourInterval,
+      };
+    })
+    .filter(Boolean);
 }
 
 function sanitizeObjName(value, fallback) {
@@ -5028,28 +8020,37 @@ function interpolateTerrainPointAtLevel(startPoint, endPoint, level) {
   const elevationDifference = endPoint.elevation - startPoint.elevation;
 
   if (!elevationDifference) {
-    return [startPoint.x, startPoint.y];
+    return {
+      x: startPoint.x,
+      y: startPoint.y,
+      elevation: level,
+    };
   }
 
   const ratio = (level - startPoint.elevation) / elevationDifference;
 
-  return [
-    startPoint.x + (endPoint.x - startPoint.x) * ratio,
-    startPoint.y + (endPoint.y - startPoint.y) * ratio,
-  ];
+  return {
+    x: startPoint.x + (endPoint.x - startPoint.x) * ratio,
+    y: startPoint.y + (endPoint.y - startPoint.y) * ratio,
+    elevation: level,
+  };
 }
 
-function clipTriangleAboveLevel(triangle, level) {
+function clipPolygonByElevation(points, level, keepAbove = true) {
   const clipped = [];
 
-  for (let index = 0; index < triangle.length; index += 1) {
-    const current = triangle[index];
-    const next = triangle[(index + 1) % triangle.length];
-    const currentInside = current.elevation >= level;
-    const nextInside = next.elevation >= level;
+  for (let index = 0; index < points.length; index += 1) {
+    const current = points[index];
+    const next = points[(index + 1) % points.length];
+    const currentInside = keepAbove
+      ? current.elevation >= level
+      : current.elevation <= level;
+    const nextInside = keepAbove
+      ? next.elevation >= level
+      : next.elevation <= level;
 
     if (currentInside && nextInside) {
-      clipped.push([next.x, next.y]);
+      clipped.push(next);
       continue;
     }
 
@@ -5060,11 +8061,29 @@ function clipTriangleAboveLevel(triangle, level) {
 
     if (!currentInside && nextInside) {
       clipped.push(interpolateTerrainPointAtLevel(current, next, level));
-      clipped.push([next.x, next.y]);
+      clipped.push(next);
     }
   }
 
-  return dedupeLocalPolygonPoints(clipped);
+  return clipped;
+}
+
+function clipTriangleToBand(triangle, bottomLevel, topLevel) {
+  const aboveBottom = clipPolygonByElevation(triangle, bottomLevel, true);
+
+  if (aboveBottom.length < 3) {
+    return [];
+  }
+
+  const withinTop = clipPolygonByElevation(aboveBottom, topLevel, false);
+
+  if (withinTop.length < 3) {
+    return [];
+  }
+
+  return dedupeLocalPolygonPoints(
+    withinTop.map((point) => [point.x, point.y])
+  );
 }
 
 function buildContourBandSlices(siteContext) {
@@ -5074,7 +8093,7 @@ function buildContourBandSlices(siteContext) {
     return [];
   }
 
-  const interval = normalizeContourInterval(siteContext.options?.contourInterval);
+  const interval = resolveEffectiveContourBandInterval(siteContext);
   const startLevel =
     Math.floor(Number(terrainGrid.minElevation || 0) / interval) * interval;
   const maxElevation = Number(terrainGrid.maxElevation || 0);
@@ -5143,7 +8162,7 @@ function buildContourBandSlices(siteContext) {
         ];
 
         for (const triangle of triangles) {
-          const polygonPoints = clipTriangleAboveLevel(triangle, level);
+          const polygonPoints = clipTriangleToBand(triangle, level, topElevation);
 
           if (polygonPoints.length >= 3) {
             slices.push({
@@ -5186,6 +8205,18 @@ function orientLocalPolygonCounterClockwise(points) {
   }
 
   return computeLocalPolygonSignedArea(polygon) >= 0
+    ? polygon
+    : [...polygon].reverse();
+}
+
+function orientLocalPolygonClockwise(points) {
+  const polygon = dedupeLocalPolygonPoints(points);
+
+  if (polygon.length < 3) {
+    return polygon;
+  }
+
+  return computeLocalPolygonSignedArea(polygon) <= 0
     ? polygon
     : [...polygon].reverse();
 }
@@ -5240,7 +8271,260 @@ function buildPolygonClippingRing(points) {
   ]);
 }
 
-function buildContourBandUnionLoops(slices) {
+function computeLocalPolygonBounds(points) {
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (const point of points || []) {
+    const xMeters = Number(point?.[0]);
+    const yMeters = Number(point?.[1]);
+
+    if (!Number.isFinite(xMeters) || !Number.isFinite(yMeters)) {
+      continue;
+    }
+
+    minX = Math.min(minX, xMeters);
+    minY = Math.min(minY, yMeters);
+    maxX = Math.max(maxX, xMeters);
+    maxY = Math.max(maxY, yMeters);
+  }
+
+  if (
+    !Number.isFinite(minX) ||
+    !Number.isFinite(minY) ||
+    !Number.isFinite(maxX) ||
+    !Number.isFinite(maxY)
+  ) {
+    return null;
+  }
+
+  return {
+    minX,
+    minY,
+    maxX,
+    maxY,
+  };
+}
+
+function getContourBandSliceBounds(slice) {
+  if (slice?.bounds) {
+    return slice.bounds;
+  }
+
+  const bounds = computeLocalPolygonBounds(slice?.points || []);
+
+  if (slice && bounds) {
+    slice.bounds = bounds;
+  }
+
+  return bounds;
+}
+
+function partitionContourBandSlices(
+  slices,
+  interval = 1,
+  maxBucketSize = CONTOUR_BAND_UNION_MAX_SLICES
+) {
+  const validSlices = (slices || []).filter((slice) => slice?.points?.length >= 3);
+
+  if (validSlices.length <= maxBucketSize) {
+    return [validSlices];
+  }
+
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (const slice of validSlices) {
+    const bounds = getContourBandSliceBounds(slice);
+
+    if (!bounds) {
+      continue;
+    }
+
+    minX = Math.min(minX, bounds.minX);
+    minY = Math.min(minY, bounds.minY);
+    maxX = Math.max(maxX, bounds.maxX);
+    maxY = Math.max(maxY, bounds.maxY);
+  }
+
+  if (
+    !Number.isFinite(minX) ||
+    !Number.isFinite(minY) ||
+    !Number.isFinite(maxX) ||
+    !Number.isFinite(maxY)
+  ) {
+    return [validSlices];
+  }
+
+  const spanX = Math.max(1, maxX - minX);
+  const spanY = Math.max(1, maxY - minY);
+  const targetBucketCount = Math.max(
+    2,
+    Math.ceil(validSlices.length / Math.max(1, maxBucketSize))
+  );
+  const gridDimension = Math.max(2, Math.ceil(Math.sqrt(targetBucketCount)));
+  const tileWidth = Math.max(interval * 12, spanX / gridDimension);
+  const tileHeight = Math.max(interval * 12, spanY / gridDimension);
+  const buckets = new Map();
+
+  for (const slice of validSlices) {
+    const bounds = getContourBandSliceBounds(slice);
+
+    if (!bounds) {
+      continue;
+    }
+
+    const centerX = (bounds.minX + bounds.maxX) * 0.5;
+    const centerY = (bounds.minY + bounds.maxY) * 0.5;
+    const tileX = Math.max(
+      0,
+      Math.min(gridDimension - 1, Math.floor((centerX - minX) / tileWidth))
+    );
+    const tileY = Math.max(
+      0,
+      Math.min(gridDimension - 1, Math.floor((centerY - minY) / tileHeight))
+    );
+    const bucketKey = `${tileX}|${tileY}`;
+
+    if (!buckets.has(bucketKey)) {
+      buckets.set(bucketKey, []);
+    }
+
+    buckets.get(bucketKey).push(slice);
+  }
+
+  const partitioned = [...buckets.values()].filter((bucket) => bucket.length);
+
+  return partitioned.length ? partitioned : [validSlices];
+}
+
+function buildContourBandBoundaryLoopsFromSlices(slices, interval = 1) {
+  const precision =
+    interval <= 0.1 ? 2 : interval <= 0.5 ? 2 : interval <= 1 ? 3 : 3;
+  return mergeBandSlicePolygons(
+    slices.map((slice) => slice.points).filter((points) => points?.length >= 3),
+    precision
+  )
+    .map((ring) => simplifyLocalPolygon(ring, Math.max(0.01, interval * 0.05)))
+    .filter((ring) => ring.length >= 3);
+}
+
+function buildContourBandRegionsFromMultiPolygon(multiPolygon) {
+  const regions = [];
+
+  for (const polygon of multiPolygon || []) {
+    if (!Array.isArray(polygon) || !polygon.length) {
+      continue;
+    }
+
+    const outerPoints = simplifyLocalPolygon(
+      orientLocalPolygonCounterClockwise(polygon[0] || []),
+      0.01
+    );
+
+    if (outerPoints.length < 3) {
+      continue;
+    }
+
+    const holePoints = (polygon.slice(1) || [])
+      .map((ring) =>
+        simplifyLocalPolygon(
+          [...orientLocalPolygonCounterClockwise(ring || [])].reverse(),
+          0.01
+        )
+      )
+      .filter((ring) => ring.length >= 3);
+
+    regions.push({
+      outerPoints,
+      holePoints,
+    });
+  }
+
+  return regions;
+}
+
+function buildContourBandRegionsForSlicesInternal(slices, interval = 1, depth = 0) {
+  const multiPolygon = [];
+
+  for (const slice of slices || []) {
+    const ring = buildPolygonClippingRing(
+      orientLocalPolygonCounterClockwise(slice.points)
+    );
+
+    if (!ring) {
+      continue;
+    }
+
+    multiPolygon.push([ring]);
+  }
+
+  if (!multiPolygon.length) {
+    return [];
+  }
+
+  if (multiPolygon.length > CONTOUR_BAND_UNION_MAX_SLICES) {
+    const partitionedBuckets =
+      depth < 3 ? partitionContourBandSlices(slices, interval) : [];
+
+    if (
+      partitionedBuckets.length > 1 &&
+      partitionedBuckets.length < multiPolygon.length
+    ) {
+      console.warn(
+        `[terrain-union] partitioned dense slices=${multiPolygon.length} buckets=${partitionedBuckets.length} interval=${Number(
+          interval || 0
+        )} depth=${depth + 1}`
+      );
+      const partitionedRegions = partitionedBuckets.flatMap((bucket) =>
+        buildContourBandRegionsForSlicesInternal(bucket, interval, depth + 1)
+      );
+
+      if (partitionedRegions.length) {
+        return partitionedRegions;
+      }
+    }
+
+    console.warn(
+      `[terrain-union] dense-slice boundary merge slices=${multiPolygon.length} interval=${Number(
+        interval || 0
+      )}`
+    );
+    const fallbackLoops = buildContourBandBoundaryLoopsFromSlices(
+      slices,
+      interval
+    );
+    return buildContourBandRegions(fallbackLoops, slices);
+  }
+
+  try {
+    const unionResult = polygonClipping.union(multiPolygon) || [];
+    const regions = buildContourBandRegionsFromMultiPolygon(unionResult);
+
+    if (regions.length) {
+      return regions;
+    }
+  } catch (error) {
+    console.warn(
+      `[terrain-union] polygon union fallback slices=${multiPolygon.length} error=${formatErrorForLog(
+        error
+      )}`
+    );
+  }
+
+  const fallbackLoops = buildContourBandBoundaryLoopsFromSlices(slices, interval);
+  return buildContourBandRegions(fallbackLoops, slices);
+}
+
+function buildContourBandRegionsForSlices(slices, interval = 1) {
+  return buildContourBandRegionsForSlicesInternal(slices, interval, 0);
+}
+
+function buildContourBandUnionLoopsInternal(slices, interval = 1, depth = 0) {
   const multiPolygon = [];
 
   for (const slice of slices) {
@@ -5259,6 +8543,36 @@ function buildContourBandUnionLoops(slices) {
     return [];
   }
 
+  if (multiPolygon.length > CONTOUR_BAND_UNION_MAX_SLICES) {
+    const partitionedBuckets =
+      depth < 3 ? partitionContourBandSlices(slices, interval) : [];
+
+    if (
+      partitionedBuckets.length > 1 &&
+      partitionedBuckets.length < multiPolygon.length
+    ) {
+      console.warn(
+        `[terrain-union] partitioned loop slices=${multiPolygon.length} buckets=${partitionedBuckets.length} interval=${Number(
+          interval || 0
+        )} depth=${depth + 1}`
+      );
+      const partitionedLoops = partitionedBuckets.flatMap((bucket) =>
+        buildContourBandUnionLoopsInternal(bucket, interval, depth + 1)
+      );
+
+      if (partitionedLoops.length) {
+        return partitionedLoops;
+      }
+    }
+
+    console.warn(
+      `[terrain-union] dense-slice boundary merge slices=${multiPolygon.length} interval=${Number(
+        interval || 0
+      )}`
+    );
+    return buildContourBandBoundaryLoopsFromSlices(slices, interval);
+  }
+
   try {
     const unionResult = polygonClipping.union(multiPolygon);
 
@@ -5272,8 +8586,12 @@ function buildContourBandUnionLoops(slices) {
         error
       )}`
     );
-    return [];
+    return buildContourBandBoundaryLoopsFromSlices(slices, interval);
   }
+}
+
+function buildContourBandUnionLoops(slices, interval = 1) {
+  return buildContourBandUnionLoopsInternal(slices, interval, 0);
 }
 
 function mergeBandSlicePolygons(polygons, precision = 3) {
@@ -5434,18 +8752,32 @@ function buildContourBandGroups(siteContext) {
 
   for (const [groupKey, slices] of groupedSlices.entries()) {
     const [bottomElevation, topElevation] = groupKey.split("|").map(Number);
-    const unionLoops = buildContourBandUnionLoops(slices);
-    const regions = buildContourBandRegions(unionLoops, slices);
+    const interval = Math.max(
+      MIN_CONTOUR_INTERVAL_METERS,
+      Number((topElevation - bottomElevation).toFixed(3))
+    );
+    const regions = buildContourBandRegionsForSlices(slices, interval);
+    const multiPolygon = buildPolygonClippingMultiPolygonFromRegions(regions);
+    const bounds = computeRegionBounds(regions);
     const boundaryLoops = regions.flatMap((region) => [
       region.outerPoints,
       ...(region.holePoints || []),
     ]);
+
+    if (!regions.length) {
+      console.warn(
+        `[terrain-band] skipped empty band bottom=${bottomElevation} top=${topElevation} slices=${slices.length}`
+      );
+      continue;
+    }
 
     bandGroups.push({
       bottomElevation,
       topElevation,
       boundaryLoops,
       regions,
+      multiPolygon,
+      bounds,
     });
   }
 
@@ -5457,8 +8789,12 @@ function getCachedContourBandGroups(siteContext) {
     return buildContourBandGroups(siteContext);
   }
 
-  if (contourBandGroupCache.has(siteContext)) {
-    return contourBandGroupCache.get(siteContext);
+  const cacheKey = getContourBandCacheKey(siteContext);
+  const owner = resolveContourCacheOwner(siteContext);
+  const entry = getOrCreateWeakMapEntry(contourBandGroupCache, owner);
+
+  if (entry instanceof Map && entry.has(cacheKey)) {
+    return entry.get(cacheKey);
   }
 
   const bandGroups = buildContourBandGroups(siteContext).sort(
@@ -5466,7 +8802,97 @@ function getCachedContourBandGroups(siteContext) {
       left.bottomElevation - right.bottomElevation ||
       left.topElevation - right.topElevation
   );
-  contourBandGroupCache.set(siteContext, bandGroups);
+
+  if (entry instanceof Map) {
+    entry.set(cacheKey, bandGroups);
+  }
+
+  return bandGroups;
+}
+
+function buildCumulativeContourBandGroups(siteContext) {
+  const bandGroups = getCachedContourBandGroups(siteContext);
+
+  if (!bandGroups.length) {
+    return [];
+  }
+
+  const cumulativeDescending = [];
+  let cumulativeMultiPolygon = [];
+
+  for (let index = bandGroups.length - 1; index >= 0; index -= 1) {
+    const group = bandGroups[index];
+    const groupMultiPolygon = buildPolygonClippingMultiPolygonFromRegions(
+      group.regions
+    );
+
+    if (!groupMultiPolygon.length) {
+      continue;
+    }
+
+    let nextMultiPolygon = groupMultiPolygon;
+
+    if (cumulativeMultiPolygon.length) {
+      try {
+        nextMultiPolygon =
+          polygonClipping.union(groupMultiPolygon, cumulativeMultiPolygon) || [];
+      } catch (error) {
+        console.warn(
+          `[terrain-band] cumulative union fallback elevation=${group.topElevation} error=${formatErrorForLog(
+            error
+          )}`
+        );
+        nextMultiPolygon = [...groupMultiPolygon, ...cumulativeMultiPolygon];
+      }
+    }
+
+    const regions = stripRegionHoles(
+      buildContourBandRegionsFromMultiPolygon(nextMultiPolygon)
+    );
+
+    if (!regions.length) {
+      cumulativeMultiPolygon = nextMultiPolygon;
+      continue;
+    }
+
+    cumulativeDescending.push({
+      ...group,
+      boundaryLoops: regions.flatMap((region) => [
+        region.outerPoints,
+        ...(region.holePoints || []),
+      ]),
+      regions,
+      multiPolygon: nextMultiPolygon,
+    });
+    cumulativeMultiPolygon = nextMultiPolygon;
+  }
+
+  return cumulativeDescending.reverse();
+}
+
+function getCachedCumulativeContourBandGroups(siteContext) {
+  if (!siteContext || typeof siteContext !== "object") {
+    return buildCumulativeContourBandGroups(siteContext);
+  }
+
+  const cacheKey = getContourBandCacheKey(siteContext);
+  const owner = resolveContourCacheOwner(siteContext);
+  const entry = getOrCreateWeakMapEntry(contourCumulativeBandGroupCache, owner);
+
+  if (entry instanceof Map && entry.has(cacheKey)) {
+    return entry.get(cacheKey);
+  }
+
+  const bandGroups = buildCumulativeContourBandGroups(siteContext).sort(
+    (left, right) =>
+      left.bottomElevation - right.bottomElevation ||
+      left.topElevation - right.topElevation
+  );
+
+  if (entry instanceof Map) {
+    entry.set(cacheKey, bandGroups);
+  }
+
   return bandGroups;
 }
 
@@ -5498,6 +8924,193 @@ function buildPolygonClippingMultiPolygonFromRegions(regions) {
   return multiPolygon;
 }
 
+function stripRegionHoles(regions) {
+  return (regions || [])
+    .map((region) => ({
+      outerPoints: orientLocalPolygonCounterClockwise(region?.outerPoints || []),
+      holePoints: [],
+    }))
+    .filter((region) => region.outerPoints.length >= 3);
+}
+
+function buildBuildingFootprintMultiPolygon(siteContext) {
+  if (siteContext.options?.includeBuildings === false) {
+    return [];
+  }
+
+  const center = siteContext.location;
+  const multiPolygon = [];
+
+  for (const feature of siteContext.buildings?.features || []) {
+    const ring = getOpenRing(getOuterRing(feature));
+
+    if (ring.length < 3) {
+      continue;
+    }
+
+    const localRing = ring
+      .map((point) => localMetersFromLngLat(point, center))
+      .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+    const polygonRing = buildPolygonClippingRing(
+      orientLocalPolygonCounterClockwise(localRing)
+    );
+
+    if (polygonRing) {
+      multiPolygon.push([polygonRing]);
+    }
+  }
+
+  if (!multiPolygon.length) {
+    return [];
+  }
+
+  try {
+    return polygonClipping.union(multiPolygon) || [];
+  } catch (error) {
+    console.warn(
+      `[building-terrain] footprint union fallback error=${formatErrorForLog(
+        error
+      )}`
+    );
+    return multiPolygon;
+  }
+}
+
+function buildBuildingFootprintCarveProfiles(siteContext) {
+  if (siteContext.options?.includeBuildings === false) {
+    return [];
+  }
+
+  const center = siteContext.location;
+  const seed = Math.round(
+    Math.abs(Number(center?.lat) * 1000) + Math.abs(Number(center?.lng) * 1000)
+  );
+  const profiles = [];
+
+  for (const feature of siteContext.buildings?.features || []) {
+    const ring = getOpenRing(getOuterRing(feature));
+
+    if (ring.length < 3) {
+      continue;
+    }
+
+    const localRing = ring
+      .map((point) => localMetersFromLngLat(point, center))
+      .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+    const polygonRing = buildPolygonClippingRing(
+      orientLocalPolygonCounterClockwise(localRing)
+    );
+
+    if (!polygonRing) {
+      continue;
+    }
+
+    const placementInfo = resolveBuildingPlacementForRing(
+      siteContext,
+      ring,
+      center,
+      seed
+    );
+    const baseElevation = placementInfo?.finalBaseElevation ?? null;
+
+    profiles.push({
+      baseElevation: Number.isFinite(baseElevation) ? Number(baseElevation) : null,
+      polygon: [polygonRing],
+    });
+  }
+
+  return profiles;
+}
+
+function buildRenderableContourBandGroups(siteContext) {
+  const cumulativeGroups = getCachedCumulativeContourBandGroups(siteContext);
+
+  if (
+    siteContext.options?.buildingPlacement !== "embed-lowest" ||
+    !cumulativeGroups.length
+  ) {
+    return cumulativeGroups;
+  }
+
+  const buildingCarveProfiles = buildBuildingFootprintCarveProfiles(siteContext);
+
+  if (!buildingCarveProfiles.length) {
+    return cumulativeGroups;
+  }
+
+  const renderableGroups = [];
+
+  for (const group of cumulativeGroups) {
+    const groupMultiPolygon =
+      group.multiPolygon || buildPolygonClippingMultiPolygonFromRegions(group.regions);
+    let carvedMultiPolygon = groupMultiPolygon;
+    const activeBuildingFootprints = buildingCarveProfiles
+      .filter(
+        (profile) =>
+          !Number.isFinite(profile.baseElevation) ||
+          group.topElevation > profile.baseElevation + 1e-9
+      )
+      .map((profile) => profile.polygon);
+
+    if (groupMultiPolygon.length && activeBuildingFootprints.length) {
+      try {
+        carvedMultiPolygon =
+          polygonClipping.difference(groupMultiPolygon, activeBuildingFootprints) || [];
+      } catch (error) {
+        console.warn(
+          `[building-terrain] terrain carve fallback elevation=${group.topElevation} error=${formatErrorForLog(
+            error
+          )}`
+        );
+      }
+    }
+
+    const regions = buildContourBandRegionsFromMultiPolygon(carvedMultiPolygon);
+
+    if (!regions.length) {
+      continue;
+    }
+
+    renderableGroups.push({
+      ...group,
+      boundaryLoops: regions.flatMap((region) => [
+        region.outerPoints,
+        ...(region.holePoints || []),
+      ]),
+      regions,
+      multiPolygon: carvedMultiPolygon,
+    });
+  }
+
+  return renderableGroups;
+}
+
+function getCachedRenderableContourBandGroups(siteContext) {
+  if (!siteContext || typeof siteContext !== "object") {
+    return buildRenderableContourBandGroups(siteContext);
+  }
+
+  const cacheKey = `${getContourBandCacheKey(siteContext)}|${
+    siteContext.options?.buildingPlacement === "embed-lowest"
+      ? "embed-lowest"
+      : "dominant"
+  }|${siteContext.options?.includeBuildings !== false ? "with-bldg" : "no-bldg"}`;
+  const owner = resolveRenderableContourCacheOwner(siteContext);
+  const entry = getOrCreateWeakMapEntry(contourRenderableBandGroupCache, owner);
+
+  if (entry instanceof Map && entry.has(cacheKey)) {
+    return entry.get(cacheKey);
+  }
+
+  const bandGroups = buildRenderableContourBandGroups(siteContext);
+
+  if (entry instanceof Map) {
+    entry.set(cacheKey, bandGroups);
+  }
+
+  return bandGroups;
+}
+
 function computeLocalMultiPolygonArea(multiPolygon) {
   let area = 0;
 
@@ -5516,6 +9129,167 @@ function computeLocalMultiPolygonArea(multiPolygon) {
   return Math.max(0, Number(area.toFixed(6)));
 }
 
+function computeLocalBoundsFromPoints(points) {
+  if (!Array.isArray(points) || !points.length) {
+    return null;
+  }
+
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (const point of points) {
+    if (
+      !Array.isArray(point) ||
+      point.length < 2 ||
+      !Number.isFinite(point[0]) ||
+      !Number.isFinite(point[1])
+    ) {
+      continue;
+    }
+
+    minX = Math.min(minX, point[0]);
+    minY = Math.min(minY, point[1]);
+    maxX = Math.max(maxX, point[0]);
+    maxY = Math.max(maxY, point[1]);
+  }
+
+  if (
+    !Number.isFinite(minX) ||
+    !Number.isFinite(minY) ||
+    !Number.isFinite(maxX) ||
+    !Number.isFinite(maxY)
+  ) {
+    return null;
+  }
+
+  return { minX, minY, maxX, maxY };
+}
+
+function clipLocalPolygonAgainstBoundary(points, isInside, intersect) {
+  if (!Array.isArray(points) || points.length < 3) {
+    return [];
+  }
+
+  const clipped = [];
+  let previousPoint = points[points.length - 1];
+  let previousInside = isInside(previousPoint);
+
+  for (const currentPoint of points) {
+    const currentInside = isInside(currentPoint);
+
+    if (currentInside) {
+      if (!previousInside) {
+        clipped.push(intersect(previousPoint, currentPoint));
+      }
+      clipped.push(currentPoint);
+    } else if (previousInside) {
+      clipped.push(intersect(previousPoint, currentPoint));
+    }
+
+    previousPoint = currentPoint;
+    previousInside = currentInside;
+  }
+
+  return clipped;
+}
+
+function interpolateLocalSegmentPoint(startPoint, endPoint, t) {
+  const safeT = Number.isFinite(t) ? t : 0;
+  return [
+    Number((startPoint[0] + (endPoint[0] - startPoint[0]) * safeT).toFixed(6)),
+    Number((startPoint[1] + (endPoint[1] - startPoint[1]) * safeT).toFixed(6)),
+  ];
+}
+
+function clipLocalPolygonToRect(points, minX, minY, maxX, maxY) {
+  let polygon = dedupeLocalPolygonPoints(points, 0.0001);
+
+  if (polygon.length < 3) {
+    return [];
+  }
+
+  polygon = clipLocalPolygonAgainstBoundary(
+    polygon,
+    (point) => point[0] >= minX - 1e-9,
+    (startPoint, endPoint) => {
+      const dx = endPoint[0] - startPoint[0];
+      const t = Math.abs(dx) <= 1e-9 ? 0 : (minX - startPoint[0]) / dx;
+      return interpolateLocalSegmentPoint(startPoint, endPoint, t);
+    }
+  );
+  polygon = clipLocalPolygonAgainstBoundary(
+    polygon,
+    (point) => point[0] <= maxX + 1e-9,
+    (startPoint, endPoint) => {
+      const dx = endPoint[0] - startPoint[0];
+      const t = Math.abs(dx) <= 1e-9 ? 0 : (maxX - startPoint[0]) / dx;
+      return interpolateLocalSegmentPoint(startPoint, endPoint, t);
+    }
+  );
+  polygon = clipLocalPolygonAgainstBoundary(
+    polygon,
+    (point) => point[1] >= minY - 1e-9,
+    (startPoint, endPoint) => {
+      const dy = endPoint[1] - startPoint[1];
+      const t = Math.abs(dy) <= 1e-9 ? 0 : (minY - startPoint[1]) / dy;
+      return interpolateLocalSegmentPoint(startPoint, endPoint, t);
+    }
+  );
+  polygon = clipLocalPolygonAgainstBoundary(
+    polygon,
+    (point) => point[1] <= maxY + 1e-9,
+    (startPoint, endPoint) => {
+      const dy = endPoint[1] - startPoint[1];
+      const t = Math.abs(dy) <= 1e-9 ? 0 : (maxY - startPoint[1]) / dy;
+      return interpolateLocalSegmentPoint(startPoint, endPoint, t);
+    }
+  );
+
+  return dedupeLocalPolygonPoints(polygon, 0.0001);
+}
+
+function computeRegionBounds(regions) {
+  let bounds = null;
+
+  for (const region of regions || []) {
+    const regionBounds = computeLocalBoundsFromPoints([
+      ...(region.outerPoints || []),
+      ...((region.holePoints || []).flatMap((ring) => ring || [])),
+    ]);
+
+    if (!regionBounds) {
+      continue;
+    }
+
+    if (!bounds) {
+      bounds = { ...regionBounds };
+      continue;
+    }
+
+    bounds.minX = Math.min(bounds.minX, regionBounds.minX);
+    bounds.minY = Math.min(bounds.minY, regionBounds.minY);
+    bounds.maxX = Math.max(bounds.maxX, regionBounds.maxX);
+    bounds.maxY = Math.max(bounds.maxY, regionBounds.maxY);
+  }
+
+  return bounds;
+}
+
+function boundsOverlap(left, right, toleranceMeters = 0) {
+  if (!left || !right) {
+    return false;
+  }
+
+  return !(
+    left.maxX < right.minX - toleranceMeters ||
+    right.maxX < left.minX - toleranceMeters ||
+    left.maxY < right.minY - toleranceMeters ||
+    right.maxY < left.minY - toleranceMeters
+  );
+}
+
 function buildContourTopSurfaceGroups(siteContext) {
   const bandGroups = getCachedContourBandGroups(siteContext);
 
@@ -5526,7 +9300,8 @@ function buildContourTopSurfaceGroups(siteContext) {
   const cumulativeGroups = bandGroups
     .map((group) => ({
       ...group,
-      multiPolygon: buildPolygonClippingMultiPolygonFromRegions(group.regions),
+      multiPolygon:
+        group.multiPolygon || buildPolygonClippingMultiPolygonFromRegions(group.regions),
     }))
     .filter((group) => group.multiPolygon.length);
   const topSurfaceGroups = [];
@@ -5571,12 +9346,20 @@ function getCachedContourTopSurfaceGroups(siteContext) {
     return buildContourTopSurfaceGroups(siteContext);
   }
 
-  if (contourTopSurfaceCache.has(siteContext)) {
-    return contourTopSurfaceCache.get(siteContext);
+  const cacheKey = getContourBandCacheKey(siteContext);
+  const owner = resolveContourCacheOwner(siteContext);
+  const entry = getOrCreateWeakMapEntry(contourTopSurfaceCache, owner);
+
+  if (entry instanceof Map && entry.has(cacheKey)) {
+    return entry.get(cacheKey);
   }
 
   const topSurfaceGroups = buildContourTopSurfaceGroups(siteContext);
-  contourTopSurfaceCache.set(siteContext, topSurfaceGroups);
+
+  if (entry instanceof Map) {
+    entry.set(cacheKey, topSurfaceGroups);
+  }
+
   return topSurfaceGroups;
 }
 
@@ -5909,14 +9692,14 @@ function appendObjContourBandRegionSolid(
   return vertexState.nextIndex;
 }
 
-function appendContourBandTerrainObjGeometry(lines, siteContext, vertexIndex) {
-  const terrainGrid = siteContext.terrainGrid;
+function resolveContourTerrainRenderPlan(siteContext) {
+  const terrainGrid = siteContext?.terrainGrid;
 
   if (!terrainGrid?.elevations?.length) {
-    return vertexIndex;
+    return null;
   }
 
-  const interval = normalizeContourInterval(siteContext.options?.contourInterval);
+  const interval = resolveEffectiveContourBandInterval(siteContext);
   const baseElevation = getTerrainBaseElevation(
     siteContext,
     terrainGrid.minElevation
@@ -5926,7 +9709,191 @@ function appendContourBandTerrainObjGeometry(lines, siteContext, vertexIndex) {
   );
   const minBandElevation =
     Math.floor(Number(terrainGrid.minElevation || 0) / interval) * interval;
-  const bandGroups = getCachedContourBandGroups(siteContext);
+  const bandGroups = getCachedRenderableContourBandGroups(siteContext);
+  const quantizedTopElevation = quantizeTerrainHeight(
+    siteContext,
+    Number.isFinite(terrainGrid.maxElevation)
+      ? terrainGrid.maxElevation
+      : terrainGrid.minElevation
+  );
+  const flatTopElevation = Number(
+    Math.max(minBandElevation, quantizedTopElevation || minBandElevation).toFixed(3)
+  );
+  const useFlatFallback =
+    clipPolygon.length >= 3 &&
+    bandGroups.length === 0 &&
+    flatTopElevation > baseElevation + 0.001;
+
+  return {
+    terrainGrid,
+    interval,
+    baseElevation,
+    clipPolygon,
+    minBandElevation,
+    bandGroups,
+    flatTopElevation,
+    useFlatFallback,
+  };
+}
+
+function shouldSplitTerrainAlongParcelBoundary(siteContext) {
+  return Boolean(
+    siteContext?.options?.splitParcelBoundary === true &&
+      siteContext?.selectionMode !== "range" &&
+      getOpenRing(getOuterRing(siteContext?.parcelBoundary)).length >= 3
+  );
+}
+
+function shouldGroupParcelCutContent(siteContext) {
+  return shouldSplitTerrainAlongParcelBoundary(siteContext);
+}
+
+function isLineMostlyInsideParcelRing(lineString, parcelRing) {
+  if (!Array.isArray(lineString) || lineString.length < 2 || !parcelRing?.length) {
+    return false;
+  }
+
+  let insideCount = 0;
+
+  for (const point of lineString) {
+    if (pointInRing(point, parcelRing)) {
+      insideCount += 1;
+    }
+  }
+
+  return insideCount > 0 && insideCount >= Math.ceil(lineString.length / 2);
+}
+
+function buildLocalMultiPolygonFromOpenRing(points) {
+  const polygonRing = buildPolygonClippingRing(
+    orientLocalPolygonCounterClockwise(points || [])
+  );
+
+  return polygonRing ? [[polygonRing]] : [];
+}
+
+function splitTerrainMultiPolygonByParcelBoundary(siteContext, multiPolygon) {
+  const sourceMultiPolygon = Array.isArray(multiPolygon) ? multiPolygon : [];
+  const fallbackRegions = buildContourBandRegionsFromMultiPolygon(sourceMultiPolygon);
+
+  if (
+    !sourceMultiPolygon.length ||
+    !shouldSplitTerrainAlongParcelBoundary(siteContext)
+  ) {
+    return [
+      {
+        kind: "combined",
+        multiPolygon: sourceMultiPolygon,
+        regions: fallbackRegions,
+      },
+    ];
+  }
+
+  const parcelRing = getOpenRing(getOuterRing(siteContext.parcelBoundary)).map(
+    (point) => localMetersFromLngLat(point, siteContext.location)
+  );
+  const parcelMultiPolygon = buildLocalMultiPolygonFromOpenRing(parcelRing);
+
+  if (!parcelMultiPolygon.length) {
+    return [
+      {
+        kind: "combined",
+        multiPolygon: sourceMultiPolygon,
+        regions: fallbackRegions,
+      },
+    ];
+  }
+
+  let contextMultiPolygon = sourceMultiPolygon;
+  let parcelSegmentMultiPolygon = [];
+
+  try {
+    parcelSegmentMultiPolygon =
+      polygonClipping.intersection(sourceMultiPolygon, parcelMultiPolygon) || [];
+  } catch (error) {
+    console.warn(
+      `[terrain-split] parcel intersection fallback error=${formatErrorForLog(
+        error
+      )}`
+    );
+  }
+
+  try {
+    contextMultiPolygon =
+      polygonClipping.difference(sourceMultiPolygon, parcelMultiPolygon) || [];
+  } catch (error) {
+    console.warn(
+      `[terrain-split] parcel difference fallback error=${formatErrorForLog(
+        error
+      )}`
+    );
+  }
+
+  const segments = [];
+
+  if (contextMultiPolygon.length) {
+    const regions = buildContourBandRegionsFromMultiPolygon(contextMultiPolygon);
+
+    if (regions.length) {
+      segments.push({
+        kind: "context",
+        multiPolygon: contextMultiPolygon,
+        regions,
+      });
+    }
+  }
+
+  if (parcelSegmentMultiPolygon.length) {
+    const regions = buildContourBandRegionsFromMultiPolygon(
+      parcelSegmentMultiPolygon
+    );
+
+    if (regions.length) {
+      segments.push({
+        kind: "parcel",
+        multiPolygon: parcelSegmentMultiPolygon,
+        regions,
+      });
+    }
+  }
+
+  return segments.length
+    ? segments
+    : [
+        {
+          kind: "combined",
+          multiPolygon: sourceMultiPolygon,
+          regions: fallbackRegions,
+        },
+      ];
+}
+
+function appendContourBandTerrainObjGeometry(lines, siteContext, vertexIndex) {
+  const terrainPlan = resolveContourTerrainRenderPlan(siteContext);
+
+  if (!terrainPlan) {
+    return vertexIndex;
+  }
+
+  const {
+    baseElevation,
+    clipPolygon,
+    minBandElevation,
+    bandGroups,
+    flatTopElevation,
+    useFlatFallback,
+  } = terrainPlan;
+
+  if (useFlatFallback) {
+    lines.push("o TERRAIN_CONTOUR_FLAT");
+    return appendObjPrismFromPolygon(
+      lines,
+      clipPolygon,
+      flatTopElevation,
+      baseElevation,
+      vertexIndex
+    );
+  }
 
   if (clipPolygon.length >= 3 && minBandElevation > baseElevation + 0.001) {
     lines.push("o TERRAIN_CONTOUR_BASE");
@@ -5941,6 +9908,9 @@ function appendContourBandTerrainObjGeometry(lines, siteContext, vertexIndex) {
 
   for (let groupIndex = 0; groupIndex < bandGroups.length; groupIndex += 1) {
     const group = bandGroups[groupIndex];
+    const effectiveBottomElevation = Number(
+      Math.max(baseElevation, group.bottomElevation - TERRAIN_BAND_OVERLAP_METERS).toFixed(3)
+    );
 
     for (
       let regionIndex = 0;
@@ -5951,7 +9921,7 @@ function appendContourBandTerrainObjGeometry(lines, siteContext, vertexIndex) {
         lines,
         group.regions[regionIndex],
         group.topElevation,
-        group.bottomElevation,
+        effectiveBottomElevation,
         vertexIndex,
         `TERRAIN_CONTOUR_BAND_${groupIndex + 1}_${regionIndex + 1}`
       );
@@ -6249,12 +10219,14 @@ function appendBuildingObjGeometry(
     3,
     Number(feature.properties?.heightMeters || 0) || 10.2
   );
-  const buildingBaseElevation = buildingBaseElevationForRing(
+  const placementInfo = resolveBuildingPlacementForRing(
     siteContext,
     ring,
     center,
     seed
   );
+  applyBuildingPlacementDebug(feature, placementInfo);
+  const buildingBaseElevation = placementInfo?.finalBaseElevation ?? null;
   const objectName = sanitizeObjName(
     feature.properties?.buildingName ||
       feature.properties?.buildingId ||
@@ -6301,6 +10273,479 @@ function appendBuildingObjGeometry(
   return vertexIndex;
 }
 
+function resolveRoadWidthMeters(feature) {
+  const sourceLayer = String(feature?.properties?.sourceLayer || "")
+    .trim()
+    .toLowerCase();
+  const baseWidth = Number(
+    feature?.properties?.widthMeters || DEFAULT_ROAD_WIDTH_METERS
+  );
+
+  if (sourceLayer === "lt_l_sprd") {
+    return Math.max(8, Number.isFinite(baseWidth) ? baseWidth * 1.9 : 12);
+  }
+
+  return Math.max(2, baseWidth);
+}
+
+function resolveRoadProjectionSegmentLength(siteContext, widthMeters) {
+  const terrainStep = Number(siteContext?.terrainGrid?.step || 0);
+  const preferredStep =
+    Number.isFinite(terrainStep) && terrainStep > 0
+      ? terrainStep * 2
+      : Math.max(2, Number(widthMeters || DEFAULT_ROAD_WIDTH_METERS) * 0.5);
+
+  return Math.max(
+    1.5,
+    Math.min(
+      ROAD_SURFACE_MAX_SEGMENT_METERS,
+      Number(preferredStep.toFixed(3))
+    )
+  );
+}
+
+function sampleRoadSegmentLocalPoints(startPoint, endPoint, siteContext, widthMeters) {
+  const dx = endPoint[0] - startPoint[0];
+  const dy = endPoint[1] - startPoint[1];
+  const length = Math.hypot(dx, dy);
+
+  if (!Number.isFinite(length) || length < 0.5) {
+    return [];
+  }
+
+  const maxSegmentLength = resolveRoadProjectionSegmentLength(
+    siteContext,
+    widthMeters
+  );
+  const segmentCount = Math.max(1, Math.ceil(length / maxSegmentLength));
+  const points = [];
+
+  for (let index = 0; index <= segmentCount; index += 1) {
+    const t = index / segmentCount;
+    points.push([
+      startPoint[0] + dx * t,
+      startPoint[1] + dy * t,
+    ]);
+  }
+
+  return points;
+}
+
+function buildRoadSegmentLocalQuad(startPoint, endPoint, widthMeters) {
+  const dx = endPoint[0] - startPoint[0];
+  const dy = endPoint[1] - startPoint[1];
+  const length = Math.hypot(dx, dy);
+
+  if (!Number.isFinite(length) || length < 0.5) {
+    return null;
+  }
+
+  const halfWidth = Math.max(1, widthMeters / 2);
+  const offsetX = (-dy / length) * halfWidth;
+  const offsetY = (dx / length) * halfWidth;
+
+  return [
+    [startPoint[0] + offsetX, startPoint[1] + offsetY],
+    [endPoint[0] + offsetX, endPoint[1] + offsetY],
+    [endPoint[0] - offsetX, endPoint[1] - offsetY],
+    [startPoint[0] - offsetX, startPoint[1] - offsetY],
+  ];
+}
+
+function buildRoadFeatureFootprintMultiPolygon(feature, center) {
+  const multiPolygon = [];
+  const widthMeters = resolveRoadWidthMeters(feature);
+
+  if (
+    feature?.geometry?.type === "Polygon" ||
+    feature?.geometry?.type === "MultiPolygon"
+  ) {
+    for (const ring of getOuterRings(feature)) {
+      const localRing = ring.map((point) => localMetersFromLngLat(point, center));
+      const polygonRing = buildPolygonClippingRing(
+        orientLocalPolygonCounterClockwise(localRing)
+      );
+
+      if (polygonRing) {
+        multiPolygon.push([polygonRing]);
+      }
+    }
+
+    return multiPolygon;
+  }
+
+  for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
+    for (let index = 0; index < lineString.length - 1; index += 1) {
+      const startPoint = localMetersFromLngLat(lineString[index], center);
+      const endPoint = localMetersFromLngLat(lineString[index + 1], center);
+      const quad = buildRoadSegmentLocalQuad(startPoint, endPoint, widthMeters);
+
+      if (!quad) {
+        continue;
+      }
+
+      const polygonRing = buildPolygonClippingRing(
+        orientLocalPolygonCounterClockwise(quad)
+      );
+
+      if (polygonRing) {
+        multiPolygon.push([polygonRing]);
+      }
+    }
+  }
+
+  return multiPolygon;
+}
+
+function buildRoadFootprintMultiPolygon(siteContext, center) {
+  const footprintPolygons = [];
+
+  for (const feature of siteContext.roads?.features || []) {
+    footprintPolygons.push(...buildRoadFeatureFootprintMultiPolygon(feature, center));
+  }
+
+  if (!footprintPolygons.length) {
+    return [];
+  }
+
+  try {
+    return polygonClipping.union(footprintPolygons) || [];
+  } catch (error) {
+    console.warn(
+      `[roads] footprint union fallback error=${formatErrorForLog(error)}`
+    );
+    return footprintPolygons;
+  }
+}
+
+function getCachedRoadFootprintMultiPolygon(siteContext, center) {
+  if (!siteContext || typeof siteContext !== "object") {
+    return buildRoadFootprintMultiPolygon(siteContext, center);
+  }
+
+  const owner = resolveRoadGeometryCacheOwner(siteContext);
+  const entry = getOrCreateWeakMapEntry(roadFootprintMultiPolygonCache, owner);
+  const cacheKey = `${buildLocationCacheKey(center || siteContext.location)}|${
+    siteContext?.roads?.features?.length || 0
+  }`;
+
+  if (entry instanceof Map && entry.has(cacheKey)) {
+    return entry.get(cacheKey);
+  }
+
+  const multiPolygon = buildRoadFootprintMultiPolygon(siteContext, center);
+
+  if (entry instanceof Map) {
+    entry.set(cacheKey, multiPolygon);
+  }
+
+  return multiPolygon;
+}
+
+function buildContourRegionsFromMultiPolygon(multiPolygon) {
+  const boundaryLoops = [];
+
+  for (const polygon of multiPolygon || []) {
+    for (const ring of polygon || []) {
+      const simplifiedRing = simplifyLocalPolygon(ring, 0.01);
+
+      if (simplifiedRing.length >= 3) {
+        boundaryLoops.push(simplifiedRing);
+      }
+    }
+  }
+
+  return buildContourBandRegions(boundaryLoops);
+}
+
+function buildRoadContourSurfaceGroups(siteContext, center) {
+  if (siteContext.options?.terrainMode !== "contour") {
+    return [];
+  }
+
+  const owner = resolveRoadGeometryCacheOwner(siteContext);
+  const entry = getOrCreateWeakMapEntry(roadContourSurfaceGroupCache, owner);
+  const cacheKey = `${buildLocationCacheKey(center || siteContext.location)}|${getContourBandCacheKey(
+    siteContext
+  )}|${siteContext?.roads?.features?.length || 0}`;
+
+  if (entry instanceof Map && entry.has(cacheKey)) {
+    return entry.get(cacheKey);
+  }
+
+  const roadFootprintMultiPolygon = getCachedRoadFootprintMultiPolygon(siteContext, center);
+
+  if (!roadFootprintMultiPolygon.length) {
+    if (entry instanceof Map) {
+      entry.set(cacheKey, []);
+    }
+    return [];
+  }
+
+  const topSurfaceGroups = getCachedContourTopSurfaceGroups(siteContext);
+  const roadSurfaceGroups = [];
+
+  for (const surfaceGroup of topSurfaceGroups) {
+    if (!surfaceGroup.multiPolygon?.length) {
+      continue;
+    }
+
+    let overlapMultiPolygon = [];
+
+    try {
+      overlapMultiPolygon =
+        polygonClipping.intersection(
+          roadFootprintMultiPolygon,
+          surfaceGroup.multiPolygon
+        ) || [];
+    } catch (error) {
+      console.warn(
+        `[roads] contour intersection fallback elevation=${surfaceGroup.elevation} error=${formatErrorForLog(
+          error
+        )}`
+      );
+      continue;
+    }
+
+    const areaSqm = computeLocalMultiPolygonArea(overlapMultiPolygon);
+
+    if (areaSqm <= 0.001) {
+      continue;
+    }
+
+    const regions = buildContourRegionsFromMultiPolygon(overlapMultiPolygon);
+
+    if (!regions.length) {
+      continue;
+    }
+
+    roadSurfaceGroups.push({
+      elevation: Number(surfaceGroup.elevation.toFixed(3)),
+      areaSqm: Number(areaSqm.toFixed(3)),
+      regions,
+    });
+  }
+
+  if (entry instanceof Map) {
+    entry.set(cacheKey, roadSurfaceGroups);
+  }
+
+  return roadSurfaceGroups;
+}
+
+function buildRoadSegmentLocalQuads(startPoint, endPoint, widthMeters, siteContext) {
+  const samplePoints = sampleRoadSegmentLocalPoints(
+    startPoint,
+    endPoint,
+    siteContext,
+    widthMeters
+  );
+
+  if (samplePoints.length < 2) {
+    return [];
+  }
+
+  const quads = [];
+
+  for (let index = 0; index < samplePoints.length - 1; index += 1) {
+    const quad = buildRoadSegmentLocalQuad(
+      samplePoints[index],
+      samplePoints[index + 1],
+      widthMeters
+    );
+
+    if (quad) {
+      quads.push(quad);
+    }
+  }
+
+  return quads;
+}
+
+function buildRoadLocalPath(coordinates, center, siteContext, widthMeters) {
+  if (!coordinates?.length || coordinates.length < 2) {
+    return [];
+  }
+
+  const localPoints = coordinates.map((point) =>
+    localMetersFromLngLat(point, center)
+  );
+  const path = [];
+
+  for (let index = 0; index < localPoints.length - 1; index += 1) {
+    const sampledPoints = sampleRoadSegmentLocalPoints(
+      localPoints[index],
+      localPoints[index + 1],
+      siteContext,
+      widthMeters
+    );
+
+    if (!sampledPoints.length) {
+      continue;
+    }
+
+    if (path.length) {
+      path.pop();
+    }
+
+    path.push(...sampledPoints);
+  }
+
+  return path;
+}
+
+function appendRoadPrismObjGeometry(
+  lines,
+  polygonPoints,
+  siteContext,
+  seed,
+  vertexIndex
+) {
+  if (!polygonPoints?.length || polygonPoints.length < 3) {
+    return vertexIndex;
+  }
+
+  const bottomIndices = [];
+  const topIndices = [];
+
+  for (const [xMeters, yMeters] of polygonPoints) {
+    const baseElevation =
+      siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) +
+      ROAD_SURFACE_OFFSET_METERS;
+    const topElevation = baseElevation + ROAD_SURFACE_THICKNESS_METERS;
+
+    appendObjVertex(lines, xMeters, yMeters, baseElevation);
+    bottomIndices.push(vertexIndex);
+    vertexIndex += 1;
+
+    appendObjVertex(lines, xMeters, yMeters, topElevation);
+    topIndices.push(vertexIndex);
+    vertexIndex += 1;
+  }
+
+  for (let index = 0; index < polygonPoints.length; index += 1) {
+    const nextIndex = (index + 1) % polygonPoints.length;
+    appendObjQuad(
+      lines,
+      bottomIndices[index],
+      bottomIndices[nextIndex],
+      topIndices[nextIndex],
+      topIndices[index]
+    );
+  }
+
+  appendObjFace(lines, topIndices);
+  appendObjFace(lines, bottomIndices, true);
+  return vertexIndex;
+}
+
+function appendRoadObjGeometry(
+  lines,
+  feature,
+  center,
+  siteContext,
+  seed,
+  vertexIndex
+) {
+  const roadName = sanitizeObjName(
+    feature.properties?.roadName || feature.properties?.roadId,
+    `ROAD_${vertexIndex}`
+  );
+  const widthMeters = resolveRoadWidthMeters(feature);
+
+  if (
+    feature?.geometry?.type === "Polygon" ||
+    feature?.geometry?.type === "MultiPolygon"
+  ) {
+    let polygonIndex = 1;
+
+    for (const ring of getOuterRings(feature)) {
+      const openRing = getOpenRing(ring);
+
+      if (openRing.length < 3) {
+        continue;
+      }
+
+      lines.push(`o ROAD_${roadName}_${polygonIndex}`);
+      vertexIndex = appendRoadPrismObjGeometry(
+        lines,
+        openRing.map((point) => localMetersFromLngLat(point, center)),
+        siteContext,
+        seed,
+        vertexIndex
+      );
+      polygonIndex += 1;
+    }
+
+    return vertexIndex;
+  }
+
+  let segmentCounter = 1;
+
+  for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
+    for (let index = 0; index < lineString.length - 1; index += 1) {
+      const startPoint = localMetersFromLngLat(lineString[index], center);
+      const endPoint = localMetersFromLngLat(lineString[index + 1], center);
+      const quads = buildRoadSegmentLocalQuads(
+        startPoint,
+        endPoint,
+        widthMeters,
+        siteContext
+      );
+
+      for (const quad of quads) {
+        lines.push(`o ROAD_${roadName}_${segmentCounter}`);
+        vertexIndex = appendRoadPrismObjGeometry(
+          lines,
+          quad,
+          siteContext,
+          seed,
+          vertexIndex
+        );
+        segmentCounter += 1;
+      }
+    }
+  }
+
+  return vertexIndex;
+}
+
+function appendContourBandRoadObjGeometry(
+  lines,
+  siteContext,
+  center,
+  vertexIndex
+) {
+  const roadSurfaceGroups = buildRoadContourSurfaceGroups(siteContext, center);
+
+  for (let groupIndex = 0; groupIndex < roadSurfaceGroups.length; groupIndex += 1) {
+    const group = roadSurfaceGroups[groupIndex];
+    const bottomElevation = Number(
+      (group.elevation + ROAD_SURFACE_OFFSET_METERS).toFixed(3)
+    );
+    const topElevation = Number(
+      (bottomElevation + ROAD_SURFACE_THICKNESS_METERS).toFixed(3)
+    );
+
+    for (
+      let regionIndex = 0;
+      regionIndex < group.regions.length;
+      regionIndex += 1
+    ) {
+      vertexIndex = appendObjContourBandRegionSolid(
+        lines,
+        group.regions[regionIndex],
+        topElevation,
+        bottomElevation,
+        vertexIndex,
+        `ROAD_BAND_${groupIndex + 1}_${regionIndex + 1}`
+      );
+    }
+  }
+
+  return vertexIndex;
+}
+
 function buildObjFromSiteContext(siteContext, reportProgress = null) {
   const location = siteContext.location;
   const center = { lat: location.lat, lng: location.lng };
@@ -6317,11 +10762,7 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
   progress(8, "OBJ 지형을 구성하는 중입니다.");
 
   if (siteContext.options?.terrainMode === "contour") {
-    vertexIndex = appendContourBandTerrainObjGeometry(
-      lines,
-      siteContext,
-      vertexIndex
-    );
+    vertexIndex = appendContourBandTerrainObjGeometry(lines, siteContext, vertexIndex);
   } else {
     vertexIndex = appendTerrainMeshObjGeometry(
       lines,
@@ -6351,8 +10792,41 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
     }
   }
 
+  if (siteContext.options?.includeParcelBoundary !== false) {
+    progress(56, "Adding surrounding parcel boundaries.");
+
+    for (
+      let parcelIndex = 0;
+      parcelIndex < (siteContext.parcelContext?.features || []).length;
+      parcelIndex += 1
+    ) {
+      const feature = siteContext.parcelContext.features[parcelIndex];
+      const ring = getOuterRing(feature);
+
+      if (!ring?.length) {
+        continue;
+      }
+
+      lines.push(`o PARCEL_CONTEXT_${parcelIndex + 1}`);
+      const parcelVertexIndices = [];
+
+      for (const point of ring) {
+        const [xMeters, yMeters] = localMetersFromLngLat(point, center);
+        const elevation =
+          siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.12;
+        appendObjVertex(lines, xMeters, yMeters, elevation);
+        parcelVertexIndices.push(vertexIndex);
+        vertexIndex += 1;
+      }
+
+      if (parcelVertexIndices.length >= 2) {
+        lines.push(`l ${parcelVertexIndices.join(" ")}`);
+      }
+    }
+  }
+
   if (siteContext.options?.includeContours !== false) {
-    progress(64, "등고선 레이어를 정리하는 중입니다.");
+    progress(66, "등고선 레이어를 정리하는 중입니다.");
     let contourCounter = 1;
 
     for (const feature of siteContext.contourLines.features) {
@@ -6378,7 +10852,7 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
   }
 
   if (siteContext.options?.includeBuildings !== false) {
-    progress(82, "건물 매스를 배치하는 중입니다.");
+    progress(80, "건물 매스를 배치하는 중입니다.");
     for (const feature of siteContext.buildings?.features || []) {
       vertexIndex = appendBuildingObjGeometry(
         lines,
@@ -6391,11 +10865,1454 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
     }
   }
 
+  if (siteContext.options?.includeRoads === true) {
+    progress(90, "도로 오버레이를 추가하는 중입니다.");
+
+    if (siteContext.options?.terrainMode === "contour") {
+      vertexIndex = appendContourBandRoadObjGeometry(
+        lines,
+        siteContext,
+        center,
+        vertexIndex
+      );
+    } else {
+      for (const feature of siteContext.roads?.features || []) {
+        vertexIndex = appendRoadObjGeometry(
+          lines,
+          feature,
+          center,
+          siteContext,
+          seed,
+          vertexIndex
+        );
+      }
+    }
+  }
+
   progress(96, "OBJ 파일을 마무리하는 중입니다.");
   return lines.join("\n");
 }
 
-function createRhinoObjectAttributes(rhino, layerIndex, name = "", color = null) {
+function buildSketchUpFacePoint(xMeters, yMeters, elevation) {
+  return [
+    Number(xMeters.toFixed(6)),
+    Number(yMeters.toFixed(6)),
+    Number(Number(elevation || 0).toFixed(6)),
+  ];
+}
+
+function collectSketchUpRegionCapFaces(
+  facePolygons,
+  region,
+  elevation,
+  reverse = false
+) {
+  const rings = [region.outerPoints, ...(region.holePoints || [])]
+    .map((ring) => dedupeLocalPolygonPoints(ring))
+    .filter((ring) => ring.length >= 3);
+
+  if (!rings.length) {
+    return;
+  }
+
+  const flatCoordinates = [];
+  const holeIndices = [];
+  const facePoints = [];
+  let pointOffset = 0;
+
+  for (let ringIndex = 0; ringIndex < rings.length; ringIndex += 1) {
+    const ring = rings[ringIndex];
+
+    if (ringIndex > 0) {
+      holeIndices.push(pointOffset);
+    }
+
+    for (const [xMeters, yMeters] of ring) {
+      flatCoordinates.push(xMeters, yMeters);
+      facePoints.push(buildSketchUpFacePoint(xMeters, yMeters, elevation));
+      pointOffset += 1;
+    }
+  }
+
+  const triangles = earcut(flatCoordinates, holeIndices, 2);
+
+  for (let index = 0; index < triangles.length; index += 3) {
+    const a = facePoints[triangles[index]];
+    const b = facePoints[triangles[index + 1]];
+    const c = facePoints[triangles[index + 2]];
+    facePolygons.push(reverse ? [a, c, b] : [a, b, c]);
+  }
+}
+
+function collectSketchUpVerticalLoopFaces(
+  facePolygons,
+  loopPoints,
+  topElevation,
+  bottomElevation
+) {
+  const polygon = dedupeLocalPolygonPoints(loopPoints);
+
+  if (polygon.length < 2 || topElevation <= bottomElevation) {
+    return;
+  }
+
+  const isCounterClockwise = computeLocalPolygonSignedArea(polygon) >= 0;
+
+  for (let index = 0; index < polygon.length; index += 1) {
+    const nextIndex = (index + 1) % polygon.length;
+    const [x1, y1] = polygon[index];
+    const [x2, y2] = polygon[nextIndex];
+    const bottomCurrent = buildSketchUpFacePoint(x1, y1, bottomElevation);
+    const bottomNext = buildSketchUpFacePoint(x2, y2, bottomElevation);
+    const topCurrent = buildSketchUpFacePoint(x1, y1, topElevation);
+    const topNext = buildSketchUpFacePoint(x2, y2, topElevation);
+
+    facePolygons.push(
+      isCounterClockwise
+        ? [bottomCurrent, bottomNext, topNext, topCurrent]
+        : [bottomNext, bottomCurrent, topCurrent, topNext]
+    );
+  }
+}
+
+function buildSketchUpRegionSolidGroup(
+  layer,
+  objectName,
+  region,
+  topElevation,
+  bottomElevation
+) {
+  if (!region || topElevation <= bottomElevation) {
+    return null;
+  }
+
+  const facePolygons = [];
+  collectSketchUpRegionCapFaces(facePolygons, region, topElevation, false);
+  collectSketchUpRegionCapFaces(facePolygons, region, bottomElevation, true);
+  collectSketchUpVerticalLoopFaces(
+    facePolygons,
+    region.outerPoints,
+    topElevation,
+    bottomElevation
+  );
+
+  for (const holePoints of region.holePoints || []) {
+    collectSketchUpVerticalLoopFaces(
+      facePolygons,
+      holePoints,
+      topElevation,
+      bottomElevation
+    );
+  }
+
+  if (!facePolygons.length) {
+    return null;
+  }
+
+  return {
+    layer,
+    name: objectName,
+    faces: facePolygons,
+    polylines: [],
+  };
+}
+
+function buildSketchUpRegionSolidDefinition(region, topElevation, bottomElevation) {
+  if (!region || topElevation <= bottomElevation) {
+    return null;
+  }
+
+  const outerPoints = orientLocalPolygonCounterClockwise(
+    region.outerPoints || []
+  );
+
+  if (outerPoints.length < 3) {
+    return null;
+  }
+
+  return {
+    outerLoop: outerPoints.map(([xMeters, yMeters]) =>
+      buildSketchUpFacePoint(xMeters, yMeters, bottomElevation)
+    ),
+    holeLoops: (region.holePoints || [])
+      .map((ring) => orientLocalPolygonClockwise(ring))
+      .filter((ring) => ring.length >= 3)
+      .map((ring) =>
+        ring.map(([xMeters, yMeters]) =>
+          buildSketchUpFacePoint(xMeters, yMeters, bottomElevation)
+        )
+      ),
+    heightMeters: Number((topElevation - bottomElevation).toFixed(6)),
+  };
+}
+
+function buildSketchUpPrismSolidDefinition(
+  polygonPoints,
+  topElevation,
+  bottomElevation
+) {
+  return buildSketchUpRegionSolidDefinition(
+    {
+      outerPoints: dedupeLocalPolygonPoints(polygonPoints),
+      holePoints: [],
+    },
+    topElevation,
+    bottomElevation
+  );
+}
+
+function buildSketchUpPrismGroup(
+  layer,
+  objectName,
+  polygonPoints,
+  topElevation,
+  bottomElevation
+) {
+  const region = {
+    outerPoints: dedupeLocalPolygonPoints(polygonPoints),
+    holePoints: [],
+  };
+
+  if (region.outerPoints.length < 3) {
+    return null;
+  }
+
+  return buildSketchUpRegionSolidGroup(
+    layer,
+    objectName,
+    region,
+    topElevation,
+    bottomElevation
+  );
+}
+
+function buildSketchUpPolyline(points, closed = false) {
+  const normalizedPoints = closed
+    ? dedupeLocalPolygonPoints(points, 0.001)
+    : (points || []).filter(
+        (point) =>
+          Array.isArray(point) &&
+          point.length >= 3 &&
+          point.every((value) => Number.isFinite(value))
+      );
+
+  if (normalizedPoints.length < (closed ? 3 : 2)) {
+    return null;
+  }
+
+  return {
+    closed,
+    points: normalizedPoints.map(([xMeters, yMeters, elevation]) =>
+      buildSketchUpFacePoint(xMeters, yMeters, elevation)
+    ),
+  };
+}
+
+function buildSketchUpContourPolyline(points, elevation) {
+  return buildSketchUpPolyline(
+    (points || []).map(([xMeters, yMeters]) => [
+      Number(xMeters || 0),
+      Number(yMeters || 0),
+      Number(elevation || 0),
+    ]),
+    false
+  );
+}
+
+function appendSketchUpTerrainSegmentSolids(
+  targetSolidsByKind,
+  segments,
+  topElevation,
+  bottomElevation
+) {
+  for (const segment of segments || []) {
+    const bucketKey =
+      segment?.kind === "parcel" || segment?.kind === "context"
+        ? segment.kind
+        : "combined";
+
+    if (!Array.isArray(targetSolidsByKind?.[bucketKey])) {
+      targetSolidsByKind[bucketKey] = [];
+    }
+
+    for (const region of segment.regions || []) {
+      const terrainSolid = buildSketchUpRegionSolidDefinition(
+        region,
+        topElevation,
+        bottomElevation
+      );
+
+      if (terrainSolid) {
+        targetSolidsByKind[bucketKey].push(terrainSolid);
+      }
+    }
+  }
+}
+
+function buildSketchUpPayloadFromSiteContext(siteContext) {
+  const location = siteContext.location;
+  const center = { lat: location.lat, lng: location.lng };
+  const seed = Math.round(Math.abs(center.lat * 1000) + Math.abs(center.lng * 1000));
+  const groups = [];
+  const terrainSolidBuckets = { combined: [], context: [], parcel: [] };
+  const roadSolidBuckets = { combined: [], context: [], parcel: [] };
+  const parcelRing = shouldGroupParcelCutContent(siteContext)
+    ? getOuterRing(siteContext.parcelBoundary)
+    : null;
+  const parcelContainerName = parcelRing?.length ? "PARCEL_CUT_CONTENT" : "";
+  const pushGroup = (group) => {
+    if (
+      group &&
+      ((group.faces && group.faces.length) ||
+        (group.polylines && group.polylines.length) ||
+        (group.solids && group.solids.length))
+    ) {
+      groups.push(group);
+    }
+  };
+
+  if (
+    siteContext.options?.terrainMode === "contour" &&
+    siteContext.terrainGrid?.elevations?.length
+  ) {
+    const terrainPlan = resolveContourTerrainRenderPlan(siteContext);
+    const {
+      baseElevation,
+      minBandElevation,
+      bandGroups,
+      clipPolygon,
+      flatTopElevation,
+      useFlatFallback,
+    } = terrainPlan || {};
+
+    if (useFlatFallback && clipPolygon.length >= 3) {
+      const flatSegments = splitTerrainMultiPolygonByParcelBoundary(
+        siteContext,
+        buildLocalMultiPolygonFromOpenRing(clipPolygon)
+      );
+      appendSketchUpTerrainSegmentSolids(
+        terrainSolidBuckets,
+        flatSegments,
+        flatTopElevation,
+        baseElevation
+      );
+    } else {
+      if (clipPolygon.length >= 3 && minBandElevation > baseElevation + 0.001) {
+        const baseSegments = splitTerrainMultiPolygonByParcelBoundary(
+          siteContext,
+          buildLocalMultiPolygonFromOpenRing(clipPolygon)
+        );
+        appendSketchUpTerrainSegmentSolids(
+          terrainSolidBuckets,
+          baseSegments,
+          minBandElevation,
+          baseElevation
+        );
+      }
+
+      for (let groupIndex = 0; groupIndex < bandGroups.length; groupIndex += 1) {
+        const group = bandGroups[groupIndex];
+        const effectiveBottomElevation = Number(
+          Math.max(baseElevation, group.bottomElevation - TERRAIN_BAND_OVERLAP_METERS).toFixed(3)
+        );
+        const groupSegments = splitTerrainMultiPolygonByParcelBoundary(
+          siteContext,
+          group.multiPolygon ||
+            buildPolygonClippingMultiPolygonFromRegions(group.regions)
+        );
+        appendSketchUpTerrainSegmentSolids(
+          terrainSolidBuckets,
+          groupSegments,
+          group.topElevation,
+          effectiveBottomElevation
+        );
+      }
+    }
+  }
+
+  if (siteContext.options?.includeBuildings !== false) {
+    for (const feature of siteContext.buildings?.features || []) {
+      const ring = getOpenRing(getOuterRing(feature));
+
+      if (ring.length < 3) {
+        continue;
+      }
+
+      const placementInfo = resolveBuildingPlacementForRing(
+        siteContext,
+        ring,
+        center,
+        seed
+      );
+      applyBuildingPlacementDebug(feature, placementInfo);
+      const resolvedBaseElevation = Number.isFinite(placementInfo?.finalBaseElevation)
+        ? placementInfo.finalBaseElevation
+        : (() => {
+            const centroid = centroidOfRing(ring);
+
+            if (!centroid) {
+              return 0;
+            }
+
+            const [xMeters, yMeters] = localMetersFromLngLat(centroid, center);
+            return siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed);
+          })();
+      const heightMeters = Math.max(
+        3,
+        Number(feature.properties?.heightMeters || 0) || 10.2
+      );
+      const layer = feature.properties?.isTarget ? "target-building" : "buildings";
+      const objectName =
+        feature.properties?.buildingName ||
+        feature.properties?.buildingId ||
+        feature.properties?.roadAddress ||
+        `BUILDING_${groups.length + 1}`;
+
+      pushGroup(
+        {
+          layer,
+          name: objectName,
+          container:
+            feature.properties?.isTarget && parcelContainerName
+              ? parcelContainerName
+              : "",
+          faces: [],
+          polylines: [],
+          solids: [
+            buildSketchUpPrismSolidDefinition(
+              ring.map((point) => localMetersFromLngLat(point, center)),
+              resolvedBaseElevation + heightMeters,
+              resolvedBaseElevation
+            ),
+          ].filter(Boolean),
+        }
+      );
+    }
+  }
+
+  if (siteContext.options?.includeRoads === true) {
+    if (siteContext.options?.terrainMode === "contour") {
+      const roadSurfaceGroups = buildRoadContourSurfaceGroups(siteContext, center);
+
+      for (let groupIndex = 0; groupIndex < roadSurfaceGroups.length; groupIndex += 1) {
+        const group = roadSurfaceGroups[groupIndex];
+        const bottomElevation = Number(
+          (group.elevation + ROAD_SURFACE_OFFSET_METERS).toFixed(3)
+        );
+        const topElevation = Number(
+          (bottomElevation + ROAD_SURFACE_THICKNESS_METERS).toFixed(3)
+        );
+        const groupSegments = splitTerrainMultiPolygonByParcelBoundary(
+          siteContext,
+          buildPolygonClippingMultiPolygonFromRegions(group.regions)
+        );
+        appendSketchUpTerrainSegmentSolids(
+          roadSolidBuckets,
+          groupSegments,
+          topElevation,
+          bottomElevation
+        );
+      }
+    }
+  }
+
+  if (siteContext.options?.includeParcelBoundary !== false) {
+    const parcelRing = getOuterRing(siteContext.parcelBoundary);
+    const parcelPolyline = buildSketchUpPolyline(
+      parcelRing.map((point) => {
+        const [xMeters, yMeters] = localMetersFromLngLat(point, center);
+        return [
+          xMeters,
+          yMeters,
+          siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.15,
+        ];
+      }),
+      true
+    );
+
+    pushGroup({
+      layer: "site-parcel",
+      name: "PARCEL_BOUNDARY",
+      container: parcelContainerName,
+      faces: [],
+      polylines: parcelPolyline ? [parcelPolyline] : [],
+    });
+  }
+
+  if (siteContext.options?.includeContours !== false) {
+    const contourPolylines = [];
+    const parcelContourPolylines = [];
+
+    for (const feature of siteContext.contourLines?.features || []) {
+      const elevation = Number(feature?.properties?.elevation || 0);
+
+      for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
+        const localPoints = lineString.map((point) =>
+          localMetersFromLngLat(point, center)
+        );
+        const polyline = buildSketchUpContourPolyline(localPoints, elevation);
+
+        if (polyline) {
+          if (parcelRing?.length && isLineMostlyInsideParcelRing(lineString, parcelRing)) {
+            parcelContourPolylines.push(polyline);
+          } else {
+            contourPolylines.push(polyline);
+          }
+        }
+      }
+    }
+
+    if (contourPolylines.length) {
+      pushGroup({
+        layer: "contours",
+        name: "CONTOURS",
+        faces: [],
+        polylines: contourPolylines,
+        solids: [],
+      });
+    }
+
+    if (parcelContourPolylines.length) {
+      pushGroup({
+        layer: "contours",
+        name: "CONTOURS_PARCEL",
+        container: parcelContainerName,
+        faces: [],
+        polylines: parcelContourPolylines,
+        solids: [],
+      });
+    }
+  }
+
+  const contextTerrainSolids = [
+    ...(terrainSolidBuckets.combined || []),
+    ...(terrainSolidBuckets.context || []),
+  ];
+  const parcelTerrainSolids = terrainSolidBuckets.parcel || [];
+
+  if (contextTerrainSolids.length) {
+    pushGroup({
+      layer: "terrain",
+      name: "TERRAIN",
+      faces: [],
+      polylines: [],
+      solids: contextTerrainSolids,
+    });
+  }
+
+  if (parcelTerrainSolids.length) {
+    pushGroup({
+      layer: "terrain",
+      name: "TERRAIN_PARCEL",
+      container: parcelContainerName,
+      faces: [],
+      polylines: [],
+      solids: parcelTerrainSolids,
+    });
+  }
+
+  const contextRoadSolids = [
+    ...(roadSolidBuckets.combined || []),
+    ...(roadSolidBuckets.context || []),
+  ];
+  const parcelRoadSolids = roadSolidBuckets.parcel || [];
+
+  if (contextRoadSolids.length) {
+    pushGroup({
+      layer: "roads",
+      name: "ROADS",
+      faces: [],
+      polylines: [],
+      solids: contextRoadSolids,
+    });
+  }
+
+  if (parcelRoadSolids.length) {
+    pushGroup({
+      layer: "roads",
+      name: "ROADS_PARCEL",
+      container: parcelContainerName,
+      faces: [],
+      polylines: [],
+      solids: parcelRoadSolids,
+    });
+  }
+
+  return {
+    units: "meters",
+    groups,
+  };
+}
+
+function normalizeSkpExportEngine(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "sketchup-desktop") {
+    return "sketchup-desktop";
+  }
+  if (normalized === "standalone-cli") {
+    return "standalone-cli";
+  }
+  return "auto";
+}
+
+function resolveSkpExportRuntimeConfig(exportConfig = null) {
+  const source =
+    exportConfig && typeof exportConfig === "object" ? exportConfig : {};
+
+  return {
+    engine: normalizeSkpExportEngine(
+      source.skpExportEngine ?? process.env.SKP_EXPORT_ENGINE ?? "auto"
+    ),
+    skpExporterCli: normalizeConfigString(
+      source.skpExporterCli ?? process.env.SKP_EXPORTER_CLI ?? ""
+    ),
+    sketchUpExe: normalizeConfigString(
+      source.sketchUpExe ?? process.env.SKETCHUP_EXE ?? ""
+    ),
+  };
+}
+
+async function findStandaloneSkpExporterPath(exportConfig = null) {
+  const runtimeConfig = resolveSkpExportRuntimeConfig(exportConfig);
+  const configuredPath = runtimeConfig.skpExporterCli;
+
+  if (!configuredPath) {
+    return null;
+  }
+
+  try {
+    await stat(configuredPath);
+    return configuredPath;
+  } catch {
+    return null;
+  }
+}
+
+async function findSketchUpExecutablePath(exportConfig = null) {
+  const runtimeConfig = resolveSkpExportRuntimeConfig(exportConfig);
+  const preferredPath = runtimeConfig.sketchUpExe;
+
+  if (preferredPath) {
+    try {
+      await stat(preferredPath);
+      return preferredPath;
+    } catch {
+      // fall back to installed-path discovery
+    }
+  }
+
+  const installRoots = [
+    "C:\\Program Files\\SketchUp",
+    "C:\\Program Files (x86)\\SketchUp",
+  ];
+  const candidates = [];
+
+  for (const root of installRoots) {
+    try {
+      const entries = await readdir(root, { withFileTypes: true });
+
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          candidates.push(path.join(root, entry.name, "SketchUp.exe"));
+        }
+      }
+    } catch {
+      // ignore missing install roots
+    }
+  }
+
+  candidates.sort().reverse();
+
+  for (const candidate of candidates) {
+    try {
+      await stat(candidate);
+      return candidate;
+    } catch {
+      // try the next installed version
+    }
+  }
+
+  return null;
+}
+
+function launchSketchUpExportProcess(executablePath, rubyScriptPath, workingDirectory) {
+  return spawn(executablePath, ["-RubyStartup", rubyScriptPath], {
+    cwd: workingDirectory,
+    windowsHide: true,
+    stdio: "ignore",
+  });
+}
+
+function launchStandaloneSkpExporterProcess(
+  executablePath,
+  payloadPath,
+  outputPath,
+  workingDirectory
+) {
+  return spawn(
+    executablePath,
+    ["--input", payloadPath, "--output", outputPath],
+    {
+      cwd: workingDirectory,
+      windowsHide: true,
+      stdio: "ignore",
+    }
+  );
+}
+
+function formatProcessExitCode(exitCode) {
+  if (!Number.isInteger(exitCode)) {
+    return "unknown";
+  }
+
+  if (exitCode < 0) {
+    return `${exitCode}`;
+  }
+
+  return `${exitCode} (0x${exitCode.toString(16).toUpperCase()})`;
+}
+
+function createSketchUpRubyExportScript(payloadPath, outputPath, statusPath) {
+  const rubyPath = (value) => JSON.stringify(String(value).replace(/\\/g, "/"));
+
+  return `
+require 'json'
+
+METERS_TO_INCHES = ${SKETCHUP_METERS_TO_INCHES}
+payload_path = ${rubyPath(payloadPath)}
+output_path = ${rubyPath(outputPath)}
+status_path = ${rubyPath(statusPath)}
+
+def ensure_layer(model, layer_name)
+  return nil if layer_name.to_s.empty?
+  model.layers[layer_name] || model.layers.add(layer_name)
+end
+
+def point_from_triplet(triplet)
+  Geom::Point3d.new(
+    triplet[0].to_f * METERS_TO_INCHES,
+    triplet[1].to_f * METERS_TO_INCHES,
+    triplet[2].to_f * METERS_TO_INCHES
+  )
+end
+
+def add_faces_to_group(group, faces)
+  ents = group.entities
+  faces.each do |face_points|
+    points = (face_points || []).map { |point| point_from_triplet(point) }
+    next if points.length < 3
+    ents.add_face(points)
+  end
+end
+
+def add_polylines_to_group(group, polylines)
+  ents = group.entities
+  polylines.each do |polyline|
+    points = (polyline['points'] || []).map { |point| point_from_triplet(point) }
+    next if points.length < 2
+    points << points.first if polyline['closed'] && points.first != points.last
+    ents.add_edges(points)
+  end
+end
+
+def add_solids_to_group(group, solids)
+  ents = group.entities
+
+  solids.each do |solid|
+    solid_group = ents.add_group
+    solid_ents = solid_group.entities
+    outer_points = (solid['outerLoop'] || []).map { |point| point_from_triplet(point) }
+    next if outer_points.length < 3
+
+    face = solid_ents.add_face(outer_points)
+    next unless face && face.valid?
+
+    (solid['holeLoops'] || []).each do |hole_loop|
+      hole_points = hole_loop.map { |point| point_from_triplet(point) }
+      next if hole_points.length < 3
+      hole_loop_points = hole_points.dup
+      hole_loop_points << hole_loop_points.first if hole_loop_points.first != hole_loop_points.last
+      solid_ents.add_edges(hole_loop_points)
+      hole_face = solid_ents.add_face(hole_points)
+      hole_face.erase! if hole_face && hole_face.valid?
+    end
+
+    height_inches = solid['heightMeters'].to_f * METERS_TO_INCHES
+    next if height_inches.abs <= 1e-6
+
+    face.reverse! if face.valid? && face.normal.z < 0
+    face.pushpull(height_inches, true) if face.valid?
+  end
+end
+
+model = Sketchup.active_model
+begin
+  units = model.options["UnitsOptions"]
+  units["LengthFormat"] = 0 if units.has_key?("LengthFormat")
+  units["LengthUnit"] = 4 if units.has_key?("LengthUnit")
+  units["LengthPrecision"] = 3 if units.has_key?("LengthPrecision")
+rescue
+end
+
+begin
+  payload = JSON.parse(File.read(payload_path))
+  model.start_operation('Site Context SKP Export', true)
+  model.entities.clear!
+  root_group = model.entities.add_group
+  root_group.name = 'Site Context Export'
+  root_entities = root_group.entities
+  container_groups = {}
+
+  (payload['groups'] || []).each do |group_data|
+    parent_entities = root_entities
+    container_name = group_data['container'].to_s
+
+    unless container_name.empty?
+      unless container_groups.has_key?(container_name)
+        container_group = root_entities.add_group
+        container_group.name = container_name
+        container_layer_name = group_data['containerLayer'].to_s
+        container_layer = ensure_layer(model, container_layer_name.empty? ? group_data['layer'] : container_layer_name)
+        container_group.layer = container_layer if container_layer
+        container_groups[container_name] = container_group
+      end
+
+      parent_entities = container_groups[container_name].entities
+    end
+
+    group = parent_entities.add_group
+    group.name = group_data['name'].to_s unless group_data['name'].to_s.empty?
+    layer = ensure_layer(model, group_data['layer'])
+    group.layer = layer if layer
+    add_solids_to_group(group, group_data['solids'] || [])
+    add_faces_to_group(group, group_data['faces'] || [])
+    add_polylines_to_group(group, group_data['polylines'] || [])
+  end
+
+  model.commit_operation
+  saved = model.save(output_path)
+  File.write(status_path, saved ? "ok" : "save_failed")
+rescue => error
+  begin
+    model.abort_operation
+  rescue
+  end
+
+  File.write(
+    status_path,
+    "error: #{error.class}: #{error.message}\\n#{Array(error.backtrace).join("\\n")}"
+  )
+ensure
+  UI.start_timer(0.25, false) { Sketchup.quit }
+end
+`;
+}
+
+async function waitForSketchUpExportResult(statusPath, outputPath, childProcess) {
+  const startedAt = Date.now();
+  let observedExitCode = null;
+  let exitObservedAt = 0;
+
+  while (Date.now() - startedAt < SKETCHUP_EXPORT_TIMEOUT_MS) {
+    try {
+      const status = String(await readFile(statusPath, "utf8")).trim();
+
+      if (status === "ok") {
+        return readFile(outputPath);
+      }
+
+      if (status) {
+        throw new Error(status);
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+
+    try {
+      const existingOutput = await readFile(outputPath);
+
+      if (existingOutput?.byteLength) {
+        return existingOutput;
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+
+    if (childProcess.exitCode !== null && childProcess.exitCode !== 0) {
+      if (observedExitCode === null) {
+        observedExitCode = childProcess.exitCode;
+        exitObservedAt = Date.now();
+      }
+
+      if (Date.now() - exitObservedAt >= 30_000) {
+        throw new Error(
+          `SketchUp export process exited with code ${formatProcessExitCode(
+            observedExitCode
+          )}.`
+        );
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  if (childProcess.exitCode === null) {
+    childProcess.kill();
+  }
+
+  if (observedExitCode !== null) {
+    throw new Error(
+      `SketchUp export process exited with code ${formatProcessExitCode(
+        observedExitCode
+      )}.`
+    );
+  }
+
+  throw new Error("SketchUp export timed out before the SKP file was created.");
+}
+
+async function waitForStandaloneSkpExportResult(outputPath, childProcess) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < SKETCHUP_EXPORT_TIMEOUT_MS) {
+    try {
+      if (childProcess.exitCode === 0) {
+        return readFile(outputPath);
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+
+    if (childProcess.exitCode !== null && childProcess.exitCode !== 0) {
+      throw new Error(
+        `Standalone SKP exporter exited with code ${formatProcessExitCode(
+          childProcess.exitCode
+        )}.`
+      );
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  if (childProcess.exitCode === null) {
+    childProcess.kill();
+  }
+
+  throw new Error(
+    "Standalone SKP exporter timed out before the SKP file was created."
+  );
+}
+
+async function buildSkpFromSiteContext(
+  siteContext,
+  reportProgress = null,
+  exportConfig = null
+) {
+  const progress =
+    typeof reportProgress === "function" ? reportProgress : () => null;
+  const runtimeConfig = resolveSkpExportRuntimeConfig(exportConfig);
+
+  progress(12, "SKP 변환용 SketchUp payload를 준비하는 중입니다.");
+  const payload = buildSketchUpPayloadFromSiteContext(siteContext);
+  const tempDirectory = await mkdtemp(path.join(tmpdir(), "site-context-skp-"));
+  const payloadPath = path.join(tempDirectory, "site-context.json");
+  const rubyScriptPath = path.join(tempDirectory, "export-to-skp.rb");
+  const outputPath = path.join(tempDirectory, "site-context.skp");
+  const statusPath = path.join(tempDirectory, "status.txt");
+
+  try {
+    await writeFile(payloadPath, JSON.stringify(payload), "utf8");
+
+    let childProcess = null;
+    let skpBuffer = null;
+    const standaloneExporterPath = await findStandaloneSkpExporterPath(
+      runtimeConfig
+    );
+    const sketchUpExecutable = await findSketchUpExecutablePath(runtimeConfig);
+    const resolvedEngine =
+      runtimeConfig.engine === "auto"
+        ? standaloneExporterPath
+          ? "standalone-cli"
+          : sketchUpExecutable
+            ? "sketchup-desktop"
+            : "standalone-cli"
+        : runtimeConfig.engine;
+
+    if (resolvedEngine === "sketchup-desktop") {
+      if (!sketchUpExecutable) {
+        throw new Error(
+          "SketchUp desktop export could not start because SketchUp.exe was not found. Set SKETCHUP_EXE or configure SKP_EXPORTER_CLI."
+        );
+      }
+
+      await writeFile(
+        rubyScriptPath,
+        createSketchUpRubyExportScript(payloadPath, outputPath, statusPath),
+        "utf8"
+      );
+
+      progress(34, "Legacy SketchUp 변환기를 실행하는 중입니다.");
+      childProcess = launchSketchUpExportProcess(
+        sketchUpExecutable,
+        rubyScriptPath,
+        tempDirectory
+      );
+      skpBuffer = await Promise.race([
+        waitForSketchUpExportResult(statusPath, outputPath, childProcess),
+        new Promise((_, reject) => {
+          childProcess.once("error", reject);
+        }),
+      ]);
+    } else {
+      if (!standaloneExporterPath) {
+        throw new Error(
+          "SKP export is not configured. Install SketchUp Desktop or set SKP_EXPORTER_CLI to a standalone SKP exporter built on the SketchUp C SDK."
+        );
+      }
+
+      progress(34, "Standalone SKP 변환기를 실행하는 중입니다.");
+      childProcess = launchStandaloneSkpExporterProcess(
+        standaloneExporterPath,
+        payloadPath,
+        outputPath,
+        tempDirectory
+      );
+      skpBuffer = await Promise.race([
+        waitForStandaloneSkpExportResult(outputPath, childProcess),
+        new Promise((_, reject) => {
+          childProcess.once("error", reject);
+        }),
+      ]);
+    }
+
+    progress(92, "SKP 파일을 수집하는 중입니다.");
+    return Buffer.from(skpBuffer);
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true }).catch(() => null);
+  }
+}
+
+async function buildSkpFromSiteContextWithRetry(
+  siteContext,
+  reportProgress = null,
+  exportConfig = null
+) {
+  const progress =
+    typeof reportProgress === "function" ? reportProgress : () => null;
+  const runtimeConfig = resolveSkpExportRuntimeConfig(exportConfig);
+  const standaloneExporterPath = await findStandaloneSkpExporterPath(runtimeConfig);
+  const sketchUpExecutable = await findSketchUpExecutablePath(runtimeConfig);
+  const resolvedEngine =
+    runtimeConfig.engine === "auto"
+      ? standaloneExporterPath
+        ? "standalone-cli"
+        : sketchUpExecutable
+          ? "sketchup-desktop"
+          : "standalone-cli"
+      : runtimeConfig.engine;
+  const baseOptions = {
+    ...(siteContext?.options || {}),
+  };
+  let currentSiteContext = siteContext;
+  let currentInterval = normalizeContourInterval(
+    currentSiteContext?.stats?.effectiveContourBandInterval ||
+      currentSiteContext?.options?.contourInterval
+  );
+  let attemptIndex = 0;
+  let lastError = null;
+
+  if (resolvedEngine === "sketchup-desktop") {
+    const sourceInterval = normalizeContourInterval(
+      resolveSourceContourInterval(siteContext)
+    );
+    const safeDesktopInterval = Math.max(currentInterval, sourceInterval);
+
+    if (safeDesktopInterval > currentInterval + 1e-9) {
+      currentSiteContext = prepareSiteContextForExport(
+        siteContext,
+        {
+          ...baseOptions,
+          contourInterval: safeDesktopInterval,
+        },
+        "skp"
+      );
+      currentInterval = normalizeContourInterval(
+        currentSiteContext?.stats?.effectiveContourBandInterval ||
+          safeDesktopInterval
+      );
+      console.warn(
+        `[skp-export] desktop-safe-start requested=${normalizeContourInterval(
+          baseOptions.contourInterval
+        )} source=${sourceInterval} effective=${currentInterval}`
+      );
+    }
+  }
+
+  while (attemptIndex < 4) {
+    attemptIndex += 1;
+
+    try {
+      if (attemptIndex > 1) {
+        progress(
+          Math.min(88, 48 + attemptIndex * 8),
+          `SKP 생성을 다시 시도하고 있습니다. (${attemptIndex}/4)`
+        );
+      }
+
+      return await buildSkpFromSiteContext(
+        currentSiteContext,
+        progress,
+        exportConfig
+      );
+    } catch (error) {
+      lastError = error;
+      const nextInterval = nextContourIntervalStep(currentInterval);
+
+      console.warn(
+        `[skp-export] retry attempt=${attemptIndex} interval=${currentInterval} error=${error?.message || error}`
+      );
+
+      if (!(nextInterval > currentInterval + 1e-9) || nextInterval > 20) {
+        throw error;
+      }
+
+      currentSiteContext = prepareSiteContextForExport(
+        siteContext,
+        {
+          ...baseOptions,
+          contourInterval: nextInterval,
+        },
+        "skp"
+      );
+      currentInterval = normalizeContourInterval(
+        currentSiteContext?.stats?.effectiveContourBandInterval || nextInterval
+      );
+    }
+  }
+
+  throw lastError || new Error("SKP export failed after repeated attempts.");
+}
+
+function appendDxfPair(lines, code, value) {
+  lines.push(String(code), String(value));
+}
+
+function getGeometryPolygonRings(geometry) {
+  if (!geometry) {
+    return [];
+  }
+
+  if (geometry.type === "Polygon") {
+    return (geometry.coordinates || []).filter(
+      (ring) => Array.isArray(ring) && ring.length
+    );
+  }
+
+  if (geometry.type === "MultiPolygon") {
+    return (geometry.coordinates || []).flatMap((polygon) =>
+      (polygon || []).filter((ring) => Array.isArray(ring) && ring.length)
+    );
+  }
+
+  return [];
+}
+
+function getFeaturePolygonRings(feature) {
+  return getGeometryPolygonRings(feature?.geometry);
+}
+
+function appendDxfHeaderSection(lines) {
+  appendDxfPair(lines, 0, "SECTION");
+  appendDxfPair(lines, 2, "HEADER");
+  appendDxfPair(lines, 9, "$ACADVER");
+  appendDxfPair(lines, 1, "AC1015");
+  appendDxfPair(lines, 9, "$INSUNITS");
+  appendDxfPair(lines, 70, 6);
+  appendDxfPair(lines, 0, "ENDSEC");
+}
+
+function appendDxfLinetypeTable(lines) {
+  appendDxfPair(lines, 0, "TABLE");
+  appendDxfPair(lines, 2, "LTYPE");
+  appendDxfPair(lines, 70, 1);
+  appendDxfPair(lines, 0, "LTYPE");
+  appendDxfPair(lines, 2, "CONTINUOUS");
+  appendDxfPair(lines, 70, 0);
+  appendDxfPair(lines, 3, "Solid line");
+  appendDxfPair(lines, 72, 65);
+  appendDxfPair(lines, 73, 0);
+  appendDxfPair(lines, 40, 0);
+  appendDxfPair(lines, 0, "ENDTAB");
+}
+
+function appendDxfLayerTable(lines, layers) {
+  const normalizedLayers = [
+    { name: "0", color: 7 },
+    ...(layers || []).filter(
+      (layer) => layer?.name && String(layer.name).trim() !== "0"
+    ),
+  ];
+
+  appendDxfPair(lines, 0, "TABLE");
+  appendDxfPair(lines, 2, "LAYER");
+  appendDxfPair(lines, 70, normalizedLayers.length);
+
+  for (const layer of normalizedLayers) {
+    appendDxfPair(lines, 0, "LAYER");
+    appendDxfPair(lines, 2, layer.name);
+    appendDxfPair(lines, 70, 0);
+    appendDxfPair(lines, 62, layer.color);
+    appendDxfPair(lines, 6, "CONTINUOUS");
+  }
+
+  appendDxfPair(lines, 0, "ENDTAB");
+}
+
+function appendDxfTablesSection(lines, layers) {
+  appendDxfPair(lines, 0, "SECTION");
+  appendDxfPair(lines, 2, "TABLES");
+  appendDxfLinetypeTable(lines);
+  appendDxfLayerTable(lines, layers);
+  appendDxfPair(lines, 0, "ENDSEC");
+}
+
+function normalizeDxfPolylinePoints(
+  points,
+  { closed = false, toleranceMeters = 0.001 } = {}
+) {
+  const normalized = [];
+
+  for (const point of points || []) {
+    if (
+      !Array.isArray(point) ||
+      point.length < 2 ||
+      !Number.isFinite(point[0]) ||
+      !Number.isFinite(point[1])
+    ) {
+      continue;
+    }
+
+    if (
+      !normalized.length ||
+      !pointsMatchInMeters(
+        normalized[normalized.length - 1],
+        point,
+        toleranceMeters
+      )
+    ) {
+      normalized.push([Number(point[0]), Number(point[1])]);
+    }
+  }
+
+  if (
+    closed &&
+    normalized.length >= 2 &&
+    pointsMatchInMeters(
+      normalized[0],
+      normalized[normalized.length - 1],
+      toleranceMeters
+    )
+  ) {
+    normalized.pop();
+  }
+
+  return normalized;
+}
+
+function appendDxfPolylineEntity(
+  lines,
+  layerName,
+  points,
+  { closed = false, elevation = 0 } = {}
+) {
+  const normalizedPoints = normalizeDxfPolylinePoints(points, { closed });
+  const minimumPointCount = closed ? 3 : 2;
+
+  if (normalizedPoints.length < minimumPointCount) {
+    return;
+  }
+
+  const zElevation = Number.isFinite(Number(elevation))
+    ? Number(elevation)
+    : 0;
+
+  appendDxfPair(lines, 0, "LWPOLYLINE");
+  appendDxfPair(lines, 100, "AcDbEntity");
+  appendDxfPair(lines, 8, layerName);
+  appendDxfPair(lines, 100, "AcDbPolyline");
+  appendDxfPair(lines, 90, normalizedPoints.length);
+  appendDxfPair(lines, 70, closed ? 1 : 0);
+
+  if (Math.abs(zElevation) > 0.0005) {
+    appendDxfPair(lines, 38, zElevation.toFixed(3));
+  }
+
+  for (const [xMeters, yMeters] of normalizedPoints) {
+    appendDxfPair(lines, 10, Number(xMeters).toFixed(3));
+    appendDxfPair(lines, 20, Number(yMeters).toFixed(3));
+  }
+}
+
+function appendDxfFeaturePolygonEntities(
+  lines,
+  layerName,
+  feature,
+  center,
+  options = {}
+) {
+  for (const ring of getFeaturePolygonRings(feature)) {
+    appendDxfPolylineEntity(
+      lines,
+      layerName,
+      getOpenRing(ring).map((point) => localMetersFromLngLat(point, center)),
+      {
+        ...options,
+        closed: true,
+      }
+    );
+  }
+}
+
+function buildDxfFromSiteContext(siteContext, reportProgress = null) {
+  const location = siteContext.location;
+  const center = { lat: location.lat, lng: location.lng };
+  const progress =
+    typeof reportProgress === "function" ? reportProgress : () => null;
+  const lines = [];
+  const layers = [
+    { name: "CLIP_BOUNDARY", color: 1 },
+    { name: "PARCEL_BOUNDARY", color: 30 },
+    { name: "PARCEL_CONTEXT", color: 94 },
+    { name: "CONTOURS", color: 8 },
+    { name: "BUILDINGS", color: 252 },
+    { name: "TARGET_BUILDING", color: 10 },
+    { name: "ROADS", color: 5 },
+  ];
+
+  progress(6, "DXF 湲곕낯 援ъ“瑜?留뚮뱶??以묒엯?덈떎.");
+  appendDxfHeaderSection(lines);
+  appendDxfTablesSection(lines, layers);
+  appendDxfPair(lines, 0, "SECTION");
+  appendDxfPair(lines, 2, "ENTITIES");
+
+  progress(18, "DXF 寃쎄퀎 ?붿냼瑜??뺣━?섎뒗 以묒엯?덈떎.");
+  appendDxfFeaturePolygonEntities(
+    lines,
+    "CLIP_BOUNDARY",
+    siteContext.clipBoundary,
+    center
+  );
+
+  if (siteContext.options?.includeParcelBoundary !== false) {
+    appendDxfFeaturePolygonEntities(
+      lines,
+      "PARCEL_BOUNDARY",
+      siteContext.parcelBoundary,
+      center
+    );
+
+    for (const feature of siteContext.parcelContext?.features || []) {
+      appendDxfFeaturePolygonEntities(lines, "PARCEL_CONTEXT", feature, center);
+    }
+  }
+
+  if (siteContext.options?.includeContours !== false) {
+    progress(42, "DXF ?깃퀬??寃쎅퀎瑜??붽??섎뒗 以묒엯?덈떎.");
+
+    for (const feature of siteContext.contourLines?.features || []) {
+      const elevation = Number(feature.properties?.elevation || 0);
+
+      for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
+        appendDxfPolylineEntity(
+          lines,
+          "CONTOURS",
+          lineString.map((point) => localMetersFromLngLat(point, center)),
+          {
+            closed: false,
+            elevation,
+          }
+        );
+      }
+    }
+  }
+
+  if (siteContext.options?.includeBuildings !== false) {
+    progress(62, "DXF 嫄대Ъ footprint瑜??붽??섎뒗 以묒엯?덈떎.");
+
+    for (const feature of siteContext.buildings?.features || []) {
+      appendDxfFeaturePolygonEntities(
+        lines,
+        feature.properties?.isTarget ? "TARGET_BUILDING" : "BUILDINGS",
+        feature,
+        center
+      );
+    }
+  }
+
+  if (siteContext.options?.includeRoads === true) {
+    progress(78, "DXF ?꾨줈 footprint瑜??붽??섎뒗 以묒엯?덈떎.");
+
+    if (siteContext.options?.terrainMode === "contour") {
+      const roadSurfaceGroups = buildRoadContourSurfaceGroups(siteContext, center);
+
+      for (const group of roadSurfaceGroups) {
+        const topElevation = Number(
+          (
+            group.elevation +
+            ROAD_SURFACE_OFFSET_METERS +
+            ROAD_SURFACE_THICKNESS_METERS
+          ).toFixed(3)
+        );
+
+        for (const region of group.regions) {
+          appendDxfPolylineEntity(lines, "ROADS", region.outerPoints, {
+            closed: true,
+            elevation: topElevation,
+          });
+
+          for (const holePoints of region.holePoints || []) {
+            appendDxfPolylineEntity(lines, "ROADS", holePoints, {
+              closed: true,
+              elevation: topElevation,
+            });
+          }
+        }
+      }
+    } else {
+      const roadFootprintMultiPolygon = getCachedRoadFootprintMultiPolygon(
+        siteContext,
+        center
+      );
+
+      for (const polygon of roadFootprintMultiPolygon) {
+        for (const ring of polygon || []) {
+          appendDxfPolylineEntity(lines, "ROADS", ring, {
+            closed: true,
+          });
+        }
+      }
+    }
+  }
+
+  progress(94, "DXF ?뚯씪??留덈Т由ы븯??以묒엯?덈떎.");
+  appendDxfPair(lines, 0, "ENDSEC");
+  appendDxfPair(lines, 0, "EOF");
+  return `${lines.join("\r\n")}\r\n`;
+}
+
+function createRhinoObjectAttributes(
+  rhino,
+  layerIndex,
+  name = "",
+  color = null,
+  groupIndices = []
+) {
   const attributes = new rhino.ObjectAttributes();
   attributes.layerIndex = layerIndex;
   attributes.name = String(name || "");
@@ -6403,6 +12320,16 @@ function createRhinoObjectAttributes(rhino, layerIndex, name = "", color = null)
   if (color) {
     attributes.colorSource = rhino.ObjectColorSource.ColorFromObject;
     attributes.objectColor = color;
+  }
+
+  for (const groupIndex of Array.isArray(groupIndices)
+    ? groupIndices
+    : Number.isInteger(groupIndices)
+      ? [groupIndices]
+      : []) {
+    if (Number.isInteger(groupIndex) && groupIndex >= 0) {
+      attributes.addToGroup(groupIndex);
+    }
   }
 
   return attributes;
@@ -6416,8 +12343,82 @@ function ensureRhinoLayer(doc, layerIndexCache, name, color) {
   return layerIndexCache.get(name);
 }
 
+function ensureRhinoGroup(doc, rhino, groupIndexCache, name) {
+  if (!name) {
+    return null;
+  }
+
+  if (!groupIndexCache.has(name)) {
+    let group = doc.groups().findName(name);
+
+    if (!group) {
+      group = new rhino.Group();
+      group.name = name;
+      doc.groups().add(group);
+      group = doc.groups().findName(name);
+    }
+
+    groupIndexCache.set(
+      name,
+      Number.isInteger(group?.index) ? group.index : null
+    );
+  }
+
+  return groupIndexCache.get(name);
+}
+
 function createRhinoPolylineCurve(rhino, points) {
   return new rhino.PolylineCurve(points);
+}
+
+function dedupePolylinePoints(points, toleranceMeters = 0.001) {
+  const deduped = [];
+
+  for (const point of points || []) {
+    if (
+      !Array.isArray(point) ||
+      point.length < 3 ||
+      !Number.isFinite(point[0]) ||
+      !Number.isFinite(point[1]) ||
+      !Number.isFinite(point[2])
+    ) {
+      continue;
+    }
+
+    const previousPoint = deduped[deduped.length - 1];
+
+    if (
+      !previousPoint ||
+      Math.abs(previousPoint[0] - point[0]) > toleranceMeters ||
+      Math.abs(previousPoint[1] - point[1]) > toleranceMeters ||
+      Math.abs(previousPoint[2] - point[2]) > toleranceMeters
+    ) {
+      deduped.push([point[0], point[1], point[2]]);
+    }
+  }
+
+  return deduped;
+}
+
+function createRhinoContourDisplayCurve(rhino, points) {
+  if (!Array.isArray(points) || points.length < 2) {
+    return null;
+  }
+
+  const normalizedPoints = dedupePolylinePoints(points).filter(
+    (point) =>
+      Array.isArray(point) &&
+      point.length >= 3 &&
+      Number.isFinite(point[0]) &&
+      Number.isFinite(point[1]) &&
+      Number.isFinite(point[2])
+  );
+
+  if (normalizedPoints.length < 2) {
+    return null;
+  }
+
+  return createRhinoPolylineCurve(rhino, normalizedPoints);
 }
 
 function createRhinoLocalProfileCurve(rhino, polygonPoints) {
@@ -6487,7 +12488,8 @@ function addRhinoPrismFromPolygon(
   polygonPoints,
   topElevation,
   baseElevation,
-  objectName
+  objectName,
+  groupIndices = []
 ) {
   const openPolygon = dedupeLocalPolygonPoints(polygonPoints);
 
@@ -6507,7 +12509,7 @@ function addRhinoPrismFromPolygon(
 
   doc.objects().add(
     extrusion,
-    createRhinoObjectAttributes(rhino, layerIndex, objectName)
+    createRhinoObjectAttributes(rhino, layerIndex, objectName, null, groupIndices)
   );
 }
 
@@ -6518,7 +12520,8 @@ function addRhinoContourBandRegionExtrusion(
   region,
   topElevation,
   bottomElevation,
-  objectName
+  objectName,
+  groupIndices = []
 ) {
   if (topElevation <= bottomElevation) {
     return false;
@@ -6558,7 +12561,7 @@ function addRhinoContourBandRegionExtrusion(
 
   doc.objects().add(
     extrusion,
-    createRhinoObjectAttributes(rhino, layerIndex, objectName)
+    createRhinoObjectAttributes(rhino, layerIndex, objectName, null, groupIndices)
   );
   return true;
 }
@@ -6662,35 +12665,184 @@ function addRhinoMeshVerticalLoopFaces(
   }
 }
 
-function addRhinoContourBandTerrain(doc, rhino, layerIndex, siteContext) {
-  const terrainGrid = siteContext.terrainGrid;
-
-  if (!terrainGrid?.elevations?.length) {
+function addRhinoContourTerrainRegions(
+  doc,
+  rhino,
+  layerIndex,
+  regions,
+  topElevation,
+  bottomElevation,
+  objectNamePrefix,
+  mesh,
+  vertexCache,
+  groupIndices = []
+) {
+  if (topElevation <= bottomElevation) {
     return;
   }
 
-  const interval = normalizeContourInterval(siteContext.options?.contourInterval);
-  const baseElevation = getTerrainBaseElevation(
-    siteContext,
-    terrainGrid.minElevation
-  );
-  const clipPolygon = getOpenRing(getOuterRing(siteContext.clipBoundary)).map((point) =>
-    localMetersFromLngLat(point, siteContext.location)
-  );
-  const minBandElevation =
-    Math.floor(Number(terrainGrid.minElevation || 0) / interval) * interval;
-  const bandGroups = getCachedContourBandGroups(siteContext);
+  for (let regionIndex = 0; regionIndex < regions.length; regionIndex += 1) {
+    const region = regions[regionIndex];
+
+    if (
+      addRhinoContourBandRegionExtrusion(
+        doc,
+        rhino,
+        layerIndex,
+        region,
+        topElevation,
+        bottomElevation,
+        `${objectNamePrefix}_${regionIndex + 1}`,
+        groupIndices
+      )
+    ) {
+      continue;
+    }
+
+    addRhinoMeshRegionCapFaces(mesh, vertexCache, region, topElevation, false);
+    addRhinoMeshRegionCapFaces(mesh, vertexCache, region, bottomElevation, true);
+
+    addRhinoMeshVerticalLoopFaces(
+      mesh,
+      vertexCache,
+      region.outerPoints,
+      topElevation,
+      bottomElevation
+    );
+
+    for (const holePoints of region.holePoints || []) {
+      addRhinoMeshVerticalLoopFaces(
+        mesh,
+        vertexCache,
+        holePoints,
+        topElevation,
+        bottomElevation
+      );
+    }
+  }
+}
+
+function addRhinoContourBandTerrain(
+  doc,
+  rhino,
+  layerIndex,
+  siteContext,
+  parcelGroupIndex = null
+) {
+  const terrainPlan = resolveContourTerrainRenderPlan(siteContext);
+
+  if (!terrainPlan) {
+    return;
+  }
+
+  const {
+    baseElevation,
+    clipPolygon,
+    minBandElevation,
+    bandGroups,
+    flatTopElevation,
+    useFlatFallback,
+  } = terrainPlan;
+
+  if (useFlatFallback) {
+    const mesh = new rhino.Mesh();
+    const vertexCache = new Map();
+    const flatSegments = splitTerrainMultiPolygonByParcelBoundary(
+      siteContext,
+      buildLocalMultiPolygonFromOpenRing(clipPolygon)
+    );
+
+    for (const segment of flatSegments) {
+      const segmentGroupIndices =
+        segment.kind === "parcel" && Number.isInteger(parcelGroupIndex)
+          ? [parcelGroupIndex]
+          : [];
+
+      if (segment.kind === "combined" && segment.regions.length === 1) {
+        addRhinoPrismFromPolygon(
+          doc,
+          rhino,
+          layerIndex,
+          segment.regions[0].outerPoints,
+          flatTopElevation,
+          baseElevation,
+          "TERRAIN_CONTOUR_FLAT",
+          segmentGroupIndices
+        );
+        continue;
+      }
+
+      addRhinoContourTerrainRegions(
+        doc,
+        rhino,
+        layerIndex,
+        segment.regions,
+        flatTopElevation,
+        baseElevation,
+        `TERRAIN_CONTOUR_FLAT_${String(segment.kind || "part").toUpperCase()}`,
+        mesh,
+        vertexCache,
+        segmentGroupIndices
+      );
+    }
+
+    if (mesh.vertices().count && mesh.faces().count) {
+      doc.objects().add(
+        mesh,
+        createRhinoObjectAttributes(rhino, layerIndex, "TERRAIN_CONTOUR_FLAT_MESH")
+      );
+    }
+    return;
+  }
 
   if (clipPolygon.length >= 3 && minBandElevation > baseElevation + 0.001) {
-    addRhinoPrismFromPolygon(
-      doc,
-      rhino,
-      layerIndex,
-      clipPolygon,
-      minBandElevation,
-      baseElevation,
-      "TERRAIN_BASE"
+    const mesh = new rhino.Mesh();
+    const vertexCache = new Map();
+    const baseSegments = splitTerrainMultiPolygonByParcelBoundary(
+      siteContext,
+      buildLocalMultiPolygonFromOpenRing(clipPolygon)
     );
+
+    for (const segment of baseSegments) {
+      const segmentGroupIndices =
+        segment.kind === "parcel" && Number.isInteger(parcelGroupIndex)
+          ? [parcelGroupIndex]
+          : [];
+
+      if (segment.kind === "combined" && segment.regions.length === 1) {
+        addRhinoPrismFromPolygon(
+          doc,
+          rhino,
+          layerIndex,
+          segment.regions[0].outerPoints,
+          minBandElevation,
+          baseElevation,
+          "TERRAIN_BASE",
+          segmentGroupIndices
+        );
+        continue;
+      }
+
+      addRhinoContourTerrainRegions(
+        doc,
+        rhino,
+        layerIndex,
+        segment.regions,
+        minBandElevation,
+        baseElevation,
+        `TERRAIN_BASE_${String(segment.kind || "part").toUpperCase()}`,
+        mesh,
+        vertexCache,
+        segmentGroupIndices
+      );
+    }
+
+    if (mesh.vertices().count && mesh.faces().count) {
+      doc.objects().add(
+        mesh,
+        createRhinoObjectAttributes(rhino, layerIndex, "TERRAIN_BASE_MESH")
+      );
+    }
   }
 
   const mesh = new rhino.Mesh();
@@ -6698,56 +12850,34 @@ function addRhinoContourBandTerrain(doc, rhino, layerIndex, siteContext) {
 
   for (let groupIndex = 0; groupIndex < bandGroups.length; groupIndex += 1) {
     const group = bandGroups[groupIndex];
+    const effectiveBottomElevation = Number(
+      Math.max(baseElevation, group.bottomElevation - TERRAIN_BAND_OVERLAP_METERS).toFixed(3)
+    );
 
-    for (let regionIndex = 0; regionIndex < group.regions.length; regionIndex += 1) {
-      const region = group.regions[regionIndex];
+    const groupSegments = splitTerrainMultiPolygonByParcelBoundary(
+      siteContext,
+      group.multiPolygon ||
+        buildPolygonClippingMultiPolygonFromRegions(group.regions)
+    );
 
-      if (
-        addRhinoContourBandRegionExtrusion(
-          doc,
-          rhino,
-          layerIndex,
-          region,
-          group.topElevation,
-          group.bottomElevation,
-          `TERRAIN_BAND_${groupIndex + 1}_${regionIndex + 1}`
-        )
-      ) {
-        continue;
-      }
+    for (const segment of groupSegments) {
+      const segmentGroupIndices =
+        segment.kind === "parcel" && Number.isInteger(parcelGroupIndex)
+          ? [parcelGroupIndex]
+          : [];
 
-      addRhinoMeshRegionCapFaces(
-        mesh,
-        vertexCache,
-        region,
+      addRhinoContourTerrainRegions(
+        doc,
+        rhino,
+        layerIndex,
+        segment.regions,
         group.topElevation,
-        false
-      );
-      addRhinoMeshRegionCapFaces(
+        effectiveBottomElevation,
+        `TERRAIN_BAND_${groupIndex + 1}_${String(segment.kind || "part").toUpperCase()}`,
         mesh,
         vertexCache,
-        region,
-        group.bottomElevation,
-        true
+        segmentGroupIndices
       );
-
-      addRhinoMeshVerticalLoopFaces(
-        mesh,
-        vertexCache,
-        region.outerPoints,
-        group.topElevation,
-        group.bottomElevation
-      );
-
-      for (const holePoints of region.holePoints || []) {
-        addRhinoMeshVerticalLoopFaces(
-          mesh,
-          vertexCache,
-          holePoints,
-          group.topElevation,
-          group.bottomElevation
-        );
-      }
     }
   }
 
@@ -6870,7 +13000,8 @@ function addRhinoBuildings(
   targetLayerIndex,
   siteContext,
   center,
-  seed
+  seed,
+  parcelGroupIndex = null
 ) {
   for (const feature of siteContext.buildings?.features || []) {
     const ring = getOpenRing(getOuterRing(feature));
@@ -6879,12 +13010,14 @@ function addRhinoBuildings(
       continue;
     }
 
-    const buildingBaseElevation = buildingBaseElevationForRing(
+    const placementInfo = resolveBuildingPlacementForRing(
       siteContext,
       ring,
       center,
       seed
     );
+    applyBuildingPlacementDebug(feature, placementInfo);
+    const buildingBaseElevation = placementInfo?.finalBaseElevation ?? null;
     const footprintRing = ring.map((point) => {
       const [xMeters, yMeters] = localMetersFromLngLat(point, center);
       const elevation = Number.isFinite(buildingBaseElevation)
@@ -6942,9 +13075,261 @@ function addRhinoBuildings(
         feature.properties?.isTarget
           ? { r: 180, g: 74, b: 58 }
           : { r: 88, g: 96, b: 107 }
+        ,
+        feature.properties?.isTarget && Number.isInteger(parcelGroupIndex)
+          ? [parcelGroupIndex]
+          : []
       )
     );
   }
+}
+
+function addRhinoRoadPrismMesh(mesh, polygonPoints, siteContext, seed) {
+  if (!polygonPoints?.length || polygonPoints.length < 3) {
+    return;
+  }
+
+  const baseIndices = [];
+  const topIndices = [];
+
+  for (const [xMeters, yMeters] of polygonPoints) {
+    const baseElevation =
+      siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) +
+      ROAD_SURFACE_OFFSET_METERS;
+    const topElevation = baseElevation + ROAD_SURFACE_THICKNESS_METERS;
+
+    baseIndices.push(mesh.vertices().add(xMeters, yMeters, baseElevation));
+    topIndices.push(mesh.vertices().add(xMeters, yMeters, topElevation));
+  }
+
+  for (let index = 0; index < polygonPoints.length; index += 1) {
+    const nextIndex = (index + 1) % polygonPoints.length;
+    mesh.faces().addQuadFace(
+      baseIndices[index],
+      baseIndices[nextIndex],
+      topIndices[nextIndex],
+      topIndices[index]
+    );
+  }
+
+  if (topIndices.length >= 4) {
+    mesh.faces().addQuadFace(
+      topIndices[0],
+      topIndices[1],
+      topIndices[2],
+      topIndices[3]
+    );
+    mesh.faces().addQuadFace(
+      baseIndices[3],
+      baseIndices[2],
+      baseIndices[1],
+      baseIndices[0]
+    );
+  }
+}
+
+function addRhinoRoads(doc, rhino, layerIndex, siteContext, center, seed) {
+  const mesh = new rhino.Mesh();
+  let polygonCount = 0;
+  let segmentCount = 0;
+
+  for (const feature of siteContext.roads?.features || []) {
+    if (
+      feature?.geometry?.type === "Polygon" ||
+      feature?.geometry?.type === "MultiPolygon"
+    ) {
+      for (const ring of getOuterRings(feature)) {
+        const openRing = getOpenRing(ring);
+
+        if (openRing.length < 3) {
+          continue;
+        }
+
+        addRhinoRoadPrismMesh(
+          mesh,
+          openRing.map((point) => localMetersFromLngLat(point, center)),
+          siteContext,
+          seed
+        );
+        polygonCount += 1;
+      }
+
+      continue;
+    }
+
+    const widthMeters = resolveRoadWidthMeters(feature);
+
+    for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
+      for (let index = 0; index < lineString.length - 1; index += 1) {
+        const startPoint = localMetersFromLngLat(lineString[index], center);
+        const endPoint = localMetersFromLngLat(lineString[index + 1], center);
+        const quads = buildRoadSegmentLocalQuads(
+          startPoint,
+          endPoint,
+          widthMeters,
+          siteContext
+        );
+
+        for (const quad of quads) {
+          addRhinoRoadPrismMesh(mesh, quad, siteContext, seed);
+          segmentCount += 1;
+        }
+      }
+    }
+  }
+
+  const vertexCount = Number(mesh.vertices().count || 0);
+  const faceCount = Number(mesh.faces().count || 0);
+
+  if (vertexCount && faceCount) {
+    if (typeof mesh.compact === "function") {
+      mesh.compact();
+    }
+
+    try {
+      if (typeof mesh.normals === "function") {
+        const normals = mesh.normals();
+
+        if (normals && typeof normals.computeNormals === "function") {
+          normals.computeNormals();
+        }
+      }
+    } catch {
+      // Rhino can still display the mesh without precomputed normals.
+    }
+
+    doc.objects().add(
+      mesh,
+      createRhinoObjectAttributes(rhino, layerIndex, "ROADS", {
+        r: 22,
+        g: 119,
+        b: 255,
+      })
+    );
+  }
+
+  return {
+    vertexCount,
+    faceCount,
+    polygonCount,
+    segmentCount,
+    objectCount: vertexCount && faceCount ? 1 : 0,
+  };
+}
+
+function addRhinoContourBandRoadSolids(
+  doc,
+  rhino,
+  layerIndex,
+  siteContext,
+  center,
+  parcelGroupIndex = null
+) {
+  const roadSurfaceGroups = buildRoadContourSurfaceGroups(siteContext, center);
+  let objectCount = 0;
+
+  for (let groupIndex = 0; groupIndex < roadSurfaceGroups.length; groupIndex += 1) {
+    const group = roadSurfaceGroups[groupIndex];
+    const bottomElevation = Number(
+      (group.elevation + ROAD_SURFACE_OFFSET_METERS).toFixed(3)
+    );
+    const topElevation = Number(
+      (bottomElevation + ROAD_SURFACE_THICKNESS_METERS).toFixed(3)
+    );
+    const groupSegments = splitTerrainMultiPolygonByParcelBoundary(
+      siteContext,
+      buildPolygonClippingMultiPolygonFromRegions(group.regions)
+    );
+
+    for (const segment of groupSegments) {
+      const segmentGroupIndices =
+        segment.kind === "parcel" && Number.isInteger(parcelGroupIndex)
+          ? [parcelGroupIndex]
+          : [];
+
+      for (
+        let regionIndex = 0;
+        regionIndex < segment.regions.length;
+        regionIndex += 1
+      ) {
+        if (
+          addRhinoContourBandRegionExtrusion(
+            doc,
+            rhino,
+            layerIndex,
+            segment.regions[regionIndex],
+            topElevation,
+            bottomElevation,
+            `ROAD_BAND_${groupIndex + 1}_${String(segment.kind || "part").toUpperCase()}_${regionIndex + 1}`,
+            segmentGroupIndices
+          )
+        ) {
+          objectCount += 1;
+        }
+      }
+    }
+  }
+
+  return {
+    groupCount: roadSurfaceGroups.length,
+    objectCount,
+  };
+}
+
+function addRhinoRoadCenterlines(doc, rhino, layerIndex, siteContext, center, seed) {
+  let objectCount = 0;
+  let lineCount = 0;
+
+  for (const feature of siteContext.roads?.features || []) {
+    const widthMeters = resolveRoadWidthMeters(feature);
+    const coordinateSets =
+      feature?.geometry?.type === "LineString" ||
+      feature?.geometry?.type === "MultiLineString"
+        ? getLineStringsFromGeometry(feature.geometry)
+        : getOuterRings(feature);
+
+    for (let lineIndex = 0; lineIndex < coordinateSets.length; lineIndex += 1) {
+      const coordinates = coordinateSets[lineIndex];
+      const path = buildRoadLocalPath(
+        coordinates,
+        center,
+        siteContext,
+        widthMeters
+      );
+
+      if (!path.length || path.length < 2) {
+        continue;
+      }
+
+      const points = path.map(([xMeters, yMeters]) => {
+        return [
+          xMeters,
+          yMeters,
+          siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) +
+            ROAD_SURFACE_OFFSET_METERS +
+            ROAD_SURFACE_THICKNESS_METERS +
+            0.02,
+        ];
+      });
+
+      doc.objects().add(
+        createRhinoPolylineCurve(rhino, points),
+        createRhinoObjectAttributes(
+          rhino,
+          layerIndex,
+          `ROAD_CENTERLINE_${objectCount + 1}`,
+          { r: 22, g: 119, b: 255 }
+        )
+      );
+      objectCount += 1;
+      lineCount += 1;
+    }
+  }
+
+  return {
+    objectCount,
+    lineCount,
+  };
 }
 
 function addRhinoPolylineCollection(
@@ -6953,8 +13338,16 @@ function addRhinoPolylineCollection(
   layerIndex,
   features,
   center,
-  elevationResolver
+  elevationResolver,
+  options = {}
 ) {
+  const objectNamePrefix = String(options.objectNamePrefix || "");
+  const groupIndicesResolver =
+    typeof options.groupIndicesResolver === "function"
+      ? options.groupIndicesResolver
+      : null;
+  let objectIndex = 0;
+
   for (const feature of features) {
     const coordinateSets =
       feature?.geometry?.type === "LineString" ||
@@ -6972,12 +13365,112 @@ function addRhinoPolylineCollection(
         return [xMeters, yMeters, elevationResolver(point, xMeters, yMeters)];
       });
 
+      objectIndex += 1;
       doc.objects().add(
         createRhinoPolylineCurve(rhino, points),
-        createRhinoObjectAttributes(rhino, layerIndex)
+        createRhinoObjectAttributes(
+          rhino,
+          layerIndex,
+          objectNamePrefix ? `${objectNamePrefix}_${objectIndex}` : "",
+          null,
+          groupIndicesResolver ? groupIndicesResolver(feature, coordinates) : []
+        )
       );
     }
   }
+}
+
+function prepareSiteContextForExport(siteContext, requestedOptions, format) {
+  const exportSiteContext = {
+    ...siteContext,
+    options: {
+      ...(siteContext?.options || {}),
+      ...(requestedOptions || {}),
+      exportFormat: format,
+    },
+    stats: {
+      ...(siteContext?.stats || {}),
+    },
+    dataSources: {
+      ...(siteContext?.dataSources || {}),
+      terrain: siteContext?.dataSources?.terrain
+        ? { ...siteContext.dataSources.terrain }
+        : siteContext?.dataSources?.terrain,
+      contours: siteContext?.dataSources?.contours
+        ? { ...siteContext.dataSources.contours }
+        : siteContext?.dataSources?.contours,
+    },
+  };
+  const requestedContourInterval = normalizeContourInterval(
+    exportSiteContext.options?.contourInterval
+  );
+  const sourceContourInterval = resolveSourceContourInterval(exportSiteContext);
+  exportSiteContext.options.contourInterval = requestedContourInterval;
+  const effectiveContourBandInterval = resolveEffectiveContourBandInterval(
+    exportSiteContext
+  );
+
+  exportSiteContext.stats.requestedContourInterval = requestedContourInterval;
+  exportSiteContext.stats.sourceContourInterval = sourceContourInterval;
+  exportSiteContext.stats.effectiveContourBandInterval =
+    effectiveContourBandInterval;
+  exportSiteContext.stats.effectiveContourDisplayInterval =
+    requestedContourInterval;
+  exportSiteContext.stats.buildingPlacementDebug = buildBuildingPlacementDiagnostics(
+    exportSiteContext
+  );
+
+  if (exportSiteContext.dataSources?.contours) {
+    exportSiteContext.dataSources.contours.interval = sourceContourInterval;
+  }
+
+  const displayContourInterval = resolveRequestedContourDisplayInterval(
+    exportSiteContext
+  );
+  const currentDisplayInterval = inferSourceContourIntervalFromContourLines(
+    exportSiteContext.contourLines
+  );
+  const preserveNativeContourDisplayLines =
+    shouldPreserveNativeContourDisplayLines(format) &&
+    exportSiteContext.contourLines?.features?.length;
+
+  exportSiteContext.stats.effectiveContourDisplayInterval =
+    preserveNativeContourDisplayLines &&
+    Number.isFinite(currentDisplayInterval) &&
+    currentDisplayInterval > 0
+      ? normalizeContourInterval(currentDisplayInterval)
+      : requestedContourInterval;
+
+  if (
+    !preserveNativeContourDisplayLines &&
+    (format === "obj" ||
+      format === "skp" ||
+      format === "skp-payload" ||
+      format === "3dm") &&
+    exportSiteContext.options?.terrainMode === "contour" &&
+    exportSiteContext.options?.includeContours !== false &&
+    exportSiteContext.terrainGrid?.elevations?.length &&
+    (
+      !exportSiteContext.contourLines?.features?.length ||
+      !Number.isFinite(currentDisplayInterval) ||
+      Math.abs(displayContourInterval - currentDisplayInterval) > 1e-9
+    )
+  ) {
+    exportSiteContext.contourLines = createContourLinesFromTerrainGrid(
+      exportSiteContext.location,
+      exportSiteContext.terrainGrid,
+      {
+        ...exportSiteContext.options,
+        contourInterval: displayContourInterval,
+      }
+    );
+  }
+
+  console.log(
+    `[export-terrain] format=${format} requested=${requestedContourInterval} source=${sourceContourInterval} effective=${effectiveContourBandInterval} display=${exportSiteContext.stats.effectiveContourDisplayInterval} preserveNativeContours=${preserveNativeContourDisplayLines}`
+  );
+
+  return exportSiteContext;
 }
 
 async function build3dmFromSiteContext(siteContext, reportProgress = null) {
@@ -6986,12 +13479,25 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
   progress(6, "3DM 엔진을 준비하는 중입니다.");
   const rhino = await getRhino3dm();
   const doc = new rhino.File3dm();
+  const docSettings = doc.settings();
+  if (docSettings) {
+    docSettings.modelUnitSystem = rhino.UnitSystem.Meters;
+    docSettings.pageUnitSystem = rhino.UnitSystem.Meters;
+    docSettings.modelAbsoluteTolerance = 0.001;
+  }
   const center = {
     lat: Number(siteContext.location?.lat),
     lng: Number(siteContext.location?.lng),
   };
   const seed = Math.round(Math.abs(center.lat * 1000) + Math.abs(center.lng * 1000));
   const layerIndexCache = new Map();
+  const groupIndexCache = new Map();
+  const parcelContentGroupIndex = shouldGroupParcelCutContent(siteContext)
+    ? ensureRhinoGroup(doc, rhino, groupIndexCache, "PARCEL_CUT_CONTENT")
+    : null;
+  const parcelRing = Number.isInteger(parcelContentGroupIndex)
+    ? getOuterRing(siteContext.parcelBoundary)
+    : null;
   const terrainLayer = ensureRhinoLayer(doc, layerIndexCache, "terrain", {
     r: 181,
     g: 143,
@@ -7012,10 +13518,15 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
       b: 58,
     }
   );
-  const parcelLayer = ensureRhinoLayer(doc, layerIndexCache, "parcel", {
+  const targetParcelLayer = ensureRhinoLayer(doc, layerIndexCache, "site-parcel", {
     r: 191,
     g: 81,
     b: 42,
+  });
+  const parcelContextLayer = ensureRhinoLayer(doc, layerIndexCache, "parcel-context", {
+    r: 92,
+    g: 122,
+    b: 99,
   });
   const contourLayer = ensureRhinoLayer(doc, layerIndexCache, "contours", {
     r: 88,
@@ -7027,7 +13538,13 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
   if (siteContext.options?.terrainMode === "flat") {
     addRhinoFlatTerrain(doc, rhino, terrainLayer, siteContext, center);
   } else if (siteContext.options?.terrainMode === "contour") {
-    addRhinoContourBandTerrain(doc, rhino, terrainLayer, siteContext);
+    addRhinoContourBandTerrain(
+      doc,
+      rhino,
+      terrainLayer,
+      siteContext,
+      parcelContentGroupIndex
+    );
   } else {
     addRhinoTerrainMesh(doc, rhino, terrainLayer, siteContext, center, seed);
   }
@@ -7041,7 +13558,8 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
       targetBuildingLayer,
       siteContext,
       center,
-      seed
+      seed,
+      parcelContentGroupIndex
     );
   }
 
@@ -7050,12 +13568,29 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
     addRhinoPolylineCollection(
       doc,
       rhino,
-      parcelLayer,
+      targetParcelLayer,
       [siteContext.parcelBoundary],
       center,
       (_point, xMeters, yMeters) =>
-        siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.15
+        siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.15,
+      {
+        objectNamePrefix: "PARCEL_BOUNDARY",
+        groupIndicesResolver: () =>
+          Number.isInteger(parcelContentGroupIndex) ? [parcelContentGroupIndex] : [],
+      }
     );
+
+    if (siteContext.parcelContext?.features?.length) {
+      addRhinoPolylineCollection(
+        doc,
+        rhino,
+        parcelContextLayer,
+        siteContext.parcelContext.features,
+        center,
+        (_point, xMeters, yMeters) =>
+          siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.12
+      );
+    }
   }
 
   if (siteContext.options?.includeContours !== false) {
@@ -7079,14 +13614,74 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
         }
 
         doc.objects().add(
-          createRhinoPolylineCurve(rhino, points),
+          createRhinoContourDisplayCurve(rhino, points),
           createRhinoObjectAttributes(
             rhino,
             contourLayer,
-            `CONTOUR_${index + 1}_${lineIndex + 1}`
+            `CONTOUR_${index + 1}_${lineIndex + 1}`,
+            null,
+            parcelRing?.length &&
+              isLineMostlyInsideParcelRing(lineStrings[lineIndex], parcelRing) &&
+              Number.isInteger(parcelContentGroupIndex)
+              ? [parcelContentGroupIndex]
+              : []
           )
         );
       }
+    }
+  }
+
+  if (siteContext.options?.includeRoads === true) {
+    progress(92, "3DM 도로 레이어를 추가하는 중입니다.");
+    const roadLayer = ensureRhinoLayer(doc, layerIndexCache, "roads", {
+      r: 91,
+      g: 112,
+      b: 121,
+    });
+    if (siteContext.options?.terrainMode === "contour") {
+      const roadSolidStats = addRhinoContourBandRoadSolids(
+        doc,
+        rhino,
+        roadLayer,
+        siteContext,
+        center,
+        parcelContentGroupIndex
+      );
+      console.log(
+        `[export-3dm] roads features=${Number(
+          siteContext.roads?.features?.length || 0
+        )} contourGroups=${roadSolidStats.groupCount} solidObjects=${
+          roadSolidStats.objectCount
+        } mode=contour-solid`
+      );
+    } else {
+      const roadMeshStats = addRhinoRoads(
+        doc,
+        rhino,
+        roadLayer,
+        siteContext,
+        center,
+        seed
+      );
+      const roadCenterlineStats = addRhinoRoadCenterlines(
+        doc,
+        rhino,
+        roadLayer,
+        siteContext,
+        center,
+        seed
+      );
+      console.log(
+        `[export-3dm] roads features=${Number(
+          siteContext.roads?.features?.length || 0
+        )} segments=${roadMeshStats.segmentCount} polygons=${
+          roadMeshStats.polygonCount
+        } vertices=${roadMeshStats.vertexCount} faces=${
+          roadMeshStats.faceCount
+        } meshObjects=${roadMeshStats.objectCount} centerlineObjects=${
+          roadCenterlineStats.objectCount
+        } mode=mesh`
+      );
     }
   }
 
@@ -7099,7 +13694,48 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
 
 function normalizeExportFormat(value) {
   const normalized = String(value || "").trim().toLowerCase();
-  return normalized === "3dm" ? "3dm" : "obj";
+  if (normalized === "3dm") {
+    return "3dm";
+  }
+
+  if (normalized === "skp") {
+    return "skp";
+  }
+
+  if (normalized === "skp-payload") {
+    return "skp-payload";
+  }
+
+  if (normalized === "dxf") {
+    return "dxf";
+  }
+
+  return "obj";
+}
+
+function buildSkpPayloadEnvelope(siteContext, exportConfig = null) {
+  const payload = buildSketchUpPayloadFromSiteContext(siteContext);
+  const runtimeConfig = resolveSkpExportRuntimeConfig(exportConfig);
+
+  return {
+    format: "skp-payload",
+    payloadVersion: 1,
+    runtime: {
+      engine: runtimeConfig.engine,
+      standaloneCliConfigured: Boolean(runtimeConfig.skpExporterCli),
+    },
+    stats: {
+      requestedContourInterval:
+        siteContext?.stats?.requestedContourInterval ?? null,
+      sourceContourInterval: siteContext?.stats?.sourceContourInterval ?? null,
+      effectiveContourBandInterval:
+        siteContext?.stats?.effectiveContourBandInterval ?? null,
+      effectiveContourDisplayInterval:
+        siteContext?.stats?.effectiveContourDisplayInterval ?? null,
+      groupCount: payload.groups?.length || 0,
+    },
+    payload,
+  };
 }
 
 function createModelSpec(body) {
@@ -7117,7 +13753,7 @@ function createModelSpec(body) {
         : "현재 내보내기는 프로토타입 단계이며, 대지 경계와 실표고 기반 지형이 함께 포함됩니다.",
     location: body.location,
     options: body.options,
-    exportTargets: ["3dm", "obj"],
+    exportTargets: ["3dm", "obj", "dxf", "skp", "skp-payload"],
     siteContextSummary: siteContext
       ? {
           parcelSource: siteContext.dataSources?.parcel?.provider || "unknown",
@@ -7135,6 +13771,70 @@ function createModelSpec(body) {
     siteContext,
     nextModules: ["dem-source"],
   };
+}
+
+function formatIntervalForFilename(value) {
+  const numericValue = normalizeContourInterval(value);
+  const roundedValue = Number(numericValue.toFixed(3));
+  return Number.isInteger(roundedValue)
+    ? `${roundedValue}`
+    : `${roundedValue}`.replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function sanitizeExportFilenamePart(value, fallback = "site-context") {
+  const normalized = normalizeSystemAddress(value)
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return normalized || fallback;
+}
+
+function buildExportDownloadFilename(siteContext, options, format) {
+  const normalizedFormat = normalizeExportFormat(format);
+  const fileExtension =
+    normalizedFormat === "skp-payload" ? "skp.json" : normalizedFormat;
+  const addressPart = sanitizeExportFilenamePart(
+    siteContext?.location?.parcelAddress ||
+      siteContext?.location?.roadAddress ||
+      siteContext?.location?.label ||
+      "",
+    "site-context"
+  );
+  const radiusPart = `${Math.max(0, Math.round(Number(options?.radius) || 0))}m`;
+  const intervalPart = `${formatIntervalForFilename(options?.contourInterval)}m`;
+  const parts = [addressPart, radiusPart, intervalPart];
+
+  if (options?.splitParcelBoundary === true && siteContext?.selectionMode !== "range") {
+    parts.push("분절");
+  }
+
+  return `${parts.join("_")}.${fileExtension}`;
+}
+
+function buildResolvedExportDownloadFilename(siteContext, options, format) {
+  const normalizedFormat = normalizeExportFormat(format);
+  const fileExtension =
+    normalizedFormat === "skp-payload" ? "skp.json" : normalizedFormat;
+  const addressPart = sanitizeExportFilenamePart(
+    siteContext?.location?.parcelAddress ||
+      siteContext?.location?.roadAddress ||
+      siteContext?.location?.label ||
+      "",
+    "site-context"
+  );
+  const radiusPart = `${Math.max(0, Math.round(Number(options?.radius) || 0))}m`;
+  const intervalPart = `${formatIntervalForFilename(options?.contourInterval)}m`;
+  const parts = [addressPart, radiusPart, intervalPart];
+
+  if (
+    options?.splitParcelBoundary === true &&
+    siteContext?.selectionMode !== "range"
+  ) {
+    parts.push("\uBD84\uC808");
+  }
+
+  return `${parts.join("_")}.${fileExtension}`;
 }
 
 function createEumHandoffHtml(requestUrl) {
@@ -7410,12 +14110,22 @@ async function createApp() {
           return;
         }
 
+        console.log(`[search-api] query="${query}"`);
+
+        const cachedResponse = readGeocodeCache(query);
+
+        if (cachedResponse) {
+          sendJson(response, 200, cachedResponse);
+          return;
+        }
+
         const { provider, results } = await geocodeWithPreferredProviders(
           query,
           config
         );
-
-        sendJson(response, 200, { provider, results });
+        const payload = { provider, results };
+        writeGeocodeCache(query, payload);
+        sendJson(response, 200, payload);
         return;
       }
 
@@ -7571,29 +14281,55 @@ async function createApp() {
 
       if (
         (requestUrl.pathname === "/api/export-model" ||
-          requestUrl.pathname === "/api/export-obj") &&
+          requestUrl.pathname === "/api/export-obj" ||
+          requestUrl.pathname === "/api/export-skp-payload") &&
         request.method === "POST"
       ) {
         const progressToken = readRequestProgressToken(request);
+        const isSkpPayloadRoute =
+          requestUrl.pathname === "/api/export-skp-payload";
         beginRequestProgress(
           progressToken,
-          "export-model",
+          isSkpPayloadRoute ? "export-skp-payload" : "export-model",
+          isSkpPayloadRoute
+            ? "Preparing SKP payload export."
+            :
           "3D 파일 요청을 준비하는 중입니다."
         );
 
         try {
           const body = await readJsonBody(request);
           let siteContext = body.siteContext || null;
+          const requestedOptions = body.options || {};
+          const requestedLocation = body.location || siteContext?.location || {};
           const format =
             requestUrl.pathname === "/api/export-obj"
               ? "obj"
-              : normalizeExportFormat(body.options?.exportFormat);
+              : isSkpPayloadRoute
+                ? "skp-payload"
+                : normalizeExportFormat(body.options?.exportFormat);
 
-          if (!siteContext) {
+          if (
+            !siteContext ||
+            !isSiteContextCompatibleForExport(
+              siteContext,
+              requestedLocation,
+              requestedOptions
+            )
+          ) {
             updateRequestProgress(progressToken, {
               percent: 8,
               message: "내보낼 대지 컨텍스트를 계산하는 중입니다.",
             });
+            if (siteContext) {
+              console.log(
+                `[export] rebuilding siteContext format=${format} requestedRoads=${
+                  requestedOptions.includeRoads === true
+                } providedRoads=${
+                  siteContext.options?.includeRoads === true
+                }`
+              );
+            }
             siteContext = await buildSiteContext(
               body,
               config,
@@ -7605,6 +14341,25 @@ async function createApp() {
               message: "저장된 대지 컨텍스트를 확인하는 중입니다.",
             });
           }
+
+          if (siteContext && siteContext === body.siteContext) {
+            console.log(
+              `[export] reusing siteContext format=${format} roads=${Number(
+                siteContext.roads?.features?.length || 0
+              )} includeRoads=${siteContext.options?.includeRoads === true}`
+            );
+          }
+
+          siteContext = prepareSiteContextForExport(
+            siteContext,
+            requestedOptions,
+            format
+          );
+          const exportFilename = buildResolvedExportDownloadFilename(
+            siteContext,
+            requestedOptions,
+            format
+          );
 
           const exportStartedAt = Date.now();
 
@@ -7631,7 +14386,7 @@ async function createApp() {
               200,
               exportBody,
               "application/octet-stream",
-              `site-context-${Date.now()}.3dm`
+              exportFilename
             );
             return;
           }
@@ -7640,6 +14395,103 @@ async function createApp() {
             percent: 48,
             message: "OBJ 모델을 생성하는 중입니다.",
           });
+          if (format === "skp") {
+            updateRequestProgress(progressToken, {
+              percent: 48,
+              message: "SKP 모델을 생성하는 중입니다.",
+            });
+            const exportBody = await buildSkpFromSiteContextWithRetry(
+              siteContext,
+              createRangedProgressReporter(progressToken, 48, 96),
+              config
+            );
+            console.log(
+              `[export] done format=skp bytes=${Number(
+                exportBody?.byteLength || exportBody?.length || 0
+              )} ms=${Date.now() - exportStartedAt}`
+            );
+            completeRequestProgress(
+              progressToken,
+              "SKP 파일 다운로드를 시작합니다."
+            );
+            sendBinary(
+              response,
+              200,
+              exportBody,
+              "application/octet-stream",
+              exportFilename
+            );
+            return;
+          }
+
+          if (format === "skp-payload") {
+            updateRequestProgress(progressToken, {
+              percent: 48,
+              message: "Building SKP payload JSON.",
+            });
+            const exportPayload = buildSkpPayloadEnvelope(siteContext, config);
+            console.log(
+              `[export] done format=skp-payload groups=${Number(
+                exportPayload?.payload?.groups?.length || 0
+              )} ms=${Date.now() - exportStartedAt}`
+            );
+            completeRequestProgress(
+              progressToken,
+              isSkpPayloadRoute
+                ? "SKP payload is ready."
+                : "SKP payload download is ready."
+            );
+
+            if (isSkpPayloadRoute) {
+              sendJson(response, 200, exportPayload);
+            } else {
+              sendBinary(
+                response,
+                200,
+                Buffer.from(
+                  JSON.stringify(exportPayload.payload, null, 2),
+                  "utf8"
+                ),
+                "application/json; charset=utf-8",
+                buildResolvedExportDownloadFilename(
+                  siteContext,
+                  requestedOptions,
+                  "skp-payload"
+                )
+              );
+            }
+            return;
+          }
+
+          if (format === "dxf") {
+            updateRequestProgress(progressToken, {
+              percent: 48,
+              message: "DXF 紐⑤뜽???앹꽦?섎뒗 以묒엯?덈떎.",
+            });
+            const exportBody = buildDxfFromSiteContext(
+              siteContext,
+              createRangedProgressReporter(progressToken, 48, 96)
+            );
+            console.log(
+              `[export] done format=dxf bytes=${Buffer.byteLength(
+                exportBody,
+                "utf8"
+              )} ms=${Date.now() - exportStartedAt}`
+            );
+            completeRequestProgress(
+              progressToken,
+              "DXF ?뚯씪 ?ㅼ슫濡쒕뱶瑜??쒖옉?⑸땲??"
+            );
+            sendBinary(
+              response,
+              200,
+              Buffer.from(exportBody, "utf8"),
+              "application/dxf; charset=utf-8",
+              exportFilename
+            );
+            return;
+          }
+
           const exportBody = buildObjFromSiteContext(
             siteContext,
             createRangedProgressReporter(progressToken, 48, 96)
@@ -7654,7 +14506,7 @@ async function createApp() {
             progressToken,
             "OBJ 파일 다운로드를 시작합니다."
           );
-          sendText(response, 200, exportBody, `site-context-${Date.now()}.obj`);
+          sendText(response, 200, exportBody, exportFilename);
         } catch (error) {
           failRequestProgress(progressToken, error);
           logServerError(
@@ -7708,12 +14560,24 @@ export {
   addRhinoPolylineCollection,
   addRhinoPrismFromPolygon,
   addRhinoTerrainMesh,
+  buildingBaseElevationForRing,
   build3dmFromSiteContext,
+  buildCumulativeContourBandGroups,
   buildContourBandGroups,
+  buildDxfFromSiteContext,
   buildObjFromSiteContext,
+  buildSketchUpPayloadFromSiteContext,
+  buildSkpFromSiteContext,
+  buildSkpFromSiteContextWithRetry,
   createRhinoObjectAttributes,
+  centroidOfRing,
+  collectBuildingFootprintElevationSamples,
   ensureRhinoLayer,
   getRhino3dm,
+  localMetersFromLngLat,
+  prepareSiteContextForExport,
+  resolveRawTerrainHeightAtLocalPoint,
+  siteHeightAtLocalPoint,
 };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {

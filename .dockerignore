@@ -7,4 +7,6 @@ tmp_*
 *.log
 *.obj
 *.3dm
+data/contours/
+data/dem/
 docs/sample-contours.geojson

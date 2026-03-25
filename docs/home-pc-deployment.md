@@ -11,6 +11,13 @@ This guide assumes:
 - you already have a Git repository for the code
 - you do not want to pay for a cloud server yet
 
+For the safest day-to-day workflow on one PC, keep two folders:
+
+- development: `C:\Rhino_develop`
+- production: `C:\Rhino_deploy`
+
+Edit code only in the development folder. Run the public website only from the production folder.
+
 ## High-Level Structure
 
 Your home PC will do three jobs:
@@ -59,6 +66,18 @@ Keep these files in the project:
 
 For home-PC hosting, you can run the app directly with Node first.
 
+Recommended split on one PC:
+
+1. Keep developing in `C:\Rhino_develop`
+2. Create a separate production clone in `C:\Rhino_deploy`
+3. Run the public app only from `C:\Rhino_deploy`
+
+Helper scripts in this repo:
+
+- `deploy/setup-home-prod.ps1`
+- `deploy/update-home-prod.ps1`
+- `deploy/start-server.ps1`
+
 ## Step 2. Prepare Local Secrets
 
 Create `config.local.json` from `config.local.json.example`.
@@ -75,6 +94,11 @@ Fill in:
 
 Do not commit `config.local.json` to Git.
 
+Important:
+
+- keep separate `config.local.json` files in `C:\Rhino_develop` and `C:\Rhino_deploy`
+- production should only read the config inside `C:\Rhino_deploy`
+
 ## Step 3. Start the App Locally
 
 Run:
@@ -88,6 +112,15 @@ Check:
 
 - `http://localhost:3000`
 - `http://localhost:3000/api/health`
+
+If you are separating development and production on one PC, do this for production:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\setup-home-prod.ps1
+cd C:\Rhino_deploy
+npm.cmd install
+powershell -ExecutionPolicy Bypass -File deploy\start-server.ps1
+```
 
 ## Step 4. Get a Domain or DDNS Name
 
@@ -187,14 +220,13 @@ Recommended flow:
 1. edit locally
 2. test locally
 3. push to Git
-4. pull changes on the home PC
-5. restart the app
+4. update `C:\Rhino_deploy`
+5. restart the production app
 
-If the home PC is the same machine you use for development, steps 4 and 5 are just:
+If the home PC is the same machine you use for development, keep the public app in the separate production folder and use:
 
 ```powershell
-git pull
-npm run dev
+powershell -ExecutionPolicy Bypass -File deploy\update-home-prod.ps1
 ```
 
 ## Step 12. Know When to Upgrade

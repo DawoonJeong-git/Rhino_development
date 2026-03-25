@@ -8,7 +8,7 @@
 
 직접 값을 넣을 파일:
 
-- `C:\Users\HDL\Documents\Rhino_develop\config.local.json`
+- `config.local.json`
 
 현재 파일에는 눈에 띄는 자리표시자가 들어 있습니다.
 

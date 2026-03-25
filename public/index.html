@@ -10,7 +10,7 @@
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
       crossorigin=""
     />
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=20260325-uireset21" />
   </head>
   <body>
     <div class="app-shell">
@@ -41,6 +41,7 @@
           <p class="helper-text">
             도로명주소, 지번주소, 건물명을 모두 검색할 수 있습니다. 검색 결과를 고르거나 지도에서 바로 위치를 찍어도 됩니다.
           </p>
+            <p class="search-results-empty">寃??寃곌낵媛 ?ш린???쒖떆?⑸땲??</p>
         </form>
 
         <div class="selection-summary-stack">
@@ -75,7 +76,11 @@
             </span>
             <span class="legend-item">
               <span class="legend-swatch legend-swatch-parcel"></span>
-              대지 경계
+              대상 필지
+            </span>
+            <span class="legend-item">
+              <span class="legend-swatch legend-swatch-parcel-context"></span>
+              주변 필지
             </span>
             <span class="legend-item">
               <span class="legend-swatch legend-swatch-building"></span>
@@ -84,6 +89,10 @@
             <span class="legend-item">
               <span class="legend-swatch legend-swatch-contour"></span>
               등고선
+            </span>
+            <span class="legend-item">
+              <span class="legend-swatch legend-swatch-road"></span>
+              도로
             </span>
           </div>
         </section>
@@ -282,7 +291,7 @@
             </div>
           </article>
 
-          <article class="card">
+          <article class="card model-card">
             <div class="card-header">
               <div>
                 <p class="card-kicker">3D Export</p>
@@ -292,36 +301,35 @@
             <form id="modelForm" class="model-form">
               <label>
                 범위 반경 (m)
-                <input type="number" name="radius" min="20" step="10" value="120" />
+                <input type="number" name="radius" min="20" step="10" value="100" />
               </label>
 
               <label>
                 등고 간격 (m)
-                <input
-                  type="number"
-                  name="contourInterval"
-                  min="1"
-                  step="1"
-                  value="1"
-                />
+                <select name="contourInterval">
+                  <option value="0.1">0.1</option>
+                  <option value="0.5">0.5</option>
+                  <option value="1" selected>1</option>
+                  <option value="5">5</option>
+                </select>
               </label>
 
               <div class="toggle-grid">
                 <label class="checkbox">
-                  <input type="checkbox" name="includeBuildings" checked />
                   건물 mass 포함
                 </label>
                 <label class="checkbox">
-                  <input type="checkbox" name="includeParcelBoundary" checked />
                   대지 경계 포함
                 </label>
+                <label class="checkbox" data-model-option="splitParcelBoundary">
+                  <input type="checkbox" name="splitParcelBoundary" />
+                  <span class="checkbox-label">대지 경계 분할</span>
+                </label>
                 <label class="checkbox">
-                  <input type="checkbox" name="includeContours" checked />
                   등고선 포함
                 </label>
                 <label class="checkbox">
-                  <input type="checkbox" name="includeRoads" />
-                  도로는 다음 단계에서 추가
+                  도로 레이어 포함
                 </label>
               </div>
 
@@ -366,6 +374,6 @@
       integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
       crossorigin=""
     ></script>
-    <script type="module" src="/app.js"></script>
+    <script type="module" src="/app.js?v=20260325-uireset21"></script>
   </body>
 </html>

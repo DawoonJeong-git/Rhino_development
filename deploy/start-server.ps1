@@ -1,2 +1,3 @@
-Set-Location "C:\Users\HDL\Documents\Rhino_develop"
+$repoRoot = Split-Path -Parent $PSScriptRoot
+Set-Location $repoRoot
 node server.mjs

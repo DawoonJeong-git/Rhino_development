@@ -8,5 +8,8 @@
   "TERRAIN_DEM_PATH": "",
   "TERRAIN_CONTOUR_PATH": "",
   "TERRAIN_CONTOUR_CRS": "EPSG:5179",
+  "SKP_EXPORT_ENGINE": "standalone-cli",
+  "SKP_EXPORTER_CLI": "",
+  "SKETCHUP_EXE": "",
   "USE_NOMINATIM_FALLBACK": true
 }
