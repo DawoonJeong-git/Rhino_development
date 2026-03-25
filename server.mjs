@@ -874,8 +874,9 @@ async function readJsonBody(request) {
 }
 
 async function serveStatic(requestPath, response) {
+  const indexAliases = new Set(["/", "/contour3dmodel", "/contour3dmodel/"]);
   const resolvedPath =
-    requestPath === "/"
+    indexAliases.has(requestPath)
       ? path.join(publicDir, "index.html")
       : path.join(publicDir, requestPath);
   const normalizedPath = path.normalize(resolvedPath);
