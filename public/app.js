@@ -715,6 +715,19 @@ async function fetchWithDiagnostics(endpoint, init, fallbackMessage) {
 }
 
 function createModelProgressToken() {
+  if (window.crypto?.randomUUID) {
+    return `progress-${window.crypto.randomUUID()}`;
+  }
+
+  if (window.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(12);
+    window.crypto.getRandomValues(bytes);
+    const suffix = Array.from(bytes, (value) =>
+      value.toString(16).padStart(2, "0")
+    ).join("");
+    return `progress-${suffix}`;
+  }
+
   return `progress-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
@@ -1959,6 +1972,7 @@ function renderSiteContextMeta() {
 
   const parcel = state.siteContext.dataSources?.parcel;
   const terrain = state.siteContext.dataSources?.terrain;
+  const contours = state.siteContext.dataSources?.contours;
   const buildings = state.siteContext.dataSources?.buildings;
   const stats = state.siteContext.stats || {};
   const targetParcelCount = Number(stats.targetParcelCount || 0);
@@ -1982,7 +1996,7 @@ function renderSiteContextMeta() {
     )}</dd></div>
   `;
   siteContextNote.textContent =
-    terrain?.note || buildings?.note || parcel?.note || "대지 컨텍스트를 불러왔습니다.";
+    contours?.note || terrain?.note || buildings?.note || parcel?.note || "대지 컨텍스트를 불러왔습니다.";
 }
 
 function renderInfoItems(container, items, emptyMessage) {
@@ -3674,8 +3688,13 @@ function downloadBlob(filename, blob) {
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = filename;
+  anchor.style.display = "none";
+  document.body?.append(anchor);
   anchor.click();
-  URL.revokeObjectURL(url);
+  anchor.remove();
+  window.setTimeout(() => {
+    URL.revokeObjectURL(url);
+  }, 30000);
 }
 
 function downloadJson(filename, payload) {
@@ -3895,23 +3914,34 @@ function openPendingWindow(title = "결과 창") {
     return null;
   }
 
-  popup.document.write(`
+  renderStandaloneWindow(popup, title, '<p class="popup-loading-message">결과를 준비하는 중입니다...</p>', {
+    bodyClass: "popup-shell popup-shell--loading",
+  });
+  return popup;
+}
+
+function renderStandaloneWindow(targetWindow, title, bodyHtml, options = {}) {
+  if (!targetWindow || targetWindow.closed) {
+    throw new Error("팝업이 차단되어 창을 열 수 없습니다.");
+  }
+
+  const bodyClass = String(options?.bodyClass || "popup-shell").trim();
+  const stylesheetHref = `/popup.css?v=20260326-security2`;
+
+  targetWindow.document.write(`
     <!doctype html>
     <html lang="ko">
       <head>
         <meta charset="utf-8" />
         <title>${escapeHtml(title)}</title>
-        <style>
-          body { font-family: 'Segoe UI', sans-serif; padding: 32px; color: #2e241c; }
-        </style>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <link rel="stylesheet" href="${stylesheetHref}" />
       </head>
-      <body>
-        <p>결과를 준비하는 중입니다...</p>
-      </body>
+      <body class="${escapeHtml(bodyClass)}">${bodyHtml}</body>
     </html>
   `);
-  popup.document.close();
-  return popup;
+  targetWindow.document.close();
+  targetWindow.focus();
 }
 
 function renderPopupWindow(popupWindow, title, bodyHtml) {
@@ -3919,33 +3949,9 @@ function renderPopupWindow(popupWindow, title, bodyHtml) {
     throw new Error("팝업이 차단되어 상세 창을 열 수 없습니다.");
   }
 
-  popupWindow.document.write(`
-    <!doctype html>
-    <html lang="ko">
-      <head>
-        <meta charset="utf-8" />
-        <title>${escapeHtml(title)}</title>
-        <style>
-          body { font-family: 'Pretendard Variable', 'Segoe UI', sans-serif; margin: 32px; color: #2e241c; background: #f7f2ea; }
-          h1, h2, h3, p { margin: 0; }
-          h1 { font-size: 28px; margin-bottom: 8px; }
-          h2 { font-size: 20px; margin-bottom: 8px; }
-          h3 { font-size: 14px; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #944220; }
-          .meta { color: #6c5a49; margin-bottom: 18px; line-height: 1.6; }
-          .section { margin-top: 22px; }
-          .card { border: 1px solid #d7c5b2; border-radius: 18px; padding: 18px; margin-bottom: 16px; background: #fffaf2; }
-          .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
-          .grid div { border: 1px solid rgba(108, 90, 73, 0.14); border-radius: 14px; padding: 12px; background: rgba(255,255,255,0.72); }
-          .grid strong { display: block; font-size: 12px; color: #6c5a49; margin-bottom: 6px; }
-          .notice { margin-top: 14px; color: #6c5a49; line-height: 1.6; }
-          @media (max-width: 880px) { .grid { grid-template-columns: 1fr; } body { margin: 18px; } }
-        </style>
-      </head>
-      <body>${bodyHtml}</body>
-    </html>
-  `);
-  popupWindow.document.close();
-  popupWindow.focus();
+  renderStandaloneWindow(popupWindow, title, bodyHtml, {
+    bodyClass: "popup-shell popup-shell--detail",
+  });
 }
 
 function renderPrintWindow(printWindow, title, bodyHtml) {
@@ -3953,29 +3959,9 @@ function renderPrintWindow(printWindow, title, bodyHtml) {
     throw new Error("팝업이 차단되어 인쇄 창을 열 수 없습니다.");
   }
 
-  printWindow.document.write(`
-    <!doctype html>
-    <html lang="ko">
-      <head>
-        <meta charset="utf-8" />
-        <title>${escapeHtml(title)}</title>
-        <style>
-          body { font-family: 'Pretendard Variable', 'Segoe UI', sans-serif; margin: 32px; color: #2e241c; }
-          h1, h2, p { margin: 0; }
-          h1 { font-size: 24px; margin-bottom: 8px; }
-          .meta { color: #6c5a49; margin-bottom: 20px; line-height: 1.6; }
-          .section { margin-top: 24px; }
-          .card { border: 1px solid #d7c5b2; border-radius: 16px; padding: 16px; margin-bottom: 14px; }
-          .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
-          .grid strong { display: block; font-size: 12px; color: #6c5a49; margin-bottom: 4px; }
-          .notice { margin-top: 24px; color: #6c5a49; font-size: 12px; }
-        </style>
-      </head>
-      <body>${bodyHtml}</body>
-    </html>
-  `);
-  printWindow.document.close();
-  printWindow.focus();
+  renderStandaloneWindow(printWindow, title, bodyHtml, {
+    bodyClass: "popup-shell popup-shell--print",
+  });
   window.setTimeout(() => {
     printWindow.print();
   }, 250);
@@ -4496,12 +4482,6 @@ function attachEvents() {
   let searchSubmissionInFlight = false;
   ensureSearchSelectionCard();
 
-  console.info("[search-ui] events attached", {
-    hasSearchForm: Boolean(searchForm),
-    hasSearchInput: Boolean(searchInput),
-    hasSearchResults: Boolean(searchResults),
-  });
-
   const runSearch = async (source = "submit") => {
     if (searchSubmissionInFlight) {
       return;
@@ -4520,7 +4500,6 @@ function attachEvents() {
     }
 
     searchSubmissionInFlight = true;
-    console.info(`[search-ui] ${source} query="${query}"`);
     clearSelectionForSearch();
 
     try {
@@ -4537,13 +4516,6 @@ function attachEvents() {
       if (!cachedPayload && payload?.results) {
         state.searchCache.set(cacheKey, payload);
       }
-
-      console.info(
-        `[search-ui] results=${Number(payload?.results?.length || 0)} provider="${
-          payload?.provider || "unknown"
-        }"`
-      );
-
       if ((payload?.results?.length || 0) === 1) {
         const firstResult = payload.results[0];
         state.pendingSearchSelectionId = firstResult.id || "";
@@ -4577,7 +4549,6 @@ function attachEvents() {
   });
 
   searchInput?.addEventListener("input", () => {
-    console.info("[search-ui] input");
     scheduleSearch();
   });
 

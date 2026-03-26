@@ -26,12 +26,14 @@ Safer recommended flow:
 
 1. run the Node app on `localhost:3000`
 2. run Cloudflare Tunnel on the same PC
-3. keep the Node app private behind the tunnel
+3. put Cloudflare Access in front of the tunnel
+4. keep the Node app private behind the tunnel
 
 ```text
 friend's browser
 -> your domain
 -> Cloudflare
+-> Cloudflare Access
 -> Cloudflare Tunnel on your PC
 -> Node app on localhost:3000
 ```
@@ -50,6 +52,12 @@ friend's browser
 -> Caddy (HTTPS)
 -> Node app on localhost:3000
 ```
+
+For this security build, the default recommendation is:
+
+- Cloudflare Tunnel plus Cloudflare Access
+
+Use the direct-access allowlist flow only when the Access path is not available.
 
 ## What You Need
 
@@ -166,6 +174,7 @@ Recommended with Cloudflare Tunnel:
 - keep router port forwarding for `80` and `443` disabled
 - remove old forwarding rules if they were used before
 - keep Node bound to localhost only
+- if you use Docker, keep `HOST_BIND_IP=127.0.0.1` on the host side and `BIND_HOST=0.0.0.0` inside the container
 
 Only if you are not using Cloudflare Tunnel, forward these ports from your router to your Windows PC:
 
@@ -260,7 +269,14 @@ If the home PC is the same machine you use for development, keep the public app 
 powershell -ExecutionPolicy Bypass -File deploy\update-home-prod.ps1
 ```
 
-After the update, rerun `deploy\run-home-prod-server.bat` or `deploy\run-home-site.bat`. Those scripts now safely restart the existing managed process instead of spawning duplicates.
+That update script now does four things in order:
+
+1. pulls the latest Git commit into `C:\SpaceWork_deploy`
+2. refreshes `node_modules`
+3. restarts the managed production server
+4. runs `node scripts/verify-live-site-context.mjs --base-url http://127.0.0.1:3000`
+
+Treat `C:\SpaceWork_deploy` as a read-only release clone. Edit only in `C:\SpaceWork_develop`, push to Git, then update the deploy clone through the script above so the running app, Git revision, and smoke result stay aligned.
 
 ## Step 12. Know When to Upgrade
 

@@ -5,13 +5,17 @@
 Use this exact sequence right before release:
 
 1. Copy `.env.production.example` to `.env.production` and fill in real keys.
-2. Confirm `VWORLD_API_DOMAIN` matches the real HTTPS origin.
-3. Copy the contour dataset to the server and set `TERRAIN_CONTOUR_HOST_PATH`, `TERRAIN_CONTOUR_PATH`, and `TERRAIN_CONTOUR_CRS`.
-4. If you need server-side `.skp`, provide a real standalone exporter binary and set `SKP_EXPORTER_CLI`. Otherwise leave it blank and use OBJ/3DM or `skp-payload`.
-5. Build and start the container with `docker compose --env-file .env.production up -d --build`.
-6. Verify `GET /api/health` and `GET /api/config`.
-7. Run one real parcel smoke test for search, land summary/detail, building summary/detail, `100m` preview, OBJ, and 3DM.
-8. Keep the previous image tag and one known-good parcel for rollback.
+2. Keep `HOST_BIND_IP=127.0.0.1` unless you intentionally expose the app behind a trusted reverse proxy or access layer.
+3. Confirm `VWORLD_API_DOMAIN` matches the real HTTPS origin.
+4. Copy the contour dataset to the server and set `TERRAIN_CONTOUR_HOST_PATH`, `TERRAIN_CONTOUR_PATH`, and `TERRAIN_CONTOUR_CRS`.
+5. If you need server-side `.skp`, provide a real standalone exporter binary and set `SKP_EXPORTER_CLI`. Otherwise leave it blank and use OBJ/3DM or `skp-payload`.
+6. Run `npm run verify:deployment-security`.
+7. Build and start the container with `docker compose --env-file .env.production up -d --build`.
+8. Verify `GET /api/health` and `GET /api/config`.
+9. Run `npm run verify:baseline`.
+10. Run `node scripts/verify-live-site-context.mjs --base-url http://127.0.0.1:3000` to confirm building polygons, road polygons, and DXF line entities on the live server.
+11. Run one real parcel smoke test for search, land summary/detail, building summary/detail, `100m` preview, OBJ, and 3DM.
+12. Keep the previous image tag and one known-good parcel for rollback.
 
 ## Recommended Shape
 
@@ -21,6 +25,7 @@ Recommended target:
 
 - Linux VM or VPS
 - Docker-capable host
+- Cloudflare Tunnel plus Cloudflare Access as the default controlled access path
 - Reverse proxy with HTTPS
 - Mounted contour dataset directory
 
@@ -45,6 +50,8 @@ You need:
 Required environment variables:
 
 - `PORT`
+- `HOST_BIND_IP` for Docker host port publishing, default `127.0.0.1`
+- `BIND_HOST` for the Node listener inside the container, default `0.0.0.0`
 - `VWORLD_API_KEY`
 - `VWORLD_API_DOMAIN`
 - `JUSO_CONFIRM_KEY`
@@ -64,9 +71,12 @@ You can start from:
 - `.env.production.example`
 - `compose.yaml`
 - `deploy/Caddyfile.example`
+- `docs/security-release-gates.md`
 
 Note:
 
+- `HOST_BIND_IP=127.0.0.1` keeps the published container port private to the local machine by default.
+- `BIND_HOST=0.0.0.0` is the safe container default because Docker port publishing will not reach a process bound only to container loopback.
 - `SKP_EXPORTER_CLI` should stay empty unless the deployment image or host actually provides a standalone exporter binary.
 - If `.skp` is not wired yet, keep OBJ/3DM enabled and use `skp-payload` for downstream conversion.
 
@@ -150,6 +160,21 @@ Check:
 - `POST /api/site-context`
 - `POST /api/export-model` for OBJ
 - `POST /api/export-model` for 3DM
+- `node scripts/verify-live-site-context.mjs --base-url http://127.0.0.1:3000`
+- `npm run verify:deployment-security`
+- `npm run verify:baseline`
+
+If you are validating a separate production clone from the development workspace, you can also run:
+
+```powershell
+node scripts/verify-deployment-security.mjs --root C:\SpaceWork_deploy
+```
+
+For the actual share target, add strict runtime checks too:
+
+```powershell
+node scripts/verify-deployment-security.mjs --root C:\SpaceWork_deploy --strict-runtime
+```
 
 ## Step 7. Final QA
 

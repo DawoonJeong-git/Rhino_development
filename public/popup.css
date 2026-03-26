@@ -1,0 +1,144 @@
+body.popup-shell {
+  font-family: "Pretendard Variable", "Segoe UI", sans-serif;
+  margin: 32px;
+  color: #2e241c;
+  background: #f7f2ea;
+}
+
+body.popup-shell--loading {
+  font-family: "Segoe UI", sans-serif;
+  padding: 32px;
+  margin: 0;
+  background: #ffffff;
+}
+
+body.popup-shell h1,
+body.popup-shell h2,
+body.popup-shell h3,
+body.popup-shell p {
+  margin: 0;
+}
+
+body.popup-shell h1 {
+  font-size: 28px;
+  margin-bottom: 8px;
+}
+
+body.popup-shell h2 {
+  font-size: 20px;
+  margin-bottom: 8px;
+}
+
+body.popup-shell h3 {
+  font-size: 14px;
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #944220;
+}
+
+body.popup-shell .meta {
+  color: #6c5a49;
+  margin-bottom: 18px;
+  line-height: 1.6;
+}
+
+body.popup-shell .section {
+  margin-top: 22px;
+}
+
+body.popup-shell .card {
+  border: 1px solid #d7c5b2;
+  border-radius: 18px;
+  padding: 18px;
+  margin-bottom: 16px;
+  background: #fffaf2;
+}
+
+body.popup-shell .grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+body.popup-shell .grid div {
+  border: 1px solid rgba(108, 90, 73, 0.14);
+  border-radius: 14px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+body.popup-shell .grid strong {
+  display: block;
+  font-size: 12px;
+  color: #6c5a49;
+  margin-bottom: 6px;
+}
+
+body.popup-shell .notice {
+  margin-top: 14px;
+  color: #6c5a49;
+  line-height: 1.6;
+}
+
+body.popup-shell--print {
+  background: #ffffff;
+}
+
+body.popup-shell--print h1 {
+  font-size: 24px;
+}
+
+body.popup-shell--print .meta {
+  margin-bottom: 20px;
+}
+
+body.popup-shell--print .section {
+  margin-top: 24px;
+}
+
+body.popup-shell--print .card {
+  border-radius: 16px;
+  padding: 16px;
+  margin-bottom: 14px;
+  background: #ffffff;
+}
+
+body.popup-shell--print .grid {
+  gap: 10px;
+}
+
+body.popup-shell--print .grid strong {
+  margin-bottom: 4px;
+}
+
+body.popup-shell--print .notice {
+  margin-top: 24px;
+  font-size: 12px;
+}
+
+.popup-loading-message {
+  color: #2e241c;
+}
+
+@media (max-width: 880px) {
+  body.popup-shell {
+    margin: 18px;
+  }
+
+  body.popup-shell .grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media print {
+  body.popup-shell--print {
+    margin: 20px;
+  }
+
+  body.popup-shell--print .card {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+}

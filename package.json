@@ -7,12 +7,14 @@
     "dev": "node server.mjs",
     "start": "node server.mjs",
     "verify:baseline": "node verify-exports.mjs --baseline",
+    "verify:deployment-security": "node scripts/verify-deployment-security.mjs",
     "verify:dxf": "node scripts/verify-dxf.mjs",
     "verify:exports": "node verify-exports.mjs",
     "verify:exports:full": "set VERIFY_EXPORTS_FULL_SKP=1&& node verify-exports.mjs"
   },
   "dependencies": {
     "earcut": "^3.0.2",
+    "leaflet": "1.9.4",
     "polygon-clipping": "^0.15.7",
     "proj4": "^2.20.4",
     "rhino3dm": "^8.17.0",

@@ -27,6 +27,7 @@ Recommended:
 ## 2. Production Runtime
 
 - Run the Node server behind HTTPS.
+- Publish the app port on `127.0.0.1` by default and expose it publicly only through a trusted reverse proxy, tunnel, or access layer.
 - Put the app behind a reverse proxy so large 3D export responses are handled safely.
 - Mount the contour dataset into the container instead of baking nationwide shapefiles into the image.
 - Enable gzip or brotli for HTML, JS, CSS, and JSON responses.
@@ -43,10 +44,13 @@ Recommended:
 
 Run these first from the repo root:
 
+- `npm run verify:deployment-security`
 - `npm run verify:baseline`
 - `npm run verify:dxf`
 
 The baseline script verifies the local hub route, feature route, health/config shape, security headers, progress-token guard, body-size limit, and radius limit without depending on live external APIs.
+
+The deployment-security script verifies the controlled-sharing defaults for bind settings, Compose exposure, release-gate docs, and local deployment files when they exist.
 
 Then run the live browser QA:
 
@@ -75,4 +79,5 @@ Then run the live browser QA:
 - Confirm building register keys are approved for the deployed server IP/domain policy
 - Keep a rollback build for the last known-good version
 - Capture one real parcel test set and reuse it as a regression checklist after each deployment
+- Check `docs/security-release-gates.md` before sharing the URL outside the core team
 - Re-run `npm run verify:baseline` after any route/UI/security change

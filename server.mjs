@@ -3151,6 +3151,47 @@ function pickPolygonFeature(features, location) {
   return scoredFeatures[0]?.feature || null;
 }
 
+function isRetriableUpstreamError(error) {
+  const message = String(error?.message || error || "");
+  return /Provider error: ERROR|429|504|ECONNRESET|fetch failed|socket hang up|ETIMEDOUT|timed out|terminated/i.test(
+    message
+  );
+}
+
+function waitForRetryDelay(delayMs) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
+}
+
+async function retryUpstreamOperation(operation, options = {}) {
+  const attempts = Math.max(1, Number(options?.attempts) || 1);
+  const label = String(options?.label || "upstream").trim();
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation(attempt);
+    } catch (error) {
+      lastError = error;
+
+      if (attempt >= attempts || !isRetriableUpstreamError(error)) {
+        throw error;
+      }
+
+      const delayMs = Math.min(1800, 300 * attempt);
+      console.warn(
+        `[upstream-retry] label=${label} attempt=${attempt}/${attempts} delayMs=${delayMs} reason=${
+          error instanceof Error ? error.message : error
+        }`
+      );
+      await waitForRetryDelay(delayMs);
+    }
+  }
+
+  throw lastError || new Error(`${label} request failed.`);
+}
+
 async function fetchVWorldFeatureCollection(
   dataLayer,
   geomFilter,
@@ -3159,39 +3200,47 @@ async function fetchVWorldFeatureCollection(
   size = 50,
   page = 1
 ) {
-  const params = new URLSearchParams({
-    key: config.vworldApiKey,
-    service: "data",
-    request: "GetFeature",
-    version: "2.0",
-    data: dataLayer,
-    geomFilter,
-    buffer: String(buffer),
-    geometry: "true",
-    size: String(size),
-    page: String(page),
-    format: "json",
-    crs: "EPSG:4326",
-  });
+  return retryUpstreamOperation(
+    async () => {
+      const params = new URLSearchParams({
+        key: config.vworldApiKey,
+        service: "data",
+        request: "GetFeature",
+        version: "2.0",
+        data: dataLayer,
+        geomFilter,
+        buffer: String(buffer),
+        geometry: "true",
+        size: String(size),
+        page: String(page),
+        format: "json",
+        crs: "EPSG:4326",
+      });
 
-  if (config.vworldApiDomain) {
-    params.set("domain", config.vworldApiDomain);
-  }
+      if (config.vworldApiDomain) {
+        params.set("domain", config.vworldApiDomain);
+      }
 
-  const response = await fetchWithTimeout(
-    `https://api.vworld.kr/req/data?${params}`,
-    {},
+      const response = await fetchWithTimeout(
+        `https://api.vworld.kr/req/data?${params}`,
+        {},
+        {
+          requestLabel: "VWorld data request",
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`VWorld data request failed with ${response.status}`);
+      }
+
+      const payload = await response.json();
+      return parseFeatureCollection(payload);
+    },
     {
-      requestLabel: "VWorld data request",
+      attempts: 3,
+      label: `vworld:${dataLayer}:page${page}`,
     }
   );
-
-  if (!response.ok) {
-    throw new Error(`VWorld data request failed with ${response.status}`);
-  }
-
-  const payload = await response.json();
-  return parseFeatureCollection(payload);
 }
 
 async function fetchAllVWorldFeatureCollections(
@@ -4385,6 +4434,31 @@ function inferOsmRoadWidthMeters(highway = "") {
   }
 }
 
+function parseLooseNumber(value) {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : Number.NaN;
+  }
+
+  const normalized = String(value || "")
+    .trim()
+    .replace(/,/g, "")
+    .match(/-?\d+(?:\.\d+)?/)?.[0];
+  const numeric = Number(normalized || Number.NaN);
+  return Number.isFinite(numeric) ? numeric : Number.NaN;
+}
+
+function pickFirstFiniteNumber(values = []) {
+  for (const value of values) {
+    const numeric = parseLooseNumber(value);
+
+    if (Number.isFinite(numeric)) {
+      return numeric;
+    }
+  }
+
+  return Number.NaN;
+}
+
 function normalizeRoadFeature(feature, sourceLayer = "") {
   const properties = feature?.properties || {};
 
@@ -4454,28 +4528,36 @@ async function fetchOverpassRoadCollection(clipFeature) {
   way["highway"]["area"!~"yes"](${bounds.minLat},${bounds.minLng},${bounds.maxLat},${bounds.maxLng});
 );
 out geom;`;
-  const response = await fetchWithTimeout(
-    "https://overpass-api.de/api/interpreter",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "text/plain; charset=utf-8",
-        "User-Agent": "space-work/0.1 (local development)",
-      },
-      body,
+  return retryUpstreamOperation(
+    async () => {
+      const response = await fetchWithTimeout(
+        "https://overpass-api.de/api/interpreter",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            "User-Agent": "space-work/0.1 (local development)",
+          },
+          body,
+        },
+        {
+          requestLabel: "Overpass road request",
+          timeoutMs: OVERPASS_FETCH_TIMEOUT_MS,
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Overpass road request failed with ${response.status}`);
+      }
+
+      const payload = await response.json();
+      return mapOverpassRoadCollection(payload);
     },
     {
-      requestLabel: "Overpass road request",
-      timeoutMs: OVERPASS_FETCH_TIMEOUT_MS,
+      attempts: 2,
+      label: "overpass-roads",
     }
   );
-
-  if (!response.ok) {
-    throw new Error(`Overpass road request failed with ${response.status}`);
-  }
-
-  const payload = await response.json();
-  return mapOverpassRoadCollection(payload);
 }
 
 function buildVWorldBuildingAddress(properties) {
@@ -4492,8 +4574,43 @@ function buildVWorldBuildingAddress(properties) {
   return normalizeSystemAddress(parts.join(" "));
 }
 
+function buildOsmBuildingAddress(properties = {}) {
+  const fullAddress = normalizeSystemAddress(properties["addr:full"] || "");
+
+  if (fullAddress) {
+    return fullAddress;
+  }
+
+  const parts = [
+    properties["addr:province"],
+    properties["addr:city"],
+    properties["addr:district"],
+    properties["addr:subdistrict"],
+    properties["addr:street"],
+    properties["addr:housenumber"],
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+
+  return normalizeSystemAddress(parts.join(" "));
+}
+
 function estimateBuildingHeightMeters(properties) {
-  const floors = Number(properties.gro_flo_co || 0);
+  const explicitHeight = pickFirstFiniteNumber([
+    properties.height,
+    properties.building_height,
+    properties["building:height"],
+  ]);
+
+  if (Number.isFinite(explicitHeight) && explicitHeight > 1 && explicitHeight <= 500) {
+    return Number(explicitHeight.toFixed(2));
+  }
+
+  const floors = pickFirstFiniteNumber([
+    properties.gro_flo_co,
+    properties["building:levels"],
+    properties.levels,
+  ]);
 
   if (Number.isFinite(floors) && floors > 0) {
     return Number((floors * 3.4 + 1.2).toFixed(2));
@@ -4514,14 +4631,35 @@ function normalizeBuildingFeature(feature, parcelFeature = null) {
     properties: {
       ...properties,
       buildingId: String(
-        properties.bd_mgt_sn || properties.pk || feature?.id || ""
+        properties.bd_mgt_sn ||
+          properties.pk ||
+          properties.osmId ||
+          feature?.id ||
+          ""
       ).trim(),
       buildingName: String(
-        properties.buld_nm || properties.buld_nm_dc || ""
+        properties.buld_nm ||
+          properties.buld_nm_dc ||
+          properties.name ||
+          properties.NAME ||
+          ""
       ).trim(),
-      roadAddress: buildVWorldBuildingAddress(properties),
-      aboveGroundFloors: Number(properties.gro_flo_co || 0),
-      belowGroundFloors: Number(properties.und_flo_co || 0),
+      roadAddress:
+        buildVWorldBuildingAddress(properties) || buildOsmBuildingAddress(properties),
+      aboveGroundFloors: Number(
+        pickFirstFiniteNumber([
+          properties.gro_flo_co,
+          properties["building:levels"],
+          properties.levels,
+        ]) || 0
+      ),
+      belowGroundFloors: Number(
+        pickFirstFiniteNumber([
+          properties.und_flo_co,
+          properties["building:levels:underground"],
+          properties.underground_levels,
+        ]) || 0
+      ),
       heightMeters: estimateBuildingHeightMeters(properties),
       footprintAreaSqm: Number(
         (ring ? polygonAreaSquareMeters(ring) : 0).toFixed(2)
@@ -4534,9 +4672,89 @@ function normalizeBuildingFeature(feature, parcelFeature = null) {
       ) || null,
       targetParcelGroupId: String(targetParcelProperties.groupId || "").trim(),
       targetParcelGroupName: String(targetParcelProperties.groupName || "").trim(),
-      sourceLayer: "lt_c_spbd",
+      sourceLayer: String(properties.sourceLayer || "lt_c_spbd").trim() || "lt_c_spbd",
     },
   };
+}
+
+function mapOverpassBuildingCollection(payload) {
+  const elements = Array.isArray(payload?.elements) ? payload.elements : [];
+
+  return featureCollection(
+    elements
+      .filter(
+        (element) =>
+          element?.type === "way" &&
+          Array.isArray(element?.geometry) &&
+          element.geometry.length >= 3
+      )
+      .map((element) => {
+        const ring = element.geometry.map((point) => [
+          Number(point?.lon),
+          Number(point?.lat),
+        ]);
+
+        if (
+          ring.some(
+            (point) => !Array.isArray(point) || !Number.isFinite(point[0]) || !Number.isFinite(point[1])
+          )
+        ) {
+          return null;
+        }
+
+        return polygonFeature(ring, {
+          ...(element?.tags || {}),
+          osmId: String(element.id || ""),
+          sourceLayer: "overpass-building",
+        });
+      })
+      .filter(Boolean)
+  );
+}
+
+async function fetchOverpassBuildingCollection(clipFeature) {
+  const clipRing = getOuterRing(clipFeature);
+
+  if (!clipRing?.length) {
+    return featureCollection([]);
+  }
+
+  const bounds = polygonBounds(clipRing);
+  const body = `[out:json][timeout:25];
+(
+  way["building"]["area"!~"yes"](${bounds.minLat},${bounds.minLng},${bounds.maxLat},${bounds.maxLng});
+);
+out geom;`;
+  return retryUpstreamOperation(
+    async () => {
+      const response = await fetchWithTimeout(
+        "https://overpass-api.de/api/interpreter",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            "User-Agent": "space-work/0.1 (local development)",
+          },
+          body,
+        },
+        {
+          requestLabel: "Overpass building request",
+          timeoutMs: OVERPASS_FETCH_TIMEOUT_MS,
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Overpass building request failed with ${response.status}`);
+      }
+
+      const payload = await response.json();
+      return mapOverpassBuildingCollection(payload);
+    },
+    {
+      attempts: 2,
+      label: "overpass-buildings",
+    }
+  );
 }
 
 function attachBuildingRegisterMetadata(
@@ -7338,6 +7556,93 @@ function clipRoadFeatureToClipBoundary(feature, clipFeature, location, geometryT
   };
 }
 
+function buildRoadContextResult(
+  features,
+  provider,
+  geometryType,
+  location,
+  note,
+  isFallback = false
+) {
+  if (geometryType !== "polygon") {
+    const surfaceCollection = buildRoadSurfaceFeatureCollection(features, location);
+
+    if (surfaceCollection.features.length) {
+      return {
+        collection: surfaceCollection,
+        provider,
+        isFallback,
+        note: `Loaded ${surfaceCollection.features.length} road surface polygon(s) from ${provider} line data.`,
+      };
+    }
+  }
+
+  return {
+    collection: featureCollection(features),
+    provider,
+    isFallback,
+    note,
+  };
+}
+
+async function finalizeBuildingContextCollection(
+  features,
+  provider,
+  isFallback,
+  note,
+  targetParcelFeatures,
+  config
+) {
+  const filteredFeatures = [...features].sort((left, right) => {
+    const targetDelta =
+      Number(right.properties?.isTarget || false) -
+      Number(left.properties?.isTarget || false);
+
+    if (targetDelta) {
+      return targetDelta;
+    }
+
+    return (
+      Number(right.properties?.footprintAreaSqm || 0) -
+      Number(left.properties?.footprintAreaSqm || 0)
+    );
+  });
+  const registerParcelFeature =
+    targetParcelFeatures.length === 1 ? targetParcelFeatures[0] : null;
+  const parcelReference = decomposePnu(registerParcelFeature?.properties?.pnu);
+  let enrichedFeatures = filteredFeatures;
+  let registerMatchedCount = 0;
+
+  if (parcelReference && config.buildingHubServiceKey) {
+    try {
+      const registerItems = await fetchBuildingRegisterSummary(
+        parcelReference,
+        config
+      );
+      enrichedFeatures = attachBuildingRegisterMetadata(
+        filteredFeatures,
+        registerItems,
+        registerParcelFeature
+      );
+      registerMatchedCount = enrichedFeatures.filter(
+        (feature) => feature.properties?.registerMatched
+      ).length;
+    } catch {
+      enrichedFeatures = filteredFeatures;
+    }
+  }
+
+  return {
+    collection: featureCollection(enrichedFeatures),
+    provider,
+    isFallback,
+    note:
+      registerMatchedCount > 0
+        ? `${note} Matched ${registerMatchedCount} building-register record(s).`
+        : note,
+  };
+}
+
 async function resolveRoadContext(location, clipFeature, options, config) {
   if (options.includeRoads !== true) {
     return {
@@ -7348,93 +7653,89 @@ async function resolveRoadContext(location, clipFeature, options, config) {
     };
   }
 
-  if (!config.vworldApiKey) {
-    return {
-      collection: featureCollection([]),
-      provider: "unavailable",
-      isFallback: true,
-      note: "VWorld key missing; road context unavailable.",
-    };
-  }
-
   const queryPlan = buildBuildingQueryPlan(location, clipFeature);
   const fallbackBoundaryCandidate = ROAD_LAYER_CANDIDATES.find(
     (candidate) => candidate.layer === "lt_l_sprd"
   );
+  const hasVWorldKey = Boolean(config.vworldApiKey);
 
-  for (const candidate of ROAD_LAYER_CANDIDATES) {
-    if (candidate.layer === "lt_l_sprd") {
-      continue;
-    }
+  if (hasVWorldKey) {
+    for (const candidate of ROAD_LAYER_CANDIDATES) {
+      if (candidate.layer === "lt_l_sprd") {
+        continue;
+      }
 
-    try {
-      const featureMap = new Map();
+      try {
+        const featureMap = new Map();
 
-      for (const query of queryPlan) {
-        const collection = await fetchAllVWorldFeatureCollections(
-          candidate.layer,
-          `POINT(${query.lng} ${query.lat})`,
-          Math.max(120, query.buffer),
-          config,
-          250,
-          Math.max(3, query.maxPages)
-        );
+        for (const query of queryPlan) {
+          const collection = await fetchAllVWorldFeatureCollections(
+            candidate.layer,
+            `POINT(${query.lng} ${query.lat})`,
+            Math.max(120, query.buffer),
+            config,
+            250,
+            Math.max(3, query.maxPages)
+          );
 
-        for (const feature of collection.features || []) {
-          const normalizedFeature = normalizeRoadFeature(feature, candidate.layer);
-          const key = buildFeatureMapKey(normalizedFeature, [
-            "roadId",
-            "ROAD_ID",
-            "link_id",
-            "LINK_ID",
-          ]);
+          for (const feature of collection.features || []) {
+            const normalizedFeature = normalizeRoadFeature(feature, candidate.layer);
+            const key = buildFeatureMapKey(normalizedFeature, [
+              "roadId",
+              "ROAD_ID",
+              "link_id",
+              "LINK_ID",
+            ]);
 
-          if (!featureMap.has(key)) {
-            featureMap.set(key, normalizedFeature);
+            if (!featureMap.has(key)) {
+              featureMap.set(key, normalizedFeature);
+            }
           }
         }
-      }
 
-      const filteredFeatures = [...featureMap.values()]
-        .map((feature) =>
-          clipRoadFeatureToClipBoundary(
-            {
-              ...feature,
-              properties: {
-                ...(feature.properties || {}),
-                sourceLayer: candidate.layer,
+        const filteredFeatures = [...featureMap.values()]
+          .map((feature) =>
+            clipRoadFeatureToClipBoundary(
+              {
+                ...feature,
+                properties: {
+                  ...(feature.properties || {}),
+                  sourceLayer: candidate.layer,
+                },
               },
-            },
-            clipFeature,
-            location,
-            candidate.geometryType
+              clipFeature,
+              location,
+              candidate.geometryType
+            )
           )
-        )
-        .filter(Boolean)
-        .filter((feature) =>
-          candidate.geometryType === "polygon"
-            ? polygonAreaSquareMeters(getOuterRing(feature)) > 4
-            : getLineStringsFromGeometry(feature.geometry).some(
-                (lineString) => lineString.length >= 2
-              )
+          .filter(Boolean)
+          .filter((feature) =>
+            candidate.geometryType === "polygon"
+              ? polygonAreaSquareMeters(getOuterRing(feature)) > 4
+              : getLineStringsFromGeometry(feature.geometry).some(
+                  (lineString) => lineString.length >= 2
+                )
+          );
+
+        console.log(
+          `[roads] layer=${candidate.layer} features=${filteredFeatures.length} geometry=${candidate.geometryType}`
         );
 
-      console.log(
-        `[roads] layer=${candidate.layer} features=${filteredFeatures.length} geometry=${candidate.geometryType}`
-      );
-
-      if (filteredFeatures.length) {
-        return {
-          collection: featureCollection(filteredFeatures),
-          provider: candidate.provider,
-          isFallback: false,
-          note: `Loaded ${filteredFeatures.length} road feature(s) from ${candidate.layer}.`,
-        };
+        if (filteredFeatures.length) {
+          return buildRoadContextResult(
+            filteredFeatures,
+            candidate.provider,
+            candidate.geometryType,
+            location,
+            `Loaded ${filteredFeatures.length} road feature(s) from ${candidate.layer}.`,
+            false
+          );
+        }
+      } catch (error) {
+        console.warn(
+          `[roads] layer=${candidate.layer} failed: ${error instanceof Error ? error.message : error}`
+        );
       }
-    } catch (error) {
-      console.warn(
-        `[roads] layer=${candidate.layer} failed: ${error instanceof Error ? error.message : error}`
-      );
     }
   }
 
@@ -7460,12 +7761,14 @@ async function resolveRoadContext(location, clipFeature, options, config) {
     console.log(`[roads] layer=overpass-highway features=${filteredFeatures.length} geometry=line`);
 
     if (filteredFeatures.length) {
-      return {
-        collection: featureCollection(filteredFeatures),
-        provider: "openstreetmap-overpass",
-        isFallback: false,
-        note: `Loaded ${filteredFeatures.length} road feature(s) from Overpass.`,
-      };
+      return buildRoadContextResult(
+        filteredFeatures,
+        "openstreetmap-overpass",
+        "line",
+        location,
+        `Loaded ${filteredFeatures.length} road feature(s) from Overpass.`,
+        true
+      );
     }
   } catch (error) {
     console.warn(
@@ -7473,7 +7776,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
     );
   }
 
-  if (fallbackBoundaryCandidate) {
+  if (hasVWorldKey && fallbackBoundaryCandidate) {
     try {
       const featureMap = new Map();
 
@@ -7532,12 +7835,14 @@ async function resolveRoadContext(location, clipFeature, options, config) {
       );
 
       if (filteredFeatures.length) {
-        return {
-          collection: featureCollection(filteredFeatures),
-          provider: fallbackBoundaryCandidate.provider,
-          isFallback: false,
-          note: `Loaded ${filteredFeatures.length} road feature(s) from ${fallbackBoundaryCandidate.layer}.`,
-        };
+        return buildRoadContextResult(
+          filteredFeatures,
+          fallbackBoundaryCandidate.provider,
+          fallbackBoundaryCandidate.geometryType,
+          location,
+          `Loaded ${filteredFeatures.length} road feature(s) from ${fallbackBoundaryCandidate.layer}.`,
+          true
+        );
       }
     } catch (error) {
       console.warn(
@@ -7550,8 +7855,53 @@ async function resolveRoadContext(location, clipFeature, options, config) {
     collection: featureCollection([]),
     provider: "unavailable",
     isFallback: true,
-    note: "No road-context layer returned usable features for the current area.",
+    note: hasVWorldKey
+      ? "No road-context layer returned usable features for the current area."
+      : "Road context unavailable from Overpass and no VWorld key was configured.",
   };
+}
+
+async function resolveOverpassBuildingContext(
+  location,
+  clipFeature,
+  targetParcelFeatures,
+  config,
+  fallbackReason = ""
+) {
+  try {
+    const clipRing = getOuterRing(clipFeature);
+    const collection = await fetchOverpassBuildingCollection(clipFeature);
+    const filteredFeatures = (collection.features || [])
+      .map((feature) => clipFeatureToRing(feature, clipRing, location))
+      .filter(Boolean)
+      .map((feature) => normalizeBuildingFeature(feature, targetParcelFeatures))
+      .filter((feature) => Number(feature.properties?.footprintAreaSqm || 0) > 2);
+
+    console.log(
+      `[buildings] layer=overpass-building features=${filteredFeatures.length} geometry=polygon`
+    );
+
+    if (!filteredFeatures.length) {
+      return null;
+    }
+
+    const notePrefix = fallbackReason ? `${fallbackReason} ` : "";
+    return finalizeBuildingContextCollection(
+      filteredFeatures,
+      "openstreetmap-overpass",
+      true,
+      `${notePrefix}Loaded ${filteredFeatures.length} building footprint(s) from Overpass.`,
+      targetParcelFeatures,
+      config
+    );
+  } catch (error) {
+    console.warn(
+      `[buildings] layer=overpass-building failed: ${
+        error instanceof Error ? error.message : error
+      }`
+    );
+    return null;
+  }
 }
 
 async function resolveBuildingContext(
@@ -7560,112 +7910,92 @@ async function resolveBuildingContext(
   parcelFeature,
   config
 ) {
-  if (!config.vworldApiKey) {
-    return {
-      collection: featureCollection([]),
-      provider: "unavailable",
-      isFallback: true,
-      note: "VWorld key missing; building context unavailable.",
-    };
-  }
+  const clipRing = getOuterRing(clipFeature);
+  const targetParcelFeatures = buildTargetParcelGroupFeatures(
+    Array.isArray(parcelFeature) ? parcelFeature : parcelFeature ? [parcelFeature] : []
+  );
+  const queryPlan = buildBuildingQueryPlan(location, clipFeature);
+  let vworldError = null;
 
-  try {
-    const clipRing = getOuterRing(clipFeature);
-    const queryPlan = buildBuildingQueryPlan(location, clipFeature);
-    const featureMap = new Map();
-    const targetParcelFeatures = buildTargetParcelGroupFeatures(
-      Array.isArray(parcelFeature) ? parcelFeature : parcelFeature ? [parcelFeature] : []
-    );
+  if (config.vworldApiKey) {
+    try {
+      const featureMap = new Map();
 
-    for (const query of queryPlan) {
-      const collection = await fetchAllVWorldFeatureCollections(
-        "lt_c_spbd",
-        `POINT(${query.lng} ${query.lat})`,
-        query.buffer,
-        config,
-        250,
-        query.maxPages
+      for (const query of queryPlan) {
+        const collection = await fetchAllVWorldFeatureCollections(
+          "lt_c_spbd",
+          `POINT(${query.lng} ${query.lat})`,
+          query.buffer,
+          config,
+          250,
+          query.maxPages
+        );
+
+        for (const feature of collection.features || []) {
+          const key = String(
+            feature?.properties?.bd_mgt_sn ||
+              feature?.properties?.pk ||
+              feature?.id ||
+              JSON.stringify(feature?.geometry || {})
+          );
+
+          if (!featureMap.has(key)) {
+            featureMap.set(key, feature);
+          }
+        }
+      }
+
+      const filteredFeatures = [...featureMap.values()]
+        .map((feature) => clipFeatureToRing(feature, clipRing, location))
+        .filter(Boolean)
+        .map((feature) => normalizeBuildingFeature(feature, targetParcelFeatures))
+        .filter((feature) => Number(feature.properties?.footprintAreaSqm || 0) > 2);
+
+      console.log(
+        `[buildings] layer=lt_c_spbd features=${filteredFeatures.length} geometry=polygon`
       );
 
-      for (const feature of collection.features) {
-        const key = String(
-          feature?.properties?.bd_mgt_sn ||
-            feature?.properties?.pk ||
-            feature?.id ||
-            JSON.stringify(feature?.geometry || {})
-        );
-
-        if (!featureMap.has(key)) {
-          featureMap.set(key, feature);
-        }
-      }
-    }
-
-    const filteredFeatures = [...featureMap.values()]
-      .map((feature) => clipFeatureToRing(feature, clipRing, location))
-      .filter(Boolean)
-      .map((feature) => normalizeBuildingFeature(feature, targetParcelFeatures))
-      .filter((feature) => Number(feature.properties?.footprintAreaSqm || 0) > 2)
-      .sort((left, right) => {
-        const targetDelta =
-          Number(right.properties?.isTarget || false) -
-          Number(left.properties?.isTarget || false);
-
-        if (targetDelta) {
-          return targetDelta;
-        }
-
-        return (
-          Number(right.properties?.footprintAreaSqm || 0) -
-          Number(left.properties?.footprintAreaSqm || 0)
-        );
-      });
-
-    const registerParcelFeature =
-      targetParcelFeatures.length === 1 ? targetParcelFeatures[0] : null;
-    const parcelReference = decomposePnu(registerParcelFeature?.properties?.pnu);
-    let enrichedFeatures = filteredFeatures;
-    let registerMatchedCount = 0;
-
-    if (parcelReference && config.buildingHubServiceKey) {
-      try {
-        const registerItems = await fetchBuildingRegisterSummary(
-          parcelReference,
+      if (filteredFeatures.length) {
+        return finalizeBuildingContextCollection(
+          filteredFeatures,
+          "vworld",
+          false,
+          `Loaded ${filteredFeatures.length} building footprint(s) from VWorld.`,
+          targetParcelFeatures,
           config
         );
-        enrichedFeatures = attachBuildingRegisterMetadata(
-          filteredFeatures,
-          registerItems,
-          registerParcelFeature
-        );
-        registerMatchedCount = enrichedFeatures.filter(
-          (feature) => feature.properties?.registerMatched
-        ).length;
-      } catch {
-        enrichedFeatures = filteredFeatures;
       }
-    }
 
-    return {
-      collection: featureCollection(enrichedFeatures),
-      provider: "vworld",
-      isFallback: false,
-      note:
-        registerMatchedCount > 0
-          ? `Loaded ${enrichedFeatures.length} building footprints and matched ${registerMatchedCount} building-register records.`
-          : `Loaded ${enrichedFeatures.length} building footprints from VWorld.`,
-    };
-  } catch (error) {
-    return {
-      collection: featureCollection([]),
-      provider: "unavailable",
-      isFallback: true,
-      note:
-        error instanceof Error
-          ? `Building context request failed: ${error.message}`
-          : "Building context request failed.",
-    };
+      vworldError = new Error("VWorld returned no usable building footprints.");
+    } catch (error) {
+      vworldError =
+        error instanceof Error ? error : new Error("Building context request failed.");
+    }
+  } else {
+    vworldError = new Error("VWorld key missing.");
   }
+
+  const fallbackReason = vworldError
+    ? `VWorld building context failed: ${vworldError.message}.`
+    : "";
+  const overpassResult = await resolveOverpassBuildingContext(
+    location,
+    clipFeature,
+    targetParcelFeatures,
+    config,
+    fallbackReason
+  );
+
+  if (overpassResult) {
+    return overpassResult;
+  }
+
+  return {
+    collection: featureCollection([]),
+    provider: "unavailable",
+    isFallback: true,
+    note: fallbackReason || "Building context request failed.",
+  };
 }
 
 async function buildSiteContext(body, config, reportProgress = null) {
@@ -11326,10 +11656,10 @@ function buildRoadFeatureFootprintMultiPolygon(feature, center) {
   return multiPolygon;
 }
 
-function buildRoadFootprintMultiPolygon(siteContext, center) {
+function buildRoadFootprintMultiPolygonFromFeatures(features, center) {
   const footprintPolygons = [];
 
-  for (const feature of siteContext.roads?.features || []) {
+  for (const feature of features || []) {
     footprintPolygons.push(...buildRoadFeatureFootprintMultiPolygon(feature, center));
   }
 
@@ -11345,6 +11675,67 @@ function buildRoadFootprintMultiPolygon(siteContext, center) {
     );
     return footprintPolygons;
   }
+}
+
+function buildRoadFootprintMultiPolygon(siteContext, center) {
+  return buildRoadFootprintMultiPolygonFromFeatures(
+    siteContext?.roads?.features || [],
+    center
+  );
+}
+
+function buildRoadSurfaceFeatureCollection(features, location) {
+  const center = {
+    lat: Number(location?.lat),
+    lng: Number(location?.lng),
+  };
+
+  if (!Number.isFinite(center.lat) || !Number.isFinite(center.lng)) {
+    return featureCollection([]);
+  }
+
+  const multiPolygon = buildRoadFootprintMultiPolygonFromFeatures(
+    features,
+    center
+  );
+  const surfaceFeatures = [];
+
+  for (let index = 0; index < multiPolygon.length; index += 1) {
+    const polygon = multiPolygon[index];
+    const polygonCoordinates = (polygon || [])
+      .map((ring) =>
+        closeRing(
+          (ring || [])
+            .map(([xMeters, yMeters]) => lngLatFromMeters(center, xMeters, yMeters))
+            .filter(
+              (point) =>
+                Array.isArray(point) &&
+                Number.isFinite(point[0]) &&
+                Number.isFinite(point[1])
+            )
+        )
+      )
+      .filter((ring) => ring.length >= 4);
+
+    if (!polygonCoordinates.length) {
+      continue;
+    }
+
+    surfaceFeatures.push({
+      type: "Feature",
+      properties: {
+        roadId: `road-surface-${index + 1}`,
+        sourceLayer: "derived-road-surface",
+        surfaceDerived: true,
+      },
+      geometry: {
+        type: "Polygon",
+        coordinates: polygonCoordinates,
+      },
+    });
+  }
+
+  return featureCollection(surfaceFeatures);
 }
 
 function getCachedRoadFootprintMultiPolygon(siteContext, center) {
@@ -16775,6 +17166,7 @@ export {
   buildContourBandGroups,
   buildDxfFromSiteContext,
   buildObjFromSiteContext,
+  buildRoadSurfaceFeatureCollection,
   buildSketchUpPayloadFromSiteContext,
   buildSkpFromSiteContext,
   buildSkpFromSiteContextWithRetry,

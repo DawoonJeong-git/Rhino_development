@@ -7,8 +7,10 @@ services:
     restart: unless-stopped
     env_file:
       - .env.production
+    environment:
+      BIND_HOST: "${BIND_HOST:-0.0.0.0}"
     ports:
-      - "${PORT:-3000}:3000"
+      - "${HOST_BIND_IP:-127.0.0.1}:${PORT:-3000}:3000"
     volumes:
       - "${TERRAIN_CONTOUR_HOST_PATH}:/app/data/contours:ro"
     healthcheck:

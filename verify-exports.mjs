@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createServer as createHttpServer } from "node:http";
+import path from "node:path";
 import process from "node:process";
 import {
   createApp,
@@ -7,6 +9,9 @@ import {
   buildSketchUpPayloadFromSiteContext,
   buildObjFromSiteContext,
   buildSkpFromSiteContextWithRetry,
+  fetchWithTimeout,
+  isPathInsideDirectory,
+  normalizePublicError,
 } from "./server.mjs";
 
 const BASE_URL = process.env.SITE_CONTEXT_BASE_URL || "http://127.0.0.1:3000";
@@ -59,8 +64,66 @@ const CASES = [
   },
 ].filter((testCase) => CASE_FILTER.size === 0 || CASE_FILTER.has(testCase.name));
 
+function assertDefaultCspShape(csp, label) {
+  const value = String(csp || "");
+
+  assert.match(value, /script-src 'self'/, `${label} should keep self as a script source.`);
+  assert.match(value, /style-src 'self'(;|$)/, `${label} should keep stylesheets self-hosted.`);
+  assert.match(value, /connect-src 'self'/, `${label} should keep same-origin fetch access.`);
+  assert.doesNotMatch(
+    value,
+    /unpkg\.com/i,
+    `${label} should not allow third-party CDN hosts such as unpkg.`
+  );
+  assert.match(
+    value,
+    /static\.cloudflareinsights\.com/i,
+    `${label} should allow Cloudflare analytics script injection when enabled.`
+  );
+  assert.match(
+    value,
+    /cloudflareinsights\.com/i,
+    `${label} should allow Cloudflare analytics beacons when enabled.`
+  );
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function createTimeoutProbeServer() {
+  const server = createHttpServer((request, response) => {
+    if (request.url === "/fast") {
+      response.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+      });
+      response.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    setTimeout(() => {
+      response.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+      });
+      response.end(JSON.stringify({ ok: true }));
+    }, 150);
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  const address = server.address();
+
+  if (!address || typeof address === "string") {
+    throw new Error("Timeout probe server did not expose a TCP port.");
+  }
+
+  return {
+    server,
+    baseUrl: `http://127.0.0.1:${address.port}`,
+  };
 }
 
 function isRetriableFetchError(error) {
@@ -228,7 +291,9 @@ async function verifyCase(testCase) {
 async function runBaselineVerification() {
   const baseUrl = `http://127.0.0.1:${BASELINE_PORT}`;
   const previousPort = process.env.PORT;
+  const previousBindHost = process.env.BIND_HOST;
   process.env.PORT = String(BASELINE_PORT);
+  process.env.BIND_HOST = "127.0.0.1";
   const app = await createApp();
   const server = app?.server;
   const multiParcelSelection = [
@@ -328,15 +393,78 @@ async function runBaselineVerification() {
       /\/max-mass/,
       "Hub page should link to the max-mass route."
     );
-    assert.ok(
-      hubResponse.headers.get("content-security-policy"),
-      "Hub page should send a CSP header."
-    );
+    const hubCsp = hubResponse.headers.get("content-security-policy");
+    assert.ok(hubCsp, "Hub page should send a CSP header.");
     assert.equal(
       hubResponse.headers.get("x-content-type-options"),
       "nosniff",
       "Hub page should send nosniff header."
     );
+    assert.doesNotMatch(
+      String(hubCsp),
+      /style-src[^;]*'unsafe-inline'/,
+      "Hub page should not allow inline styles in the default CSP."
+    );
+    assertDefaultCspShape(hubCsp, "Hub page CSP");
+    assert.equal(
+      isPathInsideDirectory(
+        path.join(process.cwd(), "public"),
+        path.join(process.cwd(), "public-baseline-escape", "probe.txt")
+      ),
+      false,
+      "Static path guard should reject sibling paths that only share the public prefix."
+    );
+    const timeoutProbe = await createTimeoutProbeServer();
+
+    try {
+      const fastProbeResponse = await fetchWithTimeout(
+        `${timeoutProbe.baseUrl}/fast`,
+        {},
+        {
+          requestLabel: "Fast timeout probe",
+          timeoutMs: 200,
+        }
+      );
+      assert.equal(
+        fastProbeResponse.status,
+        200,
+        "Outbound fetch helper should allow fast responses."
+      );
+      await assert.rejects(
+        () =>
+          fetchWithTimeout(`${timeoutProbe.baseUrl}/slow`, {}, {
+            requestLabel: "Slow timeout probe",
+            timeoutMs: 50,
+          }),
+        /timed out after/i,
+        "Outbound fetch helper should abort slow upstream responses."
+      );
+      const normalizedTimeoutError = normalizePublicError(
+        new Error("Open-Meteo elevation request timed out after 15s.")
+      );
+      assert.equal(
+        normalizedTimeoutError.statusCode,
+        504,
+        "Public error normalization should map upstream timeouts to 504."
+      );
+      assert.match(
+        normalizedTimeoutError.message,
+        /외부 연계 서비스 응답이 지연/,
+        "Public error normalization should provide a user-safe timeout message."
+      );
+      const normalizedProviderError = normalizePublicError(
+        new Error("VWorld data request failed with 503")
+      );
+      assert.equal(
+        normalizedProviderError.statusCode,
+        502,
+        "Public error normalization should map upstream provider failures to 502."
+      );
+    } finally {
+      await new Promise((resolve) => {
+        timeoutProbe.server.close(resolve);
+      });
+    }
 
     const featureResponse = await fetch(`${baseUrl}/contour3dmodel`);
     const featureHtml = await featureResponse.text();
@@ -350,6 +478,74 @@ async function runBaselineVerification() {
     assert.match(featureHtml, /세움터 열기/, "Building register CTA should remain visible.");
     assert.match(featureHtml, /필지 그룹 분리/, "Split parcel option should remain visible.");
     assert.match(featureHtml, /모델 미리보기/, "Preview CTA should remain visible.");
+
+    assert.doesNotMatch(
+      featureHtml,
+      /unpkg\.com/i,
+      "Feature page should no longer reference unpkg-hosted frontend assets."
+    );
+    assert.match(
+      featureHtml,
+      /\/vendor\/leaflet\/leaflet\.css\?v=20260326-security4/,
+      "Feature page should reference the self-hosted Leaflet stylesheet."
+    );
+    assert.match(
+      featureHtml,
+      /\/vendor\/leaflet\/leaflet\.js\?v=20260326-security4/,
+      "Feature page should reference the self-hosted Leaflet script."
+    );
+
+    const handoffResponse = await fetch(
+      `${baseUrl}/handoff/eum?pnu=1111010100100010000&sggcd=11110&p_location=test`
+    );
+    const handoffCsp = handoffResponse.headers.get("content-security-policy");
+    assert.equal(
+      handoffResponse.status,
+      200,
+      "Handoff route should respond for CSP verification."
+    );
+    assert.doesNotMatch(
+      String(handoffCsp || ""),
+      /style-src[^;]*'unsafe-inline'/,
+      "Handoff route should no longer require inline style allowance."
+    );
+    assertDefaultCspShape(handoffCsp, "Handoff CSP");
+    const popupStylesResponse = await fetch(`${baseUrl}/popup.css`);
+    assert.equal(
+      popupStylesResponse.status,
+      200,
+      "Popup stylesheet should be served for popup and print windows."
+    );
+    const handoffStylesResponse = await fetch(`${baseUrl}/handoff.css`);
+    assert.equal(
+      handoffStylesResponse.status,
+      200,
+      "Handoff stylesheet should be served for the handoff routes."
+    );
+    const handoffScriptResponse = await fetch(`${baseUrl}/handoff-auto-submit.js`);
+    assert.equal(
+      handoffScriptResponse.status,
+      200,
+      "Handoff auto-submit script should be served for the handoff routes."
+    );
+    const leafletStylesResponse = await fetch(`${baseUrl}/vendor/leaflet/leaflet.css`);
+    assert.equal(
+      leafletStylesResponse.status,
+      200,
+      "Self-hosted Leaflet stylesheet should be served."
+    );
+    const leafletScriptResponse = await fetch(`${baseUrl}/vendor/leaflet/leaflet.js`);
+    assert.equal(
+      leafletScriptResponse.status,
+      200,
+      "Self-hosted Leaflet script should be served."
+    );
+    const leafletMarkerResponse = await fetch(`${baseUrl}/vendor/leaflet/images/marker-icon.png`);
+    assert.equal(
+      leafletMarkerResponse.status,
+      200,
+      "Self-hosted Leaflet marker assets should be served."
+    );
 
     const heritageResponse = await fetch(`${baseUrl}/heritage-risk`);
     const heritageHtml = await heritageResponse.text();
@@ -639,6 +835,21 @@ async function runBaselineVerification() {
       refinedContourCurves.every(Boolean),
       "SKP contour polylines should be exported as curves."
     );
+    const refinedDxfSiteContext = prepareSiteContextForExport(
+      syntheticContourSiteContext,
+      syntheticContourSiteContext.options,
+      "dxf"
+    );
+    assert.equal(
+      refinedDxfSiteContext?.stats?.effectiveContourDisplayInterval,
+      2,
+      "DXF export should preserve the native official contour display interval."
+    );
+    assert.deepEqual(
+      refinedDxfSiteContext?.contourLines,
+      syntheticContourSiteContext.contourLines,
+      "DXF export should preserve official contour geometries instead of regenerating grid contours."
+    );
 
     const exportCacheRequestBody = {
       location: syntheticContourSiteContext.location,
@@ -704,6 +915,11 @@ async function runBaselineVerification() {
             "health-shape",
             "config-shape",
             "security-headers",
+            "csp-no-inline-default",
+            "self-hosted-frontend-assets",
+            "static-path-guard",
+            "outbound-fetch-timeout",
+            "public-error-normalization",
             "progress-token-guard",
             "model-spec",
             "body-size-limit",
@@ -724,6 +940,12 @@ async function runBaselineVerification() {
       process.env.PORT = previousPort;
     } else {
       delete process.env.PORT;
+    }
+
+    if (typeof previousBindHost === "string") {
+      process.env.BIND_HOST = previousBindHost;
+    } else {
+      delete process.env.BIND_HOST;
     }
 
     if (server?.listening) {
