@@ -3479,9 +3479,9 @@ function scoreSearchItemQueryMatch(item, query) {
 
   if (hints.normalizedQuery) {
     if (parcelAddressKey && parcelAddressKey === hints.normalizedQuery) {
-      score += 1200;
+      score += 5000;
     } else if (roadAddressKey && roadAddressKey === hints.normalizedQuery) {
-      score += 700;
+      score += 4200;
     } else if (
       parcelAddressKey &&
       (parcelAddressKey.includes(hints.normalizedQuery) ||
