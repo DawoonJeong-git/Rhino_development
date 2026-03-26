@@ -23,7 +23,7 @@ function makeFeature(geometry, properties = {}) {
 }
 
 function parseDxfPairs(text) {
-  const values = String(text || "").trim().split(/\r\n/);
+  const values = String(text || "").trim().split(/\r?\n/);
   assert.equal(values.length % 2, 0, "DXF should contain code/value pairs.");
   const pairs = [];
 
@@ -34,33 +34,125 @@ function parseDxfPairs(text) {
   return pairs;
 }
 
-function collectLwPolylineEntities(text) {
+function collectSectionNames(text) {
+  const pairs = parseDxfPairs(text);
+  const sections = [];
+
+  for (let index = 0; index < pairs.length - 1; index += 1) {
+    const [code, value] = pairs[index];
+    const [nextCode, nextValue] = pairs[index + 1];
+
+    if (code === "0" && value === "SECTION" && nextCode === "2") {
+      sections.push(nextValue);
+      index += 1;
+    }
+  }
+
+  return sections;
+}
+
+function collectBlockRecordHandles(text) {
+  const pairs = parseDxfPairs(text);
+  const handles = new Map();
+  let inBlockRecordTable = false;
+
+  for (let index = 0; index < pairs.length; ) {
+    const [code, value] = pairs[index];
+    const [nextCode, nextValue] = pairs[index + 1] || [];
+
+    if (!inBlockRecordTable) {
+      if (code === "0" && value === "TABLE" && nextCode === "2" && nextValue === "BLOCK_RECORD") {
+        inBlockRecordTable = true;
+        index += 2;
+        continue;
+      }
+
+      index += 1;
+      continue;
+    }
+
+    if (code === "0" && value === "ENDTAB") {
+      break;
+    }
+
+    if (code === "0" && value === "BLOCK_RECORD") {
+      let handle = "";
+      let name = "";
+      index += 1;
+
+      while (index < pairs.length && pairs[index][0] !== "0") {
+        const [recordCode, recordValue] = pairs[index];
+
+        if (recordCode === "5") {
+          handle = recordValue;
+        } else if (recordCode === "2") {
+          name = recordValue;
+        }
+
+        index += 1;
+      }
+
+      if (name) {
+        handles.set(name, handle);
+      }
+
+      continue;
+    }
+
+    index += 1;
+  }
+
+  return handles;
+}
+
+function collectLineEntities(text) {
   const pairs = parseDxfPairs(text);
   const entities = [];
 
   for (let index = 0; index < pairs.length; ) {
     const [code, value] = pairs[index];
 
-    if (code === "0" && value === "LWPOLYLINE") {
+    if (code === "0" && value === "LINE") {
       const entity = {
+        handle: "",
+        owner: "",
+        layout: "",
         layer: "0",
-        closed: false,
-        elevation: 0,
-        vertexCount: 0,
+        subclasses: [],
+        startX: null,
+        startY: null,
+        startZ: 0,
+        endX: null,
+        endY: null,
+        endZ: 0,
       };
       index += 1;
 
       while (index < pairs.length && pairs[index][0] !== "0") {
         const [entityCode, entityValue] = pairs[index];
 
-        if (entityCode === "8") {
+        if (entityCode === "5") {
+          entity.handle = entityValue;
+        } else if (entityCode === "330") {
+          entity.owner = entityValue;
+        } else if (entityCode === "410") {
+          entity.layout = entityValue;
+        } else if (entityCode === "100") {
+          entity.subclasses.push(entityValue);
+        } else if (entityCode === "8") {
           entity.layer = entityValue;
-        } else if (entityCode === "70") {
-          entity.closed = (Number(entityValue) & 1) === 1;
-        } else if (entityCode === "38") {
-          entity.elevation = Number(entityValue);
         } else if (entityCode === "10") {
-          entity.vertexCount += 1;
+          entity.startX = Number(entityValue);
+        } else if (entityCode === "20") {
+          entity.startY = Number(entityValue);
+        } else if (entityCode === "30") {
+          entity.startZ = Number(entityValue);
+        } else if (entityCode === "11") {
+          entity.endX = Number(entityValue);
+        } else if (entityCode === "21") {
+          entity.endY = Number(entityValue);
+        } else if (entityCode === "31") {
+          entity.endZ = Number(entityValue);
         }
 
         index += 1;
@@ -74,6 +166,42 @@ function collectLwPolylineEntities(text) {
   }
 
   return entities;
+}
+
+function collectHeaderVariables(text) {
+  const pairs = parseDxfPairs(text);
+  const variables = new Map();
+  let inHeader = false;
+  let activeVariableName = "";
+
+  for (let index = 0; index < pairs.length; index += 1) {
+    const [code, value] = pairs[index];
+    const [nextCode, nextValue] = pairs[index + 1] || [];
+
+    if (!inHeader) {
+      if (code === "0" && value === "SECTION" && nextCode === "2" && nextValue === "HEADER") {
+        inHeader = true;
+        index += 1;
+      }
+      continue;
+    }
+
+    if (code === "0" && value === "ENDSEC") {
+      break;
+    }
+
+    if (code === "9") {
+      activeVariableName = value;
+      variables.set(activeVariableName, []);
+      continue;
+    }
+
+    if (activeVariableName) {
+      variables.get(activeVariableName)?.push([code, value]);
+    }
+  }
+
+  return variables;
 }
 
 function countByLayer(entities) {
@@ -229,60 +357,107 @@ const siteContext = {
 };
 
 const dxf = buildDxfFromSiteContext(siteContext);
-const entities = collectLwPolylineEntities(dxf);
+const entities = collectLineEntities(dxf);
 const layerCounts = countByLayer(entities);
+const headerVariables = collectHeaderVariables(dxf);
+const sectionNames = collectSectionNames(dxf);
+const blockRecordHandles = collectBlockRecordHandles(dxf);
+const modelSpaceHandle = blockRecordHandles.get("*Model_Space");
 
 assert.ok(dxf.includes("\r\n"), "DXF should use CRLF line endings.");
+assert.ok(
+  sectionNames.includes("HEADER") &&
+    sectionNames.includes("TABLES") &&
+    sectionNames.includes("BLOCKS") &&
+    sectionNames.includes("ENTITIES"),
+  "DXF should include HEADER, TABLES, BLOCKS, and ENTITIES sections."
+);
 assert.ok(
   dxf.includes("2\r\nLTYPE\r\n"),
   "DXF should define a linetype table for CAD compatibility."
 );
 assert.ok(
-  dxf.includes("2\r\n0\r\n70\r\n0\r\n62\r\n7\r\n6\r\nCONTINUOUS\r\n"),
-  "DXF should include the default layer 0."
+  dxf.includes("2\r\nBLOCK_RECORD\r\n"),
+  "DXF should define block records for model-space ownership."
 );
 assert.ok(
-  !dxf.includes("\r\n0\r\nPOLYLINE\r\n"),
-  "DXF should avoid legacy POLYLINE entities for the 2D export."
+  modelSpaceHandle,
+  "DXF should define a block-record handle for model space."
 );
 assert.ok(
-  !dxf.includes("\r\n0\r\nVERTEX\r\n"),
-  "DXF should avoid legacy VERTEX records for the 2D export."
+  headerVariables.get("$ACADVER")?.some(
+    ([code, value]) => code === "1" && value === "AC1015"
+  ),
+  "DXF should target the AC1015 flavor when emitting block records and entity handles."
+);
+assert.ok(
+  headerVariables.has("$EXTMIN") && headerVariables.has("$EXTMAX"),
+  "DXF header should include extents for zoom-to-fit importers."
+);
+assert.ok(
+  dxf.includes("\r\n0\r\nLINE\r\n"),
+  "DXF should emit visible line entities."
+);
+assert.ok(
+  dxf.includes("\r\n0\r\nBLOCK\r\n") && dxf.includes("\r\n0\r\nENDBLK\r\n"),
+  "DXF should define model/paper-space block sections."
+);
+assert.ok(
+  !dxf.includes("\r\n0\r\nLWPOLYLINE\r\n"),
+  "DXF should avoid LWPOLYLINE so CAD importers rely on explicit line entities."
 );
 
-assert.equal(layerCounts.CLIP_BOUNDARY, 1, "Clip boundary should export one closed loop.");
+assert.equal(layerCounts.CLIP_BOUNDARY, 4, "Clip boundary should export four line segments.");
 assert.equal(
   layerCounts.PARCEL_BOUNDARY,
-  2,
-  "Parcel boundary should preserve the outer ring and the hole."
+  8,
+  "Parcel boundary should preserve the outer ring and the hole as segments."
 );
 assert.equal(
   layerCounts.PARCEL_CONTEXT,
-  3,
+  12,
   "Parcel context should preserve all rings from multipolygon features."
 );
 assert.equal(
   layerCounts.BUILDINGS,
-  3,
+  12,
   "Building export should preserve multipolygon rings and holes."
 );
 assert.equal(
   layerCounts.TARGET_BUILDING,
-  1,
+  4,
   "Target building should export on its dedicated layer."
 );
-assert.equal(layerCounts.CONTOURS, 1, "Contour lines should export as open polylines.");
+assert.equal(layerCounts.CONTOURS, 1, "Contour lines should export as line segments.");
 
 const contourEntity = entities.find((entity) => entity.layer === "CONTOURS");
 assert.ok(contourEntity, "Contour entity should exist.");
-assert.equal(contourEntity.closed, false, "Contour entity should stay open.");
-assert.equal(contourEntity.elevation, 12, "Contour elevation should be preserved.");
+assert.equal(contourEntity.startZ, 12, "Contour start elevation should be preserved.");
+assert.equal(contourEntity.endZ, 12, "Contour end elevation should be preserved.");
 
-for (const entity of entities.filter((item) => item.layer !== "CONTOURS")) {
+for (const entity of entities) {
+  assert.ok(entity.handle, `Layer ${entity.layer} should have a DXF handle.`);
   assert.equal(
-    entity.closed,
-    true,
-    `Layer ${entity.layer} should export as a closed polyline.`
+    entity.owner,
+    modelSpaceHandle,
+    `Layer ${entity.layer} should belong to the model-space block record.`
+  );
+  assert.equal(
+    entity.layout,
+    "Model",
+    `Layer ${entity.layer} should target the model layout.`
+  );
+  assert.ok(
+    entity.subclasses.includes("AcDbEntity") &&
+      entity.subclasses.includes("AcDbLine"),
+    `Layer ${entity.layer} should declare AcDbEntity and AcDbLine subclasses.`
+  );
+  assert.ok(
+    Number.isFinite(entity.startX) &&
+      Number.isFinite(entity.startY) &&
+      Number.isFinite(entity.endX) &&
+      Number.isFinite(entity.endY),
+    `Layer ${entity.layer} should export finite line endpoints.`
   );
 }
 
@@ -291,8 +466,9 @@ console.log(
     {
       ok: true,
       entityCount: entities.length,
+      sectionNames,
       layerCounts,
-      contourElevation: contourEntity.elevation,
+      contourElevation: contourEntity.startZ,
     },
     null,
     2
