@@ -1,5 +1,5 @@
 param(
-  [string]$ProdRoot = $(if (Test-Path "C:\SpaceWork_deploy") { "C:\SpaceWork_deploy" } elseif (Test-Path "C:\Rhino_deploy") { "C:\Rhino_deploy" } else { "C:\SpaceWork_deploy" }),
+  [string]$ProdRoot = "C:\SpaceWork_deploy",
   [string]$Branch = "main"
 )
 

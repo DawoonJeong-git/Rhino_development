@@ -41,6 +41,8 @@ const ROAD_SURFACE_THICKNESS_METERS = 0.01;
 const TERRAIN_BAND_OVERLAP_METERS = 0.02;
 const SKETCHUP_METERS_TO_INCHES = 39.37007874015748;
 const SKETCHUP_EXPORT_TIMEOUT_MS = 1000 * 60 * 3;
+const SKETCHUP_EXPORT_EXIT_GRACE_MS = 15_000;
+const CHILD_PROCESS_FORCE_KILL_GRACE_MS = 5_000;
 const DEFAULT_ROAD_WIDTH_METERS = 6;
 const ROAD_SURFACE_MAX_SEGMENT_METERS = 3;
 const CONTOUR_BAND_UNION_MAX_SLICES = 12000;
@@ -12459,6 +12461,135 @@ function formatProcessExitCode(exitCode) {
   return `${exitCode} (0x${exitCode.toString(16).toUpperCase()})`;
 }
 
+function hasRunningChildProcess(childProcess) {
+  return (
+    childProcess &&
+    Number.isInteger(childProcess.pid) &&
+    childProcess.exitCode === null
+  );
+}
+
+function waitForChildProcessExit(childProcess, timeoutMs = 0) {
+  if (!hasRunningChildProcess(childProcess)) {
+    return Promise.resolve({
+      exitCode: childProcess?.exitCode ?? null,
+      signal: childProcess?.signalCode ?? null,
+      timedOut: false,
+    });
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeoutHandle = null;
+
+    const cleanup = () => {
+      childProcess.off("exit", handleExit);
+      childProcess.off("error", handleError);
+
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    };
+
+    const settle = (value, shouldReject = false) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+
+      if (shouldReject) {
+        reject(value);
+      } else {
+        resolve(value);
+      }
+    };
+
+    const handleExit = (exitCode, signal) => {
+      settle({
+        exitCode,
+        signal,
+        timedOut: false,
+      });
+    };
+
+    const handleError = (error) => {
+      settle(error, true);
+    };
+
+    childProcess.once("exit", handleExit);
+    childProcess.once("error", handleError);
+
+    if (childProcess.exitCode !== null) {
+      handleExit(childProcess.exitCode, childProcess.signalCode);
+      return;
+    }
+
+    if (timeoutMs > 0) {
+      timeoutHandle = setTimeout(() => {
+        settle({
+          exitCode: childProcess.exitCode,
+          signal: childProcess.signalCode,
+          timedOut: true,
+        });
+      }, timeoutMs);
+    }
+  });
+}
+
+async function ensureChildProcessTerminated(
+  childProcess,
+  {
+    label = "child process",
+    gracefulTimeoutMs = SKETCHUP_EXPORT_EXIT_GRACE_MS,
+    forceKillTimeoutMs = CHILD_PROCESS_FORCE_KILL_GRACE_MS,
+  } = {}
+) {
+  if (!hasRunningChildProcess(childProcess)) {
+    return;
+  }
+
+  const gracefulExit = await waitForChildProcessExit(
+    childProcess,
+    gracefulTimeoutMs
+  );
+
+  if (!gracefulExit.timedOut) {
+    return;
+  }
+
+  try {
+    childProcess.kill();
+  } catch {
+    // ignore kill errors and continue waiting for termination
+  }
+
+  const killedExit = await waitForChildProcessExit(
+    childProcess,
+    forceKillTimeoutMs
+  );
+
+  if (!killedExit.timedOut) {
+    return;
+  }
+
+  try {
+    childProcess.kill("SIGKILL");
+  } catch {
+    // ignore force-kill errors and continue waiting one last time
+  }
+
+  const forcedExit = await waitForChildProcessExit(
+    childProcess,
+    forceKillTimeoutMs
+  );
+
+  if (forcedExit.timedOut) {
+    throw new Error(`${label} did not exit after a forced termination attempt.`);
+  }
+}
+
 function createSketchUpRubyExportScript(payloadPath, outputPath, statusPath) {
   const rubyPath = (value) => JSON.stringify(String(value).replace(/\\/g, "/"));
 
@@ -12716,11 +12847,12 @@ async function buildSkpFromSiteContext(
   const rubyScriptPath = path.join(tempDirectory, "export-to-skp.rb");
   const outputPath = path.join(tempDirectory, "site-context.skp");
   const statusPath = path.join(tempDirectory, "status.txt");
+  let childProcess = null;
+  let childProcessLabel = "SKP export process";
 
   try {
     await writeFile(payloadPath, JSON.stringify(payload), "utf8");
 
-    let childProcess = null;
     let skpBuffer = null;
     const standaloneExporterPath = await findStandaloneSkpExporterPath(
       runtimeConfig
@@ -12749,6 +12881,7 @@ async function buildSkpFromSiteContext(
       );
 
       progress(34, "Legacy SketchUp 변환기를 실행하는 중입니다.");
+      childProcessLabel = "SketchUp export process";
       childProcess = launchSketchUpExportProcess(
         sketchUpExecutable,
         rubyScriptPath,
@@ -12768,6 +12901,7 @@ async function buildSkpFromSiteContext(
       }
 
       progress(34, "Standalone SKP 변환기를 실행하는 중입니다.");
+      childProcessLabel = "Standalone SKP exporter";
       childProcess = launchStandaloneSkpExporterProcess(
         standaloneExporterPath,
         payloadPath,
@@ -12785,6 +12919,11 @@ async function buildSkpFromSiteContext(
     progress(92, "SKP 파일을 수집하는 중입니다.");
     return Buffer.from(skpBuffer);
   } finally {
+    await ensureChildProcessTerminated(childProcess, {
+      label: childProcessLabel,
+    }).catch((error) => {
+      console.warn(`[skp-export] cleanup-warning ${error?.message || error}`);
+    });
     await rm(tempDirectory, { recursive: true, force: true }).catch(() => null);
   }
 }

@@ -495,6 +495,8 @@ h3 {
   gap: 16px;
   min-width: 0;
   min-height: 0;
+  height: 100%;
+  max-height: 100%;
   overflow: hidden;
   align-items: stretch;
 }
@@ -510,6 +512,7 @@ h3 {
   flex-direction: column;
   align-self: stretch;
   min-height: 0;
+  height: 100%;
   max-height: none;
   border-radius: var(--radius-xl);
   overflow: hidden;
@@ -530,7 +533,7 @@ h3 {
 #map {
   flex: 1 1 auto;
   width: 100%;
-  height: auto;
+  height: 100%;
   min-height: 0;
 }
 
@@ -850,8 +853,8 @@ h3 {
 
 .side-panel {
   position: relative;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
   align-self: stretch;
   min-width: 0;
   min-height: 0;
@@ -861,25 +864,31 @@ h3 {
 }
 
 .side-panel-scroll {
-  position: absolute;
-  inset: 0;
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
   gap: 10px;
   min-width: 0;
   min-height: 0;
-  overflow-y: auto;
+  height: 100%;
+  max-height: 100%;
+  overflow-y: scroll;
   overflow-x: hidden;
   overscroll-behavior: contain;
   padding-right: 8px;
   padding-bottom: 6px;
   scrollbar-gutter: stable both-edges;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(92, 69, 48, 0.3) rgba(255, 255, 255, 0.46);
+  scrollbar-width: auto;
+  scrollbar-color: rgba(92, 69, 48, 0.46) rgba(255, 255, 255, 0.62);
+}
+
+.side-panel-scroll > * {
+  flex: 0 0 auto;
+  min-height: fit-content;
 }
 
 .side-panel-scroll::-webkit-scrollbar {
-  width: 10px;
+  width: 12px;
 }
 
 .side-panel-scroll::-webkit-scrollbar-track {
@@ -888,15 +897,16 @@ h3 {
 }
 
 .side-panel-scroll::-webkit-scrollbar-thumb {
-  background: rgba(92, 69, 48, 0.24);
+  background: rgba(92, 69, 48, 0.42);
   border-radius: 999px;
-  border: 2px solid rgba(255, 255, 255, 0.46);
+  border: 2px solid rgba(255, 255, 255, 0.62);
 }
 
 .side-panel-top-stack {
   display: grid;
   gap: 10px;
   order: -30;
+  flex: 0 0 auto;
 }
 
 .search-selection-card {
@@ -1508,8 +1518,8 @@ h3 {
   }
 
   .side-panel-scroll {
-    position: static;
-    inset: auto;
+    flex: 0 0 auto;
+    max-height: none;
     overflow: visible;
     padding-right: 0;
     padding-bottom: 0;

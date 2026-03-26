@@ -270,36 +270,6 @@ function resetDesktopPanelLayout() {
 
 function syncDesktopPanelLayout() {
   resetDesktopPanelLayout();
-
-  if (
-    !workspace ||
-    !mapPanel ||
-    !sidePanel ||
-    window.matchMedia("(max-width: 1024px)").matches
-  ) {
-    return;
-  }
-
-  const shellBounds = appShell?.getBoundingClientRect();
-  const workspaceBounds = workspace.getBoundingClientRect();
-  const viewportHeight = window.visualViewport?.height || window.innerHeight || 0;
-  const shellBottom = shellBounds?.bottom || viewportHeight;
-  const availableHeight = Math.max(
-    0,
-    Math.min(shellBottom, viewportHeight) - workspaceBounds.top
-  );
-
-  if (!availableHeight) {
-    return;
-  }
-
-  const nextHeight = `${Math.floor(availableHeight)}px`;
-  workspace.style.height = nextHeight;
-  workspace.style.maxHeight = nextHeight;
-  mapPanel.style.height = nextHeight;
-  mapPanel.style.maxHeight = nextHeight;
-  sidePanel.style.height = nextHeight;
-  sidePanel.style.maxHeight = nextHeight;
 }
 
 function relocateSearchUiToSidePanel() {

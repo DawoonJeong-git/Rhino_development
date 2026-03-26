@@ -1,4 +1,6 @@
 param(
+  [string]$TunnelName = "space-work-home",
+  [string]$CloudflaredPath = "C:\Cloudflared\bin\cloudflared.exe",
   [switch]$Managed,
   [string]$PidFile = "",
   [string]$LogDir = ""
@@ -63,11 +65,15 @@ function Stop-MatchingProcesses {
   }
 }
 
+if (-not (Test-Path $CloudflaredPath)) {
+  throw "cloudflared executable was not found: $CloudflaredPath"
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
 if (-not $Managed) {
-  node server.mjs
+  & $CloudflaredPath tunnel run $TunnelName
   exit $LASTEXITCODE
 }
 
@@ -78,21 +84,20 @@ if (-not $LogDir) {
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 if (-not $PidFile) {
-  $PidFile = Join-Path $LogDir "space-work-server.pid"
+  $PidFile = Join-Path $LogDir "cloudflare-tunnel.pid"
 }
 
-$stdoutLog = Join-Path $LogDir "space-work-server.out.log"
-$stderrLog = Join-Path $LogDir "space-work-server.err.log"
+$stdoutLog = Join-Path $LogDir "cloudflare-tunnel.out.log"
+$stderrLog = Join-Path $LogDir "cloudflare-tunnel.err.log"
 
 Stop-ManagedProcess -PidPath $PidFile
-Stop-MatchingProcesses -ProcessName "node.exe" -Patterns @($repoRoot, "server.mjs")
-Stop-MatchingProcesses -ProcessName "powershell.exe" -Patterns @($repoRoot, "deploy\start-server.ps1")
-Stop-MatchingProcesses -ProcessName "cmd.exe" -Patterns @($repoRoot, "deploy\start-server.ps1")
+Stop-MatchingProcesses -ProcessName "cloudflared.exe" -Patterns @("tunnel", "run", $TunnelName)
+Stop-MatchingProcesses -ProcessName "powershell.exe" -Patterns @($repoRoot, "start-cloudflare-tunnel.ps1", $TunnelName)
+Stop-MatchingProcesses -ProcessName "cmd.exe" -Patterns @("cloudflared.exe", "tunnel", "run", $TunnelName)
 
-$nodeCommand = Get-Command node -ErrorAction Stop
-$serverProcess = Start-Process `
-  -FilePath $nodeCommand.Source `
-  -ArgumentList "server.mjs" `
+$tunnelProcess = Start-Process `
+  -FilePath $CloudflaredPath `
+  -ArgumentList @("tunnel", "run", $TunnelName) `
   -WorkingDirectory $repoRoot `
   -RedirectStandardOutput $stdoutLog `
   -RedirectStandardError $stderrLog `
@@ -101,14 +106,15 @@ $serverProcess = Start-Process `
 
 Start-Sleep -Milliseconds 700
 
-if ($serverProcess.HasExited) {
+if ($tunnelProcess.HasExited) {
   Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
-  throw "Space Work server exited immediately. Check $stderrLog"
+  throw "Cloudflare tunnel exited immediately. Check $stderrLog"
 }
 
-Set-Content -Path $PidFile -Value $serverProcess.Id -NoNewline
+Set-Content -Path $PidFile -Value $tunnelProcess.Id -NoNewline
 
-Write-Host "Space Work server restarted in managed mode."
-Write-Host "PID: $($serverProcess.Id)"
+Write-Host "Cloudflare tunnel restarted in managed mode."
+Write-Host "PID: $($tunnelProcess.Id)"
+Write-Host "Tunnel: $TunnelName"
 Write-Host "STDOUT: $stdoutLog"
 Write-Host "STDERR: $stderrLog"

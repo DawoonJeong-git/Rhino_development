@@ -18,7 +18,7 @@ For the safest day-to-day workflow on one PC, keep two folders:
 
 Edit code only in the development folder. Run the public website only from the production folder.
 
-If you already have older folders such as `C:\Rhino_develop` and `C:\Rhino_deploy`, you can keep using them temporarily and pass the path explicitly to the deploy scripts until you finish the folder rename.
+If you still have older folders such as `C:\Rhino_develop` and `C:\Rhino_deploy`, migrate them to the `SpaceWork_*` names and remove the old folders after you verify the new paths.
 
 ## High-Level Structure
 
@@ -91,6 +91,9 @@ Helper scripts in this repo:
 - `deploy/setup-home-prod.ps1`
 - `deploy/update-home-prod.ps1`
 - `deploy/start-server.ps1`
+- `deploy/start-cloudflare-tunnel.ps1`
+- `deploy/run-home-prod-server.bat`
+- `deploy/run-home-site.bat`
 
 ## Step 2. Prepare Local Secrets
 
@@ -133,8 +136,10 @@ If you are separating development and production on one PC, do this for producti
 powershell -ExecutionPolicy Bypass -File deploy\setup-home-prod.ps1
 cd C:\SpaceWork_deploy
 npm.cmd install
-powershell -ExecutionPolicy Bypass -File deploy\start-server.ps1
+deploy\run-home-prod-server.bat
 ```
+
+The `run-home-*.bat` helpers restart a single managed server or tunnel instance and write PID/log files into `C:\SpaceWork_deploy\logs`, so rerunning them replaces the old process instead of piling up extra windows.
 
 ## Step 4. Get a Domain or DDNS Name
 
@@ -254,6 +259,8 @@ If the home PC is the same machine you use for development, keep the public app 
 ```powershell
 powershell -ExecutionPolicy Bypass -File deploy\update-home-prod.ps1
 ```
+
+After the update, rerun `deploy\run-home-prod-server.bat` or `deploy\run-home-site.bat`. Those scripts now safely restart the existing managed process instead of spawning duplicates.
 
 ## Step 12. Know When to Upgrade
 
