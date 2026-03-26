@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import {
   mkdtemp,
   open,
+  realpath,
   readFile,
   readdir,
   rm,
@@ -48,16 +49,20 @@ const ROAD_SURFACE_MAX_SEGMENT_METERS = 3;
 const CONTOUR_BAND_UNION_MAX_SLICES = 12000;
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024;
 const DEFAULT_MAX_EXPORT_REQUEST_BODY_BYTES = 12 * 1024 * 1024;
+const DEFAULT_BIND_HOST = "127.0.0.1";
+const DEFAULT_OUTBOUND_FETCH_TIMEOUT_MS = 15_000;
+const LONG_OUTBOUND_FETCH_TIMEOUT_MS = 25_000;
+const OVERPASS_FETCH_TIMEOUT_MS = 35_000;
 const DEFAULT_MAX_SITE_RADIUS_METERS = 600;
 const DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS = 1500;
 const DEFAULT_MAX_CONCURRENT_EXPORT_JOBS = 2;
 const DEFAULT_CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
-  "script-src 'self' 'unsafe-inline' https://unpkg.com https://static.cloudflareinsights.com",
-  "style-src 'self' 'unsafe-inline' https://unpkg.com",
+  "script-src 'self'",
+  "style-src 'self'",
   "img-src 'self' data: blob: https:",
   "font-src 'self' data: https:",
-  "connect-src 'self' https://unpkg.com https://cloudflareinsights.com https://*.cloudflareinsights.com",
+  "connect-src 'self'",
   "object-src 'none'",
   "base-uri 'self'",
   "frame-ancestors 'none'",
@@ -142,7 +147,7 @@ process.on("uncaughtExceptionMonitor", (error, origin) => {
 async function loadLocalConfig() {
   try {
     const raw = await readFile(configPath, "utf8");
-    return JSON.parse(raw.replace(/^\uFEFF/, ""));
+    return JSON.parse(raw);
   } catch {
     return {};
   }
@@ -338,6 +343,7 @@ function shouldPreserveNativeContourDisplayLines(format) {
   const normalizedFormat = String(format || "").trim().toLowerCase();
   return (
     normalizedFormat === "3dm" ||
+    normalizedFormat === "dxf" ||
     normalizedFormat === "obj" ||
     normalizedFormat === "skp" ||
     normalizedFormat === "skp-payload"
@@ -711,14 +717,14 @@ function assertSiteRequestWithinLimits(location, options, customBounds, config) 
     lng < -180 ||
     lng > 180
   ) {
-    throw createHttpError(400, "?꾩튂 醫뚰몴媛 ?щ컮瑜댁? ?딆뒿?덈떎.");
+    throw createHttpError(400, "위치 좌표가 올바르지 않습니다.");
   }
 
   const normalizedRadius = Math.max(30, Number(options?.radius) || 120);
   if (normalizedRadius > config.maxSiteRadiusMeters) {
     throw createHttpError(
       400,
-      `諛섍꼍? ?쒕쾭 ?쒗븳??${config.maxSiteRadiusMeters}m ?댄븯濡??붿껌?댁빞 ?⑸땲??`
+      `반경은 서버 제한인 ${config.maxSiteRadiusMeters}m 이하로 요청해야 합니다.`
     );
   }
 
@@ -737,14 +743,14 @@ function assertSiteRequestWithinLimits(location, options, customBounds, config) 
   ) {
     throw createHttpError(
       400,
-      `吏곸젒 吏??踰붿쐞??媛濡??몃줈 ${config.maxManualRangeSideMeters}m ?댄븯濡??붿껌?댁빞 ?⑸땲??`
+      `직접 지정 범위는 가로/세로 ${config.maxManualRangeSideMeters}m 이하로 요청해야 합니다.`
     );
   }
 }
 
 function assertSiteContextWithinLimits(siteContext, config) {
   if (!siteContext?.location || !siteContext?.options) {
-    throw createHttpError(400, "紐⑤뜽 而⑦뀓?ㅽ듃媛 ?щ컮瑜댁? ?딆뒿?덈떎.");
+    throw createHttpError(400, "모델 컨텍스트가 올바르지 않습니다.");
   }
 
   assertSiteRequestWithinLimits(
@@ -832,6 +838,10 @@ function isSiteContextCompatibleForExport(
 function buildRuntimeConfig(localConfig) {
   return {
     port: Number(process.env.PORT || localConfig.PORT || 3000),
+    bindHost:
+      normalizeConfigString(
+        process.env.BIND_HOST || localConfig.BIND_HOST || DEFAULT_BIND_HOST
+      ) || DEFAULT_BIND_HOST,
     vworldApiKey: normalizeConfigString(
       process.env.VWORLD_API_KEY || localConfig.VWORLD_API_KEY || ""
     ),
@@ -911,27 +921,27 @@ function buildRuntimeConfig(localConfig) {
       api: {
         maxRequests: 120,
         windowMs: 1000 * 60,
-        message: "?붿껌???덈Т 留롮뒿?덈떎. ?좎떆 ???ㅼ떆 ?쒕룄?댁＜?몄슂.",
+        message: "요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
       },
       search: {
         maxRequests: 60,
         windowMs: 1000 * 60,
-        message: "寃???붿껌???덈Т 留롮뒿?덈떎. ?좎떆 ???ㅼ떆 ?쒕룄?댁＜?몄슂.",
+        message: "검색 요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
       },
       heavy: {
         maxRequests: 24,
         windowMs: 1000 * 60,
-        message: "臾닿굅???곗씠???붿껌???좎떆 紐곕━怨??덉뒿?덈떎. 議곌툑 ???ㅼ떆 ?쒕룄?댁＜?몄슂.",
+        message: "무거운 데이터 요청이 잠시 몰리고 있습니다. 조금 후 다시 시도해주세요.",
       },
       export: {
         maxRequests: 8,
         windowMs: 1000 * 60 * 10,
-        message: "紐⑤뜽 ?대낫?닿린 ?붿껌???덈Т 留롮뒿?덈떎. ?좎떆 ???ㅼ떆 ?쒕룄?댁＜?몄슂.",
+        message: "모델 내보내기 요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
       },
       progress: {
         maxRequests: 240,
         windowMs: 1000 * 60,
-        message: "吏꾪뻾瑜?議고쉶 ?붿껌???덈Т 留롮뒿?덈떎. ?좎떆 ???ㅼ떆 ?쒕룄?댁＜?몄슂.",
+        message: "진행률 조회 요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
       },
     },
   };
@@ -1018,14 +1028,14 @@ function completeRequestProgress(token, message) {
   return updateRequestProgress(token, {
     state: "done",
     percent: 100,
-    message: String(message || "?꾨즺?섏뿀?듬땲??").trim(),
+    message: String(message || "완료되었습니다.").trim(),
     completedAt: Date.now(),
     error: "",
   });
 }
 
 function failRequestProgress(token, error) {
-  const message = formatErrorForLog(error) || "?붿껌 泥섎━ 以??ㅻ쪟媛 諛쒖깮?덉뒿?덈떎.";
+  const message = formatErrorForLog(error) || "요청 처리 중 오류가 발생했습니다.";
   return updateRequestProgress(token, {
     state: "error",
     message,
@@ -1174,7 +1184,7 @@ async function readJsonBody(request, options = {}) {
       reject(
         createHttpError(
           413,
-          `?붿껌 蹂몃Ц? ${formatByteLimit(maxBytes)} ?댄븯留??덉슜?⑸땲??`
+          `요청 본문은 ${formatByteLimit(maxBytes)} 이하만 허용됩니다.`
         )
       );
       return;
@@ -1197,7 +1207,7 @@ async function readJsonBody(request, options = {}) {
         reject(
           createHttpError(
             413,
-            `?붿껌 蹂몃Ц? ${formatByteLimit(maxBytes)} ?댄븯留??덉슜?⑸땲??`
+            `요청 본문은 ${formatByteLimit(maxBytes)} 이하만 허용됩니다.`
           )
         );
         return;
@@ -1247,22 +1257,31 @@ async function serveStatic(requestPath, response) {
     ["/max-mass/", "max-mass/index.html"],
   ]);
   const resolvedPath = staticPageAliases.has(requestPath)
-    ? path.join(publicDir, staticPageAliases.get(requestPath))
-    : path.join(publicDir, requestPath);
-  const normalizedPath = path.normalize(resolvedPath);
+    ? path.resolve(publicDir, staticPageAliases.get(requestPath))
+    : path.resolve(publicDir, `.${requestPath}`);
 
-  if (!normalizedPath.startsWith(publicDir)) {
+  if (!isPathInsideDirectory(publicDir, resolvedPath)) {
     sendJson(response, 403, { error: "Forbidden" });
     return;
   }
 
   try {
-    const fileStat = await stat(normalizedPath);
+    const fileStat = await stat(resolvedPath);
     const filePath = fileStat.isDirectory()
-      ? path.join(normalizedPath, "index.html")
-      : normalizedPath;
-    const body = await readFile(filePath);
-    const ext = path.extname(filePath).toLowerCase();
+      ? path.join(resolvedPath, "index.html")
+      : resolvedPath;
+    const [resolvedPublicDir, resolvedFilePath] = await Promise.all([
+      realpath(publicDir),
+      realpath(filePath),
+    ]);
+
+    if (!isPathInsideDirectory(resolvedPublicDir, resolvedFilePath)) {
+      sendJson(response, 403, { error: "Forbidden" });
+      return;
+    }
+
+    const body = await readFile(resolvedFilePath);
+    const ext = path.extname(resolvedFilePath).toLowerCase();
 
     response.writeHead(
       200,
@@ -1316,24 +1335,24 @@ function cleanHtmlText(value) {
 
 function normalizeRegionName(value) {
   const replacements = [
-    ["?쒖슱?밸퀎??, "?쒖슱"],
-    ["遺?곌킅??떆", "遺??],
-    ["?援ш킅??떆", "?援?],
-    ["?몄쿇愿묒뿭??, "?몄쿇"],
-    ["愿묒＜愿묒뿭??, "愿묒＜"],
-    ["??꾧킅??떆", "???],
-    ["?몄궛愿묒뿭??, "?몄궛"],
-    ["?몄쥌?밸퀎?먯튂??, "?몄쥌"],
-    ["?쒖＜?밸퀎?먯튂??, "?쒖＜"],
-    ["媛뺤썝?밸퀎?먯튂??, "媛뺤썝"],
-    ["?꾨턿?밸퀎?먯튂??, "?꾨턿"],
-    ["寃쎄린??, "寃쎄린"],
-    ["異⑹껌遺곷룄", "異⑸턿"],
-    ["異⑹껌?⑤룄", "異⑸궓"],
-    ["?꾨씪遺곷룄", "?꾨턿"],
-    ["?꾨씪?⑤룄", "?꾨궓"],
-    ["寃쎌긽遺곷룄", "寃쎈턿"],
-    ["寃쎌긽?⑤룄", "寃쎈궓"],
+    ["서울특별시", "서울"],
+    ["부산광역시", "부산"],
+    ["대구광역시", "대구"],
+    ["인천광역시", "인천"],
+    ["광주광역시", "광주"],
+    ["대전광역시", "대전"],
+    ["울산광역시", "울산"],
+    ["세종특별자치시", "세종"],
+    ["제주특별자치도", "제주"],
+    ["강원특별자치도", "강원"],
+    ["전북특별자치도", "전북"],
+    ["경기도", "경기"],
+    ["충청북도", "충북"],
+    ["충청남도", "충남"],
+    ["전라북도", "전북"],
+    ["전라남도", "전남"],
+    ["경상북도", "경북"],
+    ["경상남도", "경남"],
   ];
 
   return replacements.reduce(
@@ -1346,7 +1365,7 @@ function normalizeSystemAddress(value) {
   return normalizeRegionName(
     String(value || "")
       .replace(/\([^)]*\)/g, " ")
-      .replace(/??쒕?援?g, " ")
+      .replace(/대한민국/g, " ")
       .replace(/\b\d{5}\b/g, " ")
       .replace(/,/g, " ")
       .replace(/\s+/g, " ")
@@ -2745,23 +2764,23 @@ function buildTerrainRegionHints(location = {}) {
     normalizeDigits(String(location.pnu || "").slice(0, 10));
   const provinceCode = admCdSource.slice(0, 2);
   const provinceCodeHints = {
-    "11": ["?쒖슱"],
-    "26": ["遺??],
-    "27": ["?援?],
-    "28": ["?몄쿇"],
-    "29": ["愿묒＜"],
-    "30": ["???],
-    "31": ["?몄궛"],
-    "36": ["?몄쥌"],
-    "41": ["寃쎄린"],
-    "42": ["媛뺤썝", "媛뺤썝?밸퀎?먯튂??],
-    "43": ["異⑸턿"],
-    "44": ["異⑸궓"],
-    "45": ["?꾨턿", "?꾨턿?밸퀎?먯튂??],
-    "46": ["?꾨궓"],
-    "47": ["寃쎈턿"],
-    "48": ["寃쎈궓"],
-    "50": ["?쒖＜"],
+    "11": ["서울"],
+    "26": ["부산"],
+    "27": ["대구"],
+    "28": ["인천"],
+    "29": ["광주"],
+    "30": ["대전"],
+    "31": ["울산"],
+    "36": ["세종"],
+    "41": ["경기"],
+    "42": ["강원", "강원특별자치도"],
+    "43": ["충북"],
+    "44": ["충남"],
+    "45": ["전북", "전북특별자치도"],
+    "46": ["전남"],
+    "47": ["경북"],
+    "48": ["경남"],
+    "50": ["제주"],
   };
 
   if (provinceCodeHints[provinceCode]?.length) {
@@ -2780,42 +2799,42 @@ function buildTerrainRegionHints(location = {}) {
     .join(" ");
 
   const aliases = [
-    ["?쒖슱", ["?쒖슱"]],
-    ["?쒖슱?밸퀎??, ["?쒖슱"]],
-    ["遺??, ["遺??]],
-    ["遺?곌킅??떆", ["遺??]],
-    ["?援?, ["?援?]],
-    ["?援ш킅??떆", ["?援?]],
-    ["?몄쿇", ["?몄쿇"]],
-    ["?몄쿇愿묒뿭??, ["?몄쿇"]],
-    ["愿묒＜", ["愿묒＜"]],
-    ["愿묒＜愿묒뿭??, ["愿묒＜"]],
-    ["???, ["???]],
-    ["??꾧킅??떆", ["???]],
-    ["?몄궛", ["?몄궛"]],
-    ["?몄궛愿묒뿭??, ["?몄궛"]],
-    ["?몄쥌", ["?몄쥌"]],
-    ["?몄쥌?밸퀎?먯튂??, ["?몄쥌"]],
-    ["寃쎄린", ["寃쎄린"]],
-    ["寃쎄린??, ["寃쎄린"]],
-    ["媛뺤썝", ["媛뺤썝", "媛뺤썝?밸퀎?먯튂??]],
-    ["媛뺤썝??, ["媛뺤썝", "媛뺤썝?밸퀎?먯튂??]],
-    ["媛뺤썝?밸퀎?먯튂??, ["媛뺤썝", "媛뺤썝?밸퀎?먯튂??]],
-    ["異⑸턿", ["異⑸턿"]],
-    ["異⑹껌遺곷룄", ["異⑸턿"]],
-    ["異⑸궓", ["異⑸궓"]],
-    ["異⑹껌?⑤룄", ["異⑸궓"]],
-    ["?꾨턿", ["?꾨턿", "?꾨턿?밸퀎?먯튂??]],
-    ["?꾨씪遺곷룄", ["?꾨턿", "?꾨턿?밸퀎?먯튂??]],
-    ["?꾨턿?밸퀎?먯튂??, ["?꾨턿", "?꾨턿?밸퀎?먯튂??]],
-    ["?꾨궓", ["?꾨궓"]],
-    ["?꾨씪?⑤룄", ["?꾨궓"]],
-    ["寃쎈턿", ["寃쎈턿"]],
-    ["寃쎌긽遺곷룄", ["寃쎈턿"]],
-    ["寃쎈궓", ["寃쎈궓"]],
-    ["寃쎌긽?⑤룄", ["寃쎈궓"]],
-    ["?쒖＜", ["?쒖＜"]],
-    ["?쒖＜?밸퀎?먯튂??, ["?쒖＜"]],
+    ["서울", ["서울"]],
+    ["서울특별시", ["서울"]],
+    ["부산", ["부산"]],
+    ["부산광역시", ["부산"]],
+    ["대구", ["대구"]],
+    ["대구광역시", ["대구"]],
+    ["인천", ["인천"]],
+    ["인천광역시", ["인천"]],
+    ["광주", ["광주"]],
+    ["광주광역시", ["광주"]],
+    ["대전", ["대전"]],
+    ["대전광역시", ["대전"]],
+    ["울산", ["울산"]],
+    ["울산광역시", ["울산"]],
+    ["세종", ["세종"]],
+    ["세종특별자치시", ["세종"]],
+    ["경기", ["경기"]],
+    ["경기도", ["경기"]],
+    ["강원", ["강원", "강원특별자치도"]],
+    ["강원도", ["강원", "강원특별자치도"]],
+    ["강원특별자치도", ["강원", "강원특별자치도"]],
+    ["충북", ["충북"]],
+    ["충청북도", ["충북"]],
+    ["충남", ["충남"]],
+    ["충청남도", ["충남"]],
+    ["전북", ["전북", "전북특별자치도"]],
+    ["전라북도", ["전북", "전북특별자치도"]],
+    ["전북특별자치도", ["전북", "전북특별자치도"]],
+    ["전남", ["전남"]],
+    ["전라남도", ["전남"]],
+    ["경북", ["경북"]],
+    ["경상북도", ["경북"]],
+    ["경남", ["경남"]],
+    ["경상남도", ["경남"]],
+    ["제주", ["제주"]],
+    ["제주특별자치도", ["제주"]],
   ];
 
   for (const [needle, hints] of aliases) {
@@ -3037,7 +3056,7 @@ function buildLocationParcelLookup(location = {}) {
     jibunKeys.add(normalizeAddressKey(plainJibun));
 
     if (parcelReference.platGbCd === "1") {
-      jibunKeys.add(normalizeAddressKey(`??${plainJibun}`));
+      jibunKeys.add(normalizeAddressKey(`산 ${plainJibun}`));
     }
   }
 
@@ -3159,7 +3178,13 @@ async function fetchVWorldFeatureCollection(
     params.set("domain", config.vworldApiDomain);
   }
 
-  const response = await fetch(`https://api.vworld.kr/req/data?${params}`);
+  const response = await fetchWithTimeout(
+    `https://api.vworld.kr/req/data?${params}`,
+    {},
+    {
+      requestLabel: "VWorld data request",
+    }
+  );
 
   if (!response.ok) {
     throw new Error(`VWorld data request failed with ${response.status}`);
@@ -3219,7 +3244,7 @@ function mapVWorldSearchItems(items, searchType) {
         stripHtml(item.title) ||
         item.address?.road ||
         item.address?.parcel ||
-        "寃??寃곌낵",
+        "검색 결과",
       roadAddress: item.address?.road || "",
       parcelAddress: item.address?.parcel || "",
       lat: Number(item.point?.y || item.y),
@@ -3235,7 +3260,7 @@ function mapVWorldSearchItems(items, searchType) {
 function buildSearchQueryHints(query) {
   const normalizedQuery = normalizeAddressKey(query);
   const parcelReference = parseParcelAddressReference(query);
-  const roadAddressQuery = /(?:濡?湲??濡?\d/u.test(String(query || "").replace(/\s+/g, ""));
+  const roadAddressQuery = /(?:로|길|대로)\d/u.test(String(query || "").replace(/\s+/g, ""));
   const areaQuery = parcelReference
     ? String(query || "")
         .replace(/(?:^|\s)(\uC0B0)?\s*\d+(?:-\d+)?\s*$/u, "")
@@ -3433,9 +3458,9 @@ function isVWorldNoResultStatus(status, errorText = "") {
     normalizedStatus === "NO_DATA" ||
     normalizedStatus === "NO_RESULT" ||
     normalizedStatus === "EMPTY" ||
-    normalizedErrorText.includes("寃?됯껐怨쇨??놁뒿?덈떎") ||
-    normalizedErrorText.includes("議고쉶寃곌낵媛?놁뒿?덈떎") ||
-    normalizedErrorText.includes("寃곌낵媛?놁뒿?덈떎")
+    normalizedErrorText.includes("검색결과가없습니다") ||
+    normalizedErrorText.includes("조회결과가없습니다") ||
+    normalizedErrorText.includes("결과가없습니다")
   );
 }
 
@@ -3454,7 +3479,7 @@ function buildJusoSearchItem(item, index) {
       item.roadAddr ||
       item.jibunAddr ||
       item.bdNm ||
-      "二쇱냼 寃??寃곌낵",
+      "주소 검색 결과",
     roadAddress: item.roadAddr || item.roadAddrPart1 || "",
     parcelAddress: item.jibunAddr || "",
     provider: "juso",
@@ -3494,8 +3519,12 @@ async function searchJuso(query, config) {
     addInfoYn: "Y",
   });
 
-  const response = await fetch(
-    `https://business.juso.go.kr/addrlink/addrLinkApi.do?${params}`
+  const response = await fetchWithTimeout(
+    `https://business.juso.go.kr/addrlink/addrLinkApi.do?${params}`,
+    {},
+    {
+      requestLabel: "Juso search request",
+    }
   );
 
   if (!response.ok) {
@@ -3811,7 +3840,7 @@ function normalizeSearchResultsForQuery(items, query = "") {
   } else if (hints.mtYn === "1") {
     const textualMtMatches = filtered.filter((item) =>
       normalizeAddressKey(item?.parcelAddress || item?.label || "").includes(
-        "??
+        "산"
       )
     );
 
@@ -4425,14 +4454,21 @@ async function fetchOverpassRoadCollection(clipFeature) {
   way["highway"]["area"!~"yes"](${bounds.minLat},${bounds.minLng},${bounds.maxLat},${bounds.maxLng});
 );
 out geom;`;
-  const response = await fetch("https://overpass-api.de/api/interpreter", {
-    method: "POST",
-    headers: {
-      "Content-Type": "text/plain; charset=utf-8",
-      "User-Agent": "space-work/0.1 (local development)",
+  const response = await fetchWithTimeout(
+    "https://overpass-api.de/api/interpreter",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "User-Agent": "space-work/0.1 (local development)",
+      },
+      body,
     },
-    body,
-  });
+    {
+      requestLabel: "Overpass road request",
+      timeoutMs: OVERPASS_FETCH_TIMEOUT_MS,
+    }
+  );
 
   if (!response.ok) {
     throw new Error(`Overpass road request failed with ${response.status}`);
@@ -4711,8 +4747,12 @@ async function fetchBuildingRegisterSummary(parcelReference, config, numOfRows =
     _type: "json",
   });
 
-  const response = await fetch(
-    `https://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo?${params}`
+  const response = await fetchWithTimeout(
+    `https://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo?${params}`,
+    {},
+    {
+      requestLabel: "Building HUB request",
+    }
   );
 
   if (!response.ok) {
@@ -4724,7 +4764,7 @@ async function fetchBuildingRegisterSummary(parcelReference, config, numOfRows =
 
   if (resultCode && resultCode !== "00") {
     throw new Error(
-      payload?.response?.header?.resultMsg || "嫄댁텞臾쇰???議고쉶???ㅽ뙣?덉뒿?덈떎."
+      payload?.response?.header?.resultMsg || "건축물대장 조회에 실패했습니다."
     );
   }
 
@@ -4774,8 +4814,12 @@ async function fetchBuildingFloorOutline(parcelReference, config, numOfRows = 10
     _type: "json",
   });
 
-  const response = await fetch(
-    `https://apis.data.go.kr/1613000/BldRgstHubService/getBrFlrOulnInfo?${params}`
+  const response = await fetchWithTimeout(
+    `https://apis.data.go.kr/1613000/BldRgstHubService/getBrFlrOulnInfo?${params}`,
+    {},
+    {
+      requestLabel: "Building HUB floor request",
+    }
   );
 
   if (!response.ok) {
@@ -4787,7 +4831,7 @@ async function fetchBuildingFloorOutline(parcelReference, config, numOfRows = 10
 
   if (resultCode && resultCode !== "00") {
     throw new Error(
-      payload?.response?.header?.resultMsg || "嫄댁텞臾?痢듬퀎?꾪솴 議고쉶???ㅽ뙣?덉뒿?덈떎."
+      payload?.response?.header?.resultMsg || "건축물 층별현황 조회에 실패했습니다."
     );
   }
 
@@ -4919,7 +4963,14 @@ async function fetchEumConnectorXml(serviceUrl, key, params = {}) {
     return "";
   }
 
-  const response = await fetch(buildEumConnectorUrl(serviceUrl, key, params));
+  const response = await fetchWithTimeout(
+    buildEumConnectorUrl(serviceUrl, key, params),
+    {},
+    {
+      requestLabel: "EUM detail request",
+      timeoutMs: LONG_OUTBOUND_FETCH_TIMEOUT_MS,
+    }
+  );
 
   if (!response.ok) {
     throw new Error(`EUM detail request failed with ${response.status}`);
@@ -4976,10 +5027,10 @@ async function fetchEumLandRelationDetails(parcelReference, html, config) {
       );
 
       details.landOwnership = {
-        possessionType: extractXmlText(xml, "posesnSeCodeNm") || "誘명솗??,
-        coOwnerCount: extractXmlText(xml, "cnrsPsnCo") || "誘명솗??,
-        scaleType: extractXmlText(xml, "ladFrtlScNm") || "誘명솗??,
-        baseDate: formatCompactDate(extractXmlText(xml, "lastUpdtDt")) || "誘명솗??,
+        possessionType: extractXmlText(xml, "posesnSeCodeNm") || "미확인",
+        coOwnerCount: extractXmlText(xml, "cnrsPsnCo") || "미확인",
+        scaleType: extractXmlText(xml, "ladFrtlScNm") || "미확인",
+        baseDate: formatCompactDate(extractXmlText(xml, "lastUpdtDt")) || "미확인",
       };
       details.sourceStatus.landOwnership = "loaded";
     })().catch(() => {
@@ -5010,10 +5061,10 @@ async function fetchEumLandRelationDetails(parcelReference, html, config) {
       }
 
       details.landCharacteristics = {
-        topographyHeight: latest.tpgrphHgCodeNm || "誘명솗??,
-        topographyShape: latest.tpgrphFrmCodeNm || "誘명솗??,
-        roadSide: latest.roadSideCodeNm || "誘명솗??,
-        baseDate: formatCompactDate(latest.lastUpdtDt) || "誘명솗??,
+        topographyHeight: latest.tpgrphHgCodeNm || "미확인",
+        topographyShape: latest.tpgrphFrmCodeNm || "미확인",
+        roadSide: latest.roadSideCodeNm || "미확인",
+        baseDate: formatCompactDate(latest.lastUpdtDt) || "미확인",
       };
       details.sourceStatus.landCharacteristics = "loaded";
     })().catch(() => {
@@ -5039,10 +5090,10 @@ async function fetchEumLandRelationDetails(parcelReference, html, config) {
 
       details.landMovements = records
         .map((record) => ({
-          landCategory: record.lndcgrCodeNm || "誘명솗??,
+          landCategory: record.lndcgrCodeNm || "미확인",
           areaSquareMeters: Number(record.lndpclAr || 0),
-          reason: record.ladMvmnPrvonshCodeNm || "誘명솗??,
-          movementDate: formatCompactDate(record.ladMvmnDe) || "誘명솗??,
+          reason: record.ladMvmnPrvonshCodeNm || "미확인",
+          movementDate: formatCompactDate(record.ladMvmnDe) || "미확인",
         }))
         .sort((left, right) => String(right.movementDate).localeCompare(String(left.movementDate)));
 
@@ -5145,7 +5196,7 @@ function parseAreaText(value) {
   );
 
   return {
-    text: normalized || "誘명솗??,
+    text: normalized || "미확인",
     squareMeters: Number.isFinite(numeric) ? numeric : null,
   };
 }
@@ -5154,20 +5205,20 @@ function parseEumLandInfoHtml(html, parcelReference, location) {
   const landCategory =
     cleanHtmlText(
       html.match(/id="present_class_val"[^>]*value="([^"]*)"/i)?.[1] || ""
-    ) || "誘명솗??;
+    ) || "미확인";
   const area = parseAreaText(
     html.match(/id="present_area"[^>]*>([\s\S]*?)<\/td>/i)?.[1] || ""
   );
   const announcedPrice =
     cleanHtmlText(html.match(/id="jiga"[^>]*>([\s\S]*?)<\/span>/i)?.[1] || "") ||
-    "誘명솗??;
+    "미확인";
   const urbanPlanningItems = parseEumRegulationItems(
     extractHtmlSection(html, "present_mark1"),
-    "援?넗怨꾪쉷踰?
+    "국토계획법"
   );
   const otherLawItems = parseEumRegulationItems(
     extractHtmlSection(html, "present_mark2"),
-    "?ㅻⅨ 踰뺣졊"
+    "다른 법령"
   );
 
   return {
@@ -5215,13 +5266,20 @@ async function fetchEumLandPage(parcelReference, location) {
     pnu: parcelReference.pnu,
     p_location: buildSystemAddress(location),
   });
-  const response = await fetch("https://www.eum.go.kr/web/ar/lu/luLandDet.jsp", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+  const response = await fetchWithTimeout(
+    "https://www.eum.go.kr/web/ar/lu/luLandDet.jsp",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+      },
+      body: formBody.toString(),
     },
-    body: formBody.toString(),
-  });
+    {
+      requestLabel: "EUM request",
+      timeoutMs: LONG_OUTBOUND_FETCH_TIMEOUT_MS,
+    }
+  );
 
   if (!response.ok) {
     throw new Error(`EUM request failed with ${response.status}`);
@@ -5271,7 +5329,13 @@ async function searchVWorldCategory(query, category, config) {
     params.set("domain", config.vworldApiDomain);
   }
 
-  const response = await fetch(`https://api.vworld.kr/req/search?${params}`);
+  const response = await fetchWithTimeout(
+    `https://api.vworld.kr/req/search?${params}`,
+    {},
+    {
+      requestLabel: `VWorld ${category} geocode request`,
+    }
+  );
 
   if (!response.ok) {
     throw new Error(`VWorld ${category} geocode failed with ${response.status}`);
@@ -5338,12 +5402,15 @@ async function geocodeWithNominatim(query) {
     countrycodes: "kr",
   });
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://nominatim.openstreetmap.org/search?${params}`,
     {
       headers: {
         "User-Agent": "space-work/0.1 (local development)",
       },
+    },
+    {
+      requestLabel: "Nominatim geocode request",
     }
   );
 
@@ -5561,7 +5628,7 @@ async function geocodeParcelQueryWithDataFallback(query, fallbackResults, config
 
 function parseParcelAddressReference(value) {
   const normalized = String(value || "").trim();
-  const match = normalized.match(/(?:^|\s)(???\s*(\d+)(?:-(\d+))?\s*$/);
+  const match = normalized.match(/(?:^|\s)(산)?\s*(\d+)(?:-(\d+))?\s*$/);
 
   if (!match) {
     return null;
@@ -5591,7 +5658,13 @@ async function reverseWithVWorld(lat, lng, config) {
     params.set("domain", config.vworldApiDomain);
   }
 
-  const response = await fetch(`https://api.vworld.kr/req/address?${params}`);
+  const response = await fetchWithTimeout(
+    `https://api.vworld.kr/req/address?${params}`,
+    {},
+    {
+      requestLabel: "VWorld reverse geocode request",
+    }
+  );
 
   if (!response.ok) {
     throw new Error(`VWorld reverse geocode failed with ${response.status}`);
@@ -5658,12 +5731,15 @@ async function reverseWithNominatim(lat, lng) {
     format: "jsonv2",
   });
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://nominatim.openstreetmap.org/reverse?${params}`,
     {
       headers: {
         "User-Agent": "space-work/0.1 (local development)",
       },
+    },
+    {
+      requestLabel: "Nominatim reverse geocode request",
     }
   );
 
@@ -5895,11 +5971,17 @@ async function fetchOpenMeteoElevationChunk(points) {
         latitude: points.map((point) => point.lat.toFixed(6)).join(","),
         longitude: points.map((point) => point.lng.toFixed(6)).join(","),
       });
-      const response = await fetch(`https://api.open-meteo.com/v1/elevation?${params}`, {
-        headers: {
-          "User-Agent": "space-work/0.1",
+      const response = await fetchWithTimeout(
+        `https://api.open-meteo.com/v1/elevation?${params}`,
+        {
+          headers: {
+            "User-Agent": "space-work/0.1",
+          },
         },
-      });
+        {
+          requestLabel: "Open-Meteo elevation request",
+        }
+      );
 
       if (!response.ok) {
         throw new Error(`Open-Meteo elevation request failed with ${response.status}`);
@@ -5964,19 +6046,25 @@ async function fetchOpenTopoDataElevations(points) {
 
   for (let index = 0; index < points.length; index += 80) {
     const chunk = points.slice(index, index + 80);
-    const response = await fetch("https://api.opentopodata.org/v1/srtm90m", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "space-work/0.1",
+    const response = await fetchWithTimeout(
+      "https://api.opentopodata.org/v1/srtm90m",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": "space-work/0.1",
+        },
+        body: JSON.stringify({
+          locations: chunk
+            .map((point) => `${point.lat.toFixed(6)},${point.lng.toFixed(6)}`)
+            .join("|"),
+          interpolation: "bilinear",
+        }),
       },
-      body: JSON.stringify({
-        locations: chunk
-          .map((point) => `${point.lat.toFixed(6)},${point.lng.toFixed(6)}`)
-          .join("|"),
-        interpolation: "bilinear",
-      }),
-    });
+      {
+        requestLabel: "OpenTopoData elevation request",
+      }
+    );
 
     if (!response.ok) {
       throw new Error(`OpenTopoData elevation request failed with ${response.status}`);
@@ -6502,7 +6590,7 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
     return {
       provider: "flat",
       mode: "generated",
-      note: "?됲깂??吏?뺤쑝濡??ㅼ젙?덉뒿?덈떎.",
+      note: "평탄화 지형으로 설정했습니다.",
       contourCollection:
         options.includeContours === false
           ? featureCollection([])
@@ -6609,7 +6697,7 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
     );
     let elevations;
     let provider = "open-meteo";
-    let note = "?ㅼ젣 ?쒓퀬 ?섑뵆??諛뷀깢?쇰줈 吏??硫붿돩瑜??앹꽦?덉뒿?덈떎.";
+    let note = "실제 표고 샘플을 바탕으로 지형 메쉬를 생성했습니다.";
 
     try {
       console.log(`${terrainDebugPrefix} open-meteo request`);
@@ -6618,7 +6706,7 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
       console.log(`${terrainDebugPrefix} open-meteo failed -> opentopodata`);
       elevations = await fetchOpenTopoDataElevations(sampleGrid.points);
       provider = "opentopodata";
-      note = "?ㅼ젣 ?쒓퀬 ?섑뵆??諛뷀깢?쇰줈 吏??硫붿돩瑜??앹꽦?덉뒿?덈떎. 蹂댁“ ?쒓퀬 ?뚯뒪瑜??ъ슜?덉뒿?덈떎.";
+      note = "실제 표고 샘플을 바탕으로 지형 메쉬를 생성했습니다. 보조 표고 소스를 사용했습니다.";
     }
 
     const rows = sampleGrid.cells.map((row) =>
@@ -6663,8 +6751,8 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
       mode: "fallback",
       note:
         error instanceof Error
-          ? `?ㅼ???議고쉶???ㅽ뙣?섏뿬 ?꾩떆 吏?뺤쑝濡??泥댄뻽?듬땲?? ${error.message}`
-          : "?ㅼ???議고쉶???ㅽ뙣?섏뿬 ?꾩떆 吏?뺤쑝濡??泥댄뻽?듬땲??",
+          ? `실지형 조회에 실패하여 임시 지형으로 대체했습니다: ${error.message}`
+          : "실지형 조회에 실패하여 임시 지형으로 대체했습니다.",
       contourCollection,
       contourSource,
       contourInterval: requestedContourInterval,
@@ -6972,7 +7060,7 @@ async function resolveParcelBoundary(location, config) {
       feature: mockParcel,
       provider: "mock",
       isFallback: true,
-      note: "釉뚯씠?붾뱶 ?ㅺ? ?놁뼱 紐⑥쓽 ?吏 寃쎄퀎瑜??ъ슜?덉뒿?덈떎.",
+      note: "브이월드 키가 없어 모의 대지 경계를 사용했습니다.",
     };
   }
 
@@ -7014,7 +7102,7 @@ async function resolveParcelBoundary(location, config) {
           feature: normalizeParcelFeature(parcelFeature),
           provider: "vworld",
           isFallback: false,
-          note: "釉뚯씠?붾뱶?먯꽌 ?ㅼ젣 ?吏 寃쎄퀎瑜?遺덈윭?붿뒿?덈떎.",
+          note: "브이월드에서 실제 대지 경계를 불러왔습니다.",
         };
       }
     }
@@ -7024,7 +7112,7 @@ async function resolveParcelBoundary(location, config) {
         feature: normalizeParcelFeature(bestFeature),
         provider: "vworld",
         isFallback: false,
-        note: "釉뚯씠?붾뱶?먯꽌 ?吏 寃쎄퀎 ?꾨낫 以?媛???쇱튂?꾧? ?믪? ?꾩?瑜??좏깮?덉뒿?덈떎.",
+        note: "브이월드에서 대지 경계 후보 중 가장 일치도가 높은 필지를 선택했습니다.",
       };
     }
 
@@ -7042,7 +7130,7 @@ async function resolveParcelBoundary(location, config) {
         feature: normalizedFeature,
         provider: "vworld",
         isFallback: false,
-        note: "釉뚯씠?붾뱶?먯꽌 ?ㅼ젣 ?吏 寃쎄퀎瑜?遺덈윭?붿뒿?덈떎.",
+        note: "브이월드에서 실제 대지 경계를 불러왔습니다.",
       };
     }
   } catch (error) {
@@ -7052,8 +7140,8 @@ async function resolveParcelBoundary(location, config) {
       isFallback: true,
       note:
         error instanceof Error
-          ? `?吏 寃쎄퀎 議고쉶???ㅽ뙣?덉뒿?덈떎: ${error.message}`
-          : "?吏 寃쎄퀎 議고쉶???ㅽ뙣?덉뒿?덈떎.",
+          ? `대지 경계 조회에 실패했습니다: ${error.message}`
+          : "대지 경계 조회에 실패했습니다.",
     };
   }
 
@@ -7061,7 +7149,7 @@ async function resolveParcelBoundary(location, config) {
     feature: normalizeParcelFeature(createMockParcelFeature(location)),
     provider: "mock",
     isFallback: true,
-    note: "?ㅼ젣 ?吏 寃쎄퀎媛 ?놁뼱 紐⑥쓽 ?吏 寃쎄퀎瑜??ъ슜?덉뒿?덈떎.",
+    note: "실제 대지 경계가 없어 모의 대지 경계를 사용했습니다.",
   };
 }
 
@@ -7616,11 +7704,11 @@ async function buildSiteContext(body, config, reportProgress = null) {
     cachedSiteContext &&
     Date.now() - cachedSiteContext.cachedAt < SITE_CONTEXT_CACHE_TTL_MS
   ) {
-    progress(100, "??λ맂 ?吏 而⑦뀓?ㅽ듃瑜?遺덈윭?붿뒿?덈떎.");
+    progress(100, "저장된 대지 컨텍스트를 불러왔습니다.");
     return cachedSiteContext.value;
   }
 
-  progress(10, "?꾩? 寃쎄퀎瑜?遺덈윭?ㅻ뒗 以묒엯?덈떎.");
+  progress(10, "필지 경계를 불러오는 중입니다.");
   const parcelResult = isManualRange
     ? {
         feature: buildClipBoundary(normalizedLocation, options, null, customBounds),
@@ -7642,7 +7730,7 @@ async function buildSiteContext(body, config, reportProgress = null) {
               : "Using the selected parcel boundary.",
         }
       : await resolveParcelBoundary(normalizedLocation, config);
-  progress(24, "?吏 踰붿쐞瑜?怨꾩궛?섎뒗 以묒엯?덈떎.");
+  progress(24, "대지 범위를 계산하는 중입니다.");
   const clipBoundary = isManualRange
     ? parcelResult.feature
     : isSelectionPreview
@@ -7664,7 +7752,7 @@ async function buildSiteContext(body, config, reportProgress = null) {
             options,
             parcelResult.feature
           );
-  progress(42, "吏???곗씠?곕? 以鍮꾪븯??以묒엯?덈떎.");
+  progress(42, "지형 데이터를 준비하는 중입니다.");
   const terrainResult = isSelectionPreview
     ? {
         provider: "preview",
@@ -7705,8 +7793,8 @@ async function buildSiteContext(body, config, reportProgress = null) {
   progress(
     68,
     options.includeBuildings === false
-      ? "嫄대Ъ 而⑦뀓?ㅽ듃瑜??앸왂?섎뒗 以묒엯?덈떎."
-      : "嫄대Ъ 而⑦뀓?ㅽ듃瑜?遺덈윭?ㅻ뒗 以묒엯?덈떎."
+      ? "건물 컨텍스트를 생략하는 중입니다."
+      : "건물 컨텍스트를 불러오는 중입니다."
   );
   const buildingResult =
     options.includeBuildings === false
@@ -7744,8 +7832,8 @@ async function buildSiteContext(body, config, reportProgress = null) {
   progress(
     88,
     options.includeBuildings === false
-      ? "嫄대Ъ 而⑦뀓?ㅽ듃瑜??앸왂?섍퀬 ?덉뒿?덈떎."
-      : "嫄대Ъ 而⑦뀓?ㅽ듃瑜??뺣━?섎뒗 以묒엯?덈떎."
+      ? "건물 컨텍스트를 생략하고 있습니다."
+      : "건물 컨텍스트를 정리하는 중입니다."
   );
   const selectedTargetParcelFeatures = isManualRange
     ? []
@@ -7907,7 +7995,7 @@ async function buildSiteContext(body, config, reportProgress = null) {
     value: siteContext,
   });
 
-  progress(100, "?吏 而⑦뀓?ㅽ듃 以鍮꾧? ?꾨즺?섏뿀?듬땲??");
+  progress(100, "대지 컨텍스트 준비가 완료되었습니다.");
   return siteContext;
 }
 
@@ -11600,7 +11688,7 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
   ];
   let vertexIndex = 1;
 
-  progress(8, "OBJ 吏?뺤쓣 援ъ꽦?섎뒗 以묒엯?덈떎.");
+  progress(8, "OBJ 지형을 구성하는 중입니다.");
 
   if (siteContext.options?.terrainMode === "contour") {
     vertexIndex = appendContourBandTerrainObjGeometry(lines, siteContext, vertexIndex);
@@ -11615,7 +11703,7 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
   }
 
   if (siteContext.options?.includeParcelBoundary !== false) {
-    progress(48, "?꾩? 寃쎄퀎?좎쓣 異붽??섎뒗 以묒엯?덈떎.");
+    progress(48, "필지 경계선을 추가하는 중입니다.");
     const parcelFeatures = targetParcelFeatures.length
       ? targetParcelFeatures
       : [siteContext.parcelBoundary].filter(Boolean);
@@ -11683,7 +11771,7 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
   }
 
   if (siteContext.options?.includeContours !== false) {
-    progress(66, "?깃퀬???덉씠?대? ?뺣━?섎뒗 以묒엯?덈떎.");
+    progress(66, "등고선 레이어를 정리하는 중입니다.");
     let contourCounter = 1;
 
     for (const feature of siteContext.contourLines.features) {
@@ -11709,7 +11797,7 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
   }
 
   if (siteContext.options?.includeBuildings !== false) {
-    progress(80, "嫄대Ъ 留ㅼ뒪瑜?諛곗튂?섎뒗 以묒엯?덈떎.");
+    progress(80, "건물 매스를 배치하는 중입니다.");
     for (const feature of siteContext.buildings?.features || []) {
       vertexIndex = appendBuildingObjGeometry(
         lines,
@@ -11723,7 +11811,7 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
   }
 
   if (siteContext.options?.includeRoads === true) {
-    progress(90, "?꾨줈 ?ㅻ쾭?덉씠瑜?異붽??섎뒗 以묒엯?덈떎.");
+    progress(90, "도로 오버레이를 추가하는 중입니다.");
 
     if (siteContext.options?.terrainMode === "contour") {
       vertexIndex = appendContourBandRoadObjGeometry(
@@ -11746,7 +11834,7 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
     }
   }
 
-  progress(96, "OBJ ?뚯씪??留덈Т由ы븯??以묒엯?덈떎.");
+  progress(96, "OBJ 파일을 마무리하는 중입니다.");
   return lines.join("\n");
 }
 
@@ -12862,7 +12950,7 @@ async function buildSkpFromSiteContext(
     typeof reportProgress === "function" ? reportProgress : () => null;
   const runtimeConfig = resolveSkpExportRuntimeConfig(exportConfig);
 
-  progress(12, "SKP 蹂?섏슜 SketchUp payload瑜?以鍮꾪븯??以묒엯?덈떎.");
+  progress(12, "SKP 변환용 SketchUp payload를 준비하는 중입니다.");
   const payload = buildSketchUpPayloadFromSiteContext(siteContext);
   const tempDirectory = await mkdtemp(path.join(tmpdir(), "site-context-skp-"));
   const payloadPath = path.join(tempDirectory, "site-context.json");
@@ -12902,7 +12990,7 @@ async function buildSkpFromSiteContext(
         "utf8"
       );
 
-      progress(34, "Legacy SketchUp 蹂?섍린瑜??ㅽ뻾?섎뒗 以묒엯?덈떎.");
+      progress(34, "Legacy SketchUp 변환기를 실행하는 중입니다.");
       childProcessLabel = "SketchUp export process";
       childProcess = launchSketchUpExportProcess(
         sketchUpExecutable,
@@ -12922,7 +13010,7 @@ async function buildSkpFromSiteContext(
         );
       }
 
-      progress(34, "Standalone SKP 蹂?섍린瑜??ㅽ뻾?섎뒗 以묒엯?덈떎.");
+      progress(34, "Standalone SKP 변환기를 실행하는 중입니다.");
       childProcessLabel = "Standalone SKP exporter";
       childProcess = launchStandaloneSkpExporterProcess(
         standaloneExporterPath,
@@ -12938,7 +13026,7 @@ async function buildSkpFromSiteContext(
       ]);
     }
 
-    progress(92, "SKP ?뚯씪???섏쭛?섎뒗 以묒엯?덈떎.");
+    progress(92, "SKP 파일을 수집하는 중입니다.");
     return Buffer.from(skpBuffer);
   } finally {
     await ensureChildProcessTerminated(childProcess, {
@@ -13013,7 +13101,7 @@ async function buildSkpFromSiteContextWithRetry(
       if (attemptIndex > 1) {
         progress(
           Math.min(88, 48 + attemptIndex * 8),
-          `SKP ?앹꽦???ㅼ떆 ?쒕룄?섍퀬 ?덉뒿?덈떎. (${attemptIndex}/4)`
+          `SKP 생성을 다시 시도하고 있습니다. (${attemptIndex}/4)`
         );
       }
 
@@ -13623,6 +13711,38 @@ function createHttpError(statusCode, message, headers = {}) {
   return new HttpError(statusCode, message, headers);
 }
 
+function normalizePublicError(error) {
+  if (error instanceof HttpError) {
+    return error;
+  }
+
+  const message = String(error?.message || error || "").trim();
+
+  if (!message) {
+    return createHttpError(500, "Unexpected error");
+  }
+
+  if (/timed out after/i.test(message)) {
+    return createHttpError(
+      504,
+      "외부 연계 서비스 응답이 지연되고 있습니다. 잠시 후 다시 시도해주세요."
+    );
+  }
+
+  if (
+    /VWorld|Juso|Nominatim|EUM|Building HUB|Open-Meteo|OpenTopoData|Overpass|fetch failed/i.test(
+      message
+    )
+  ) {
+    return createHttpError(
+      502,
+      "외부 연계 서비스 요청 처리 중 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
+    );
+  }
+
+  return createHttpError(500, message || "Unexpected error");
+}
+
 function formatByteLimit(bytes) {
   const normalized = Math.max(1, Number(bytes) || 0);
 
@@ -13718,6 +13838,76 @@ function parseRequestContentLength(request) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
+function isPathInsideDirectory(parentDir, candidatePath) {
+  const relativePath = path.relative(parentDir, candidatePath);
+  return (
+    relativePath === "" ||
+    (!relativePath.startsWith("..") && !path.isAbsolute(relativePath))
+  );
+}
+
+function formatFetchTimeout(timeoutMs) {
+  if (timeoutMs % 1000 === 0) {
+    return `${timeoutMs / 1000}s`;
+  }
+
+  return `${(timeoutMs / 1000).toFixed(1)}s`;
+}
+
+async function fetchWithTimeout(resource, init = {}, options = {}) {
+  const timeoutMs = Math.max(
+    1,
+    Number(options?.timeoutMs) || DEFAULT_OUTBOUND_FETCH_TIMEOUT_MS
+  );
+  const requestLabel = String(
+    options?.requestLabel || "Outbound request"
+  ).trim();
+  const upstreamSignal = init?.signal;
+  const abortController = new AbortController();
+  let upstreamAbortHandler = null;
+
+  if (upstreamSignal && typeof upstreamSignal.addEventListener === "function") {
+    if (upstreamSignal.aborted) {
+      abortController.abort(upstreamSignal.reason);
+    } else {
+      upstreamAbortHandler = () => {
+        abortController.abort(upstreamSignal.reason);
+      };
+      upstreamSignal.addEventListener("abort", upstreamAbortHandler, {
+        once: true,
+      });
+    }
+  }
+
+  const timeoutHandle = setTimeout(() => {
+    abortController.abort(
+      new Error(`${requestLabel} timed out after ${formatFetchTimeout(timeoutMs)}.`)
+    );
+  }, timeoutMs);
+  timeoutHandle.unref?.();
+
+  try {
+    return await fetch(resource, {
+      ...init,
+      signal: abortController.signal,
+    });
+  } catch (error) {
+    if (abortController.signal.aborted && !upstreamSignal?.aborted) {
+      throw new Error(
+        `${requestLabel} timed out after ${formatFetchTimeout(timeoutMs)}.`
+      );
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeoutHandle);
+
+    if (upstreamAbortHandler) {
+      upstreamSignal.removeEventListener("abort", upstreamAbortHandler);
+    }
+  }
+}
+
 function buildSecurityHeaders() {
   return {
     "Content-Security-Policy": DEFAULT_CONTENT_SECURITY_POLICY,
@@ -13806,7 +13996,7 @@ function enforceRateLimit(request, response, config, bucket) {
       response,
       429,
       {
-        error: policy.message || "?붿껌???덈Т 留롮뒿?덈떎. ?좎떆 ???ㅼ떆 ?쒕룄?댁＜?몄슂.",
+        error: policy.message || "요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
       },
       {
         "Retry-After": String(
@@ -13829,7 +14019,7 @@ async function withExportJobSlot(config, work) {
   );
 
   if (activeExportJobs >= maxConcurrentJobs) {
-    throw createHttpError(429, "?ㅻⅨ 紐⑤뜽 ?대낫?닿린媛 吏꾪뻾 以묒엯?덈떎. ?좎떆 ???ㅼ떆 ?쒕룄?댁＜?몄슂.", {
+    throw createHttpError(429, "다른 모델 내보내기가 진행 중입니다. 잠시 후 다시 시도해주세요.", {
       "Retry-After": "15",
     });
   }
@@ -13844,6 +14034,7 @@ async function withExportJobSlot(config, work) {
 }
 
 function appendDxfPolylineEntity(
+  state,
   lines,
   layerName,
   points,
@@ -13859,25 +14050,40 @@ function appendDxfPolylineEntity(
   const zElevation = Number.isFinite(Number(elevation))
     ? Number(elevation)
     : 0;
+  const entityHandle = allocateDxfHandle(state);
+
+  updateDxfBounds(state, normalizedPoints, zElevation);
 
   appendDxfPair(lines, 0, "LWPOLYLINE");
+  appendDxfPair(lines, 5, entityHandle);
+  appendDxfPair(lines, 330, state.handles.blockRecords.modelSpace);
   appendDxfPair(lines, 100, "AcDbEntity");
+  appendDxfPair(lines, 67, 0);
   appendDxfPair(lines, 8, layerName);
+  appendDxfPair(lines, 6, "BYLAYER");
+  appendDxfPair(lines, 62, 256);
+  appendDxfPair(lines, 370, -1);
+  appendDxfPair(lines, 410, "Model");
   appendDxfPair(lines, 100, "AcDbPolyline");
   appendDxfPair(lines, 90, normalizedPoints.length);
   appendDxfPair(lines, 70, closed ? 1 : 0);
 
   if (Math.abs(zElevation) > 0.0005) {
-    appendDxfPair(lines, 38, zElevation.toFixed(3));
+    appendDxfPair(lines, 38, formatDxfCoordinateValue(zElevation));
   }
 
   for (const [xMeters, yMeters] of normalizedPoints) {
-    appendDxfPair(lines, 10, Number(xMeters).toFixed(3));
-    appendDxfPair(lines, 20, Number(yMeters).toFixed(3));
+    appendDxfPair(lines, 10, formatDxfCoordinateValue(xMeters));
+    appendDxfPair(lines, 20, formatDxfCoordinateValue(yMeters));
   }
+
+  appendDxfPair(lines, 210, "0.000");
+  appendDxfPair(lines, 220, "0.000");
+  appendDxfPair(lines, 230, "1.000");
 }
 
 function appendDxfFeaturePolygonEntities(
+  state,
   lines,
   layerName,
   feature,
@@ -13886,6 +14092,7 @@ function appendDxfFeaturePolygonEntities(
 ) {
   for (const ring of getFeaturePolygonRings(feature)) {
     appendDxfPolylineEntity(
+      state,
       lines,
       layerName,
       getOpenRing(ring).map((point) => localMetersFromLngLat(point, center)),
@@ -13902,7 +14109,6 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
   const center = { lat: location.lat, lng: location.lng };
   const progress =
     typeof reportProgress === "function" ? reportProgress : () => null;
-  const lines = [];
   const layers = [
     { name: "CLIP_BOUNDARY", color: 1 },
     { name: "PARCEL_BOUNDARY", color: 30 },
@@ -13912,43 +14118,51 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
     { name: "TARGET_BUILDING", color: 10 },
     { name: "ROADS", color: 5 },
   ];
+  const state = createDxfDocumentState(layers);
+  const entityLines = [];
+  const lines = [];
 
-  progress(6, "DXF 疫꿸퀡???닌듼쒐몴?筌띾슢諭??餓λ쵐???덈뼄.");
-  appendDxfHeaderSection(lines);
-  appendDxfTablesSection(lines, layers);
-  appendDxfPair(lines, 0, "SECTION");
-  appendDxfPair(lines, 2, "ENTITIES");
+  progress(6, "DXF 湲곕낯 援ъ“瑜?留뚮뱶??以묒엯?덈떎.");
 
-  progress(18, "DXF 野껋럡???遺용꺖???類ｂ봺??롫뮉 餓λ쵐???덈뼄.");
-  appendDxfFeaturePolygonEntities(
-    lines,
+  progress(18, "DXF 寃쎄퀎 ?붿냼瑜??뺣━?섎뒗 以묒엯?덈떎.");
+  appendDxfFeaturePolygonLineEntities(
+    state,
+    entityLines,
     "CLIP_BOUNDARY",
     siteContext.clipBoundary,
     center
   );
 
   if (siteContext.options?.includeParcelBoundary !== false) {
-    appendDxfFeaturePolygonEntities(
-      lines,
+    appendDxfFeaturePolygonLineEntities(
+      state,
+      entityLines,
       "PARCEL_BOUNDARY",
       siteContext.parcelBoundary,
       center
     );
 
     for (const feature of siteContext.parcelContext?.features || []) {
-      appendDxfFeaturePolygonEntities(lines, "PARCEL_CONTEXT", feature, center);
+      appendDxfFeaturePolygonLineEntities(
+        state,
+        entityLines,
+        "PARCEL_CONTEXT",
+        feature,
+        center
+      );
     }
   }
 
   if (siteContext.options?.includeContours !== false) {
-    progress(42, "DXF ?源껎??野껋럢?롧몴??遺???롫뮉 餓λ쵐???덈뼄.");
+    progress(42, "DXF ?깃퀬??寃쎅퀎瑜??붽??섎뒗 以묒엯?덈떎.");
 
     for (const feature of siteContext.contourLines?.features || []) {
       const elevation = Number(feature.properties?.elevation || 0);
 
       for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
-        appendDxfPolylineEntity(
-          lines,
+        appendDxfPathAsLineEntities(
+          state,
+          entityLines,
           "CONTOURS",
           lineString.map((point) => localMetersFromLngLat(point, center)),
           {
@@ -13961,11 +14175,12 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
   }
 
   if (siteContext.options?.includeBuildings !== false) {
-    progress(62, "DXF 椰꾨?窺 footprint???遺???롫뮉 餓λ쵐???덈뼄.");
+    progress(62, "DXF 嫄대Ъ footprint瑜??붽??섎뒗 以묒엯?덈떎.");
 
     for (const feature of siteContext.buildings?.features || []) {
-      appendDxfFeaturePolygonEntities(
-        lines,
+      appendDxfFeaturePolygonLineEntities(
+        state,
+        entityLines,
         feature.properties?.isTarget ? "TARGET_BUILDING" : "BUILDINGS",
         feature,
         center
@@ -13974,7 +14189,7 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
   }
 
   if (siteContext.options?.includeRoads === true) {
-    progress(78, "DXF ?袁⑥쨮 footprint???遺???롫뮉 餓λ쵐???덈뼄.");
+    progress(78, "DXF ?꾨줈 footprint瑜??붽??섎뒗 以묒엯?덈떎.");
 
     if (siteContext.options?.terrainMode === "contour") {
       const roadSurfaceGroups = buildRoadContourSurfaceGroups(siteContext, center);
@@ -13989,16 +14204,28 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
         );
 
         for (const region of group.regions) {
-          appendDxfPolylineEntity(lines, "ROADS", region.outerPoints, {
-            closed: true,
-            elevation: topElevation,
-          });
-
-          for (const holePoints of region.holePoints || []) {
-            appendDxfPolylineEntity(lines, "ROADS", holePoints, {
+          appendDxfPathAsLineEntities(
+            state,
+            entityLines,
+            "ROADS",
+            region.outerPoints,
+            {
               closed: true,
               elevation: topElevation,
-            });
+            }
+          );
+
+          for (const holePoints of region.holePoints || []) {
+            appendDxfPathAsLineEntities(
+              state,
+              entityLines,
+              "ROADS",
+              holePoints,
+              {
+                closed: true,
+                elevation: topElevation,
+              }
+            );
           }
         }
       }
@@ -14010,7 +14237,7 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
 
       for (const polygon of roadFootprintMultiPolygon) {
         for (const ring of polygon || []) {
-          appendDxfPolylineEntity(lines, "ROADS", ring, {
+          appendDxfPathAsLineEntities(state, entityLines, "ROADS", ring, {
             closed: true,
           });
         }
@@ -14018,7 +14245,13 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
     }
   }
 
-  progress(94, "DXF ???뵬??筌띾뜄龜?귐뗫릭??餓λ쵐???덈뼄.");
+  appendDxfHeaderSection(lines, state);
+  appendDxfTablesSection(lines, state);
+  appendDxfBlocksSection(lines, state);
+  appendDxfPair(lines, 0, "SECTION");
+  appendDxfPair(lines, 2, "ENTITIES");
+  lines.push(...entityLines);
+  progress(94, "DXF ?뚯씪??留덈Т由ы븯??以묒엯?덈떎.");
   appendDxfPair(lines, 0, "ENDSEC");
   appendDxfPair(lines, 0, "EOF");
   return `${lines.join("\r\n")}\r\n`;
@@ -15210,7 +15443,7 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
 async function build3dmFromSiteContext(siteContext, reportProgress = null) {
   const progress =
     typeof reportProgress === "function" ? reportProgress : () => null;
-  progress(6, "3DM ?붿쭊??以鍮꾪븯??以묒엯?덈떎.");
+  progress(6, "3DM 엔진을 준비하는 중입니다.");
   const rhino = await getRhino3dm();
   const doc = new rhino.File3dm();
   const docSettings = doc.settings();
@@ -15275,7 +15508,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
     g: 128,
     b: 168,
   });
-  progress(18, "3DM 吏???덉씠?대? 援ъ꽦?섎뒗 以묒엯?덈떎.");
+  progress(18, "3DM 지형 레이어를 구성하는 중입니다.");
 
   if (siteContext.options?.terrainMode === "flat") {
     addRhinoFlatTerrain(doc, rhino, terrainLayer, siteContext, center);
@@ -15292,7 +15525,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
   }
 
   if (siteContext.options?.includeBuildings !== false) {
-    progress(56, "3DM 嫄대Ъ ?덉씠?대? 諛곗튂?섎뒗 以묒엯?덈떎.");
+    progress(56, "3DM 건물 레이어를 배치하는 중입니다.");
     addRhinoBuildings(
       doc,
       rhino,
@@ -15306,7 +15539,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
   }
 
   if (siteContext.options?.includeParcelBoundary !== false) {
-    progress(74, "?꾩? 寃쎄퀎?좎쓣 異붽??섎뒗 以묒엯?덈떎.");
+    progress(74, "필지 경계선을 추가하는 중입니다.");
     addRhinoPolylineCollection(
       doc,
       rhino,
@@ -15341,7 +15574,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
   }
 
   if (siteContext.options?.includeContours !== false) {
-    progress(86, "?깃퀬???덉씠?대? 異붽??섎뒗 以묒엯?덈떎.");
+    progress(86, "등고선 레이어를 추가하는 중입니다.");
     for (
       let index = 0;
       index < (siteContext.contourLines?.features || []).length;
@@ -15384,7 +15617,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
   }
 
   if (siteContext.options?.includeRoads === true) {
-    progress(92, "3DM ?꾨줈 ?덉씠?대? 異붽??섎뒗 以묒엯?덈떎.");
+    progress(92, "3DM 도로 레이어를 추가하는 중입니다.");
     const roadLayer = ensureRhinoLayer(doc, layerIndexCache, "roads", {
       r: 91,
       g: 112,
@@ -15437,7 +15670,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
     }
   }
 
-  progress(96, "3DM ?뚯씪??吏곷젹?뷀븯??以묒엯?덈떎.");
+  progress(96, "3DM 파일을 직렬화하는 중입니다.");
   const writeOptions = new rhino.File3dmWriteOptions();
   writeOptions.version = RHINO6_FILE3DM_VERSION;
   writeOptions.saveUserData = true;
@@ -15635,8 +15868,8 @@ function createModelSpec(body) {
     createdAt: new Date().toISOString(),
     message:
       hasBuildings
-        ? "?꾩옱 ?대낫?닿린???꾨줈?좏????④퀎?대ŉ, ?吏 寃쎄퀎? ?ㅽ몴怨?湲곕컲 吏?? 二쇰? 嫄대Ъ mass媛 ?④퍡 ?ы븿?⑸땲??"
-        : "?꾩옱 ?대낫?닿린???꾨줈?좏????④퀎?대ŉ, ?吏 寃쎄퀎? ?ㅽ몴怨?湲곕컲 吏?뺤씠 ?④퍡 ?ы븿?⑸땲??",
+        ? "현재 내보내기는 프로토타입 단계이며, 대지 경계와 실표고 기반 지형, 주변 건물 mass가 함께 포함됩니다."
+        : "현재 내보내기는 프로토타입 단계이며, 대지 경계와 실표고 기반 지형이 함께 포함됩니다.",
     location: body.location,
     options: body.options,
     exportTargets: ["3dm", "obj", "dxf", "skp", "skp-payload"],
@@ -15692,7 +15925,7 @@ function buildExportDownloadFilename(siteContext, options, format) {
   const parts = [addressPart, radiusPart, intervalPart];
 
   if (options?.splitParcelBoundary === true && siteContext?.selectionMode !== "range") {
-    parts.push("遺꾩젅");
+    parts.push("분절");
   }
 
   return `${parts.join("_")}.${fileExtension}`;
@@ -15729,6 +15962,8 @@ function createEumHandoffHtml(requestUrl) {
   const pLocation = normalizeSystemAddress(
     requestUrl.searchParams.get("p_location") || ""
   );
+  const handoffStylesheetHref = "/handoff.css?v=20260326-security3";
+  const handoffScriptHref = "/handoff-auto-submit.js?v=20260326-security3";
 
   if (!pnu || !sggcd) {
     return `
@@ -15736,14 +15971,13 @@ function createEumHandoffHtml(requestUrl) {
       <html lang="ko">
         <head>
           <meta charset="utf-8" />
-          <title>?좎??댁쓬 ?곌껐 ?ㅽ뙣</title>
-          <style>
-            body { font-family: 'Segoe UI', sans-serif; padding: 32px; color: #2e241c; }
-          </style>
+          <title>토지이음 연결 실패</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <link rel="stylesheet" href="${handoffStylesheetHref}" />
         </head>
-        <body>
-          <h1>?좎??댁쓬 ?곌껐???꾩슂???꾩? ?뺣낫媛 ?놁뒿?덈떎.</h1>
-          <p>PNU ?먮뒗 ?쒓뎔援?肄붾뱶媛 鍮꾩뼱 ?덉뒿?덈떎. 二쇱냼瑜??ㅼ떆 ?좏깮?????쒕룄??二쇱꽭??</p>
+        <body class="handoff-shell handoff-shell--error">
+          <h1>토지이음 연결에 필요한 필지 정보가 없습니다.</h1>
+          <p>PNU 또는 시군구 코드가 비어 있습니다. 주소를 다시 선택한 뒤 시도해 주세요.</p>
         </body>
       </html>
     `;
@@ -15771,38 +16005,20 @@ function createEumHandoffHtml(requestUrl) {
     <html lang="ko">
       <head>
         <meta charset="utf-8" />
-        <title>?좎??댁쓬 ?곌껐 以?/title>
-        <style>
-          body {
-            font-family: 'Segoe UI', sans-serif;
-            padding: 32px;
-            color: #2e241c;
-            background: #f8f4ec;
-          }
-          .card {
-            max-width: 620px;
-            margin: 0 auto;
-            padding: 24px;
-            border-radius: 20px;
-            background: #fffaf2;
-            border: 1px solid rgba(111, 86, 60, 0.18);
-          }
-        </style>
+        <title>토지이음 연결 중</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <link rel="stylesheet" href="${handoffStylesheetHref}" />
+        <script defer src="${handoffScriptHref}"></script>
       </head>
-      <body>
-        <div class="card">
-          <h1>?좎??댁쓬 寃곌낵 ?섏씠吏濡??대룞 以묒엯?덈떎.</h1>
-          <p>????뿉???먮룞 ?곌껐?섏? ?딆쑝硫??꾨옒 踰꾪듉???뚮윭二쇱꽭??</p>
+      <body class="handoff-shell handoff-shell--submit">
+        <div class="handoff-card">
+          <h1>토지이음 결과 페이지로 이동 중입니다.</h1>
+          <p>새 탭에서 자동 연결되지 않으면 아래 버튼을 눌러주세요.</p>
           <form id="handoffForm" method="post" action="https://www.eum.go.kr/web/ar/lu/luLandDet.jsp">
             ${inputs}
-            <button type="submit">?좎??댁쓬 ?닿린</button>
+            <button type="submit">토지이음 열기</button>
           </form>
         </div>
-        <script>
-          window.addEventListener("load", function () {
-            document.getElementById("handoffForm").submit();
-          });
-        </script>
       </body>
     </html>
   `;
@@ -15812,6 +16028,8 @@ function createEumLawHandoffHtml(requestUrl) {
   const authCd = String(requestUrl.searchParams.get("authCd") || "").trim();
   const ucode = String(requestUrl.searchParams.get("ucode") || "").trim();
   const uname = cleanHtmlText(requestUrl.searchParams.get("uname") || "").trim();
+  const handoffStylesheetHref = "/handoff.css?v=20260326-security3";
+  const handoffScriptHref = "/handoff-auto-submit.js?v=20260326-security3";
 
   if (!authCd || !ucode) {
     return `
@@ -15819,14 +16037,13 @@ function createEumLawHandoffHtml(requestUrl) {
       <html lang="ko">
         <head>
           <meta charset="utf-8" />
-          <title>踰뺣졊 ?곌껐 ?ㅽ뙣</title>
-          <style>
-            body { font-family: 'Segoe UI', sans-serif; padding: 32px; color: #2e241c; }
-          </style>
+          <title>법령 연결 실패</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <link rel="stylesheet" href="${handoffStylesheetHref}" />
         </head>
-        <body>
-          <h1>踰뺣졊 ?곸꽭 ?곌껐???꾩슂???뺣낫媛 ?놁뒿?덈떎.</h1>
-          <p>踰뺣졊 肄붾뱶媛 鍮꾩뼱 ?덉뒿?덈떎. 二쇱냼瑜??ㅼ떆 ?좏깮?????쒕룄??二쇱꽭??</p>
+        <body class="handoff-shell handoff-shell--error">
+          <h1>법령 상세 연결에 필요한 정보가 없습니다.</h1>
+          <p>법령 코드가 비어 있습니다. 주소를 다시 선택한 뒤 시도해 주세요.</p>
         </body>
       </html>
     `;
@@ -15850,28 +16067,15 @@ function createEumLawHandoffHtml(requestUrl) {
     <html lang="ko">
       <head>
         <meta charset="utf-8" />
-        <title>踰뺣졊 ?곸꽭 ?곌껐 以?/title>
-        <style>
-          body {
-            font-family: 'Segoe UI', sans-serif;
-            padding: 32px;
-            color: #2e241c;
-            background: #f8f4ec;
-          }
-          .card {
-            max-width: 620px;
-            margin: 0 auto;
-            padding: 24px;
-            border-radius: 20px;
-            background: #fffaf2;
-            border: 1px solid rgba(111, 86, 60, 0.18);
-          }
-        </style>
+        <title>법령 상세 연결 중</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <link rel="stylesheet" href="${handoffStylesheetHref}" />
+        <script defer src="${handoffScriptHref}"></script>
       </head>
-      <body>
-        <div class="card">
-          <h1>踰뺣졊 ?곸꽭 ?섏씠吏濡??대룞 以묒엯?덈떎.</h1>
-          <p>?먮룞 ?곌껐?섏? ?딆쑝硫??꾨옒 踰꾪듉???뚮윭二쇱꽭??</p>
+      <body class="handoff-shell handoff-shell--submit">
+        <div class="handoff-card">
+          <h1>법령 상세 페이지로 이동 중입니다.</h1>
+          <p>자동 연결되지 않으면 아래 버튼을 눌러주세요.</p>
           <form
             id="handoffForm"
             method="get"
@@ -15879,14 +16083,9 @@ function createEumLawHandoffHtml(requestUrl) {
             action="https://www.eum.go.kr/web/ar/lw/lwLawDet.jsp"
           >
             ${inputs}
-            <button type="submit">踰뺣졊 ?곸꽭 ?닿린</button>
+            <button type="submit">법령 상세 열기</button>
           </form>
         </div>
-        <script>
-          window.addEventListener("load", function () {
-            document.getElementById("handoffForm").submit();
-          });
-        </script>
       </body>
     </html>
   `;
@@ -15958,7 +16157,7 @@ async function createApp() {
         );
 
         if (!token) {
-          sendJson(response, 400, { error: "?좏슚??吏꾪뻾 ?좏겙???꾩슂?⑸땲??" });
+          sendJson(response, 400, { error: "유효한 진행 토큰이 필요합니다." });
           return;
         }
 
@@ -15966,7 +16165,7 @@ async function createApp() {
         const clientIp = getClientIp(request);
 
         if (!entry || (entry.clientIp && entry.clientIp !== clientIp)) {
-          sendJson(response, 404, { error: "吏꾪뻾 ?곹깭瑜?李얠쓣 ???놁뒿?덈떎." });
+          sendJson(response, 404, { error: "진행 상태를 찾을 수 없습니다." });
           return;
         }
 
@@ -16056,7 +16255,7 @@ async function createApp() {
         beginRequestProgress(
           progressToken,
           "site-context",
-          "?吏 而⑦뀓?ㅽ듃 ?붿껌??以鍮꾪븯??以묒엯?덈떎."
+          "대지 컨텍스트 요청을 준비하는 중입니다."
         );
 
         updateRequestProgress(progressToken, { clientIp });
@@ -16072,7 +16271,7 @@ async function createApp() {
           );
           completeRequestProgress(
             progressToken,
-            "?吏 而⑦뀓?ㅽ듃 以鍮꾧? ?꾨즺?섏뿀?듬땲??"
+            "대지 컨텍스트 준비가 완료되었습니다."
           );
           sendJson(response, 200, payload);
           return;
@@ -16105,7 +16304,7 @@ async function createApp() {
         if (!parcelReference) {
           sendJson(response, 400, {
             error:
-              "?좎??뺣낫 議고쉶???꾩? ?앸퀎?뺣낫媛 ?놁뒿?덈떎. 二쇱냼 寃??寃곌낵瑜??좏깮?섍굅???吏瑜?癒쇱? 遺덈윭?ㅼ꽭??",
+              "토지정보 조회용 필지 식별정보가 없습니다. 주소 검색 결과를 선택하거나 대지를 먼저 불러오세요.",
           });
           return;
         }
@@ -16127,7 +16326,7 @@ async function createApp() {
         if (!parcelReference) {
           sendJson(response, 400, {
             error:
-              "?좎? ?곸꽭?뺣낫 議고쉶???꾩? ?앸퀎?뺣낫媛 ?놁뒿?덈떎. 二쇱냼 寃??寃곌낵瑜??좏깮?섍굅???吏瑜?癒쇱? 遺덈윭?ㅼ꽭??",
+              "토지 상세정보 조회용 필지 식별정보가 없습니다. 주소 검색 결과를 선택하거나 대지를 먼저 불러오세요.",
           });
           return;
         }
@@ -16147,7 +16346,7 @@ async function createApp() {
       ) {
         if (!config.buildingHubServiceKey) {
           sendJson(response, 400, {
-            error: "嫄댁텞HUB ?쒕퉬?ㅽ궎媛 ?ㅼ젙?섏? ?딆븯?듬땲??",
+            error: "건축HUB 서비스키가 설정되지 않았습니다.",
           });
           return;
         }
@@ -16160,7 +16359,7 @@ async function createApp() {
         if (!parcelReference) {
           sendJson(response, 400, {
             error:
-              "嫄댁텞臾쇰???議고쉶???꾩? ?앸퀎?뺣낫媛 ?놁뒿?덈떎. 二쇱냼 寃??寃곌낵瑜??좏깮?섍굅???吏瑜?癒쇱? 遺덈윭?ㅼ꽭??",
+              "건축물대장 조회용 필지 식별정보가 없습니다. 주소 검색 결과를 선택하거나 대지를 먼저 불러오세요.",
           });
           return;
         }
@@ -16191,7 +16390,7 @@ async function createApp() {
           isSkpPayloadRoute
             ? "Preparing SKP payload export."
             :
-          "3D ?뚯씪 ?붿껌??以鍮꾪븯??以묒엯?덈떎."
+          "3D 파일 요청을 준비하는 중입니다."
         );
 
         updateRequestProgress(progressToken, { clientIp });
@@ -16221,7 +16420,7 @@ async function createApp() {
           ) {
             updateRequestProgress(progressToken, {
               percent: 8,
-              message: "?대낫???吏 而⑦뀓?ㅽ듃瑜?怨꾩궛?섎뒗 以묒엯?덈떎.",
+              message: "내보낼 대지 컨텍스트를 계산하는 중입니다.",
             });
             if (siteContext) {
               console.log(
@@ -16240,7 +16439,7 @@ async function createApp() {
           } else {
             updateRequestProgress(progressToken, {
               percent: 16,
-              message: "??λ맂 ?吏 而⑦뀓?ㅽ듃瑜??뺤씤?섎뒗 以묒엯?덈떎.",
+              message: "저장된 대지 컨텍스트를 확인하는 중입니다.",
             });
           }
 
@@ -16278,11 +16477,11 @@ async function createApp() {
             );
             updateRequestProgress(progressToken, {
               percent: 96,
-              message: "?댁쟾 異쒕젰 寃곌낵瑜??ㅼ떆 ?ъ슜?섎뒗 以묒엯?덈떎.",
+              message: "이전 출력 결과를 다시 사용하는 중입니다.",
             });
             completeRequestProgress(
               progressToken,
-              `${String(format || "model").toUpperCase()} 罹먯떆 寃곌낵瑜??대젮諛쏆뒿?덈떎.`
+              `${String(format || "model").toUpperCase()} 캐시 결과를 내려받습니다.`
             );
 
             if (format === "skp-payload") {
@@ -16324,7 +16523,7 @@ async function createApp() {
           if (format === "3dm") {
             updateRequestProgress(progressToken, {
               percent: 48,
-              message: "3DM 紐⑤뜽???앹꽦?섎뒗 以묒엯?덈떎.",
+              message: "3DM 모델을 생성하는 중입니다.",
             });
             const exportBody = await build3dmFromSiteContext(
               siteContext,
@@ -16337,7 +16536,7 @@ async function createApp() {
             );
             completeRequestProgress(
               progressToken,
-              "3DM ?뚯씪 ?ㅼ슫濡쒕뱶瑜??쒖옉?⑸땲??"
+              "3DM 파일 다운로드를 시작합니다."
             );
             writeExportArtifactCache(exportCacheKey, exportBody, {
               contentType: "application/octet-stream",
@@ -16355,12 +16554,12 @@ async function createApp() {
 
           updateRequestProgress(progressToken, {
             percent: 48,
-            message: "OBJ 紐⑤뜽???앹꽦?섎뒗 以묒엯?덈떎.",
+            message: "OBJ 모델을 생성하는 중입니다.",
           });
           if (format === "skp") {
             updateRequestProgress(progressToken, {
               percent: 48,
-              message: "SKP 紐⑤뜽???앹꽦?섎뒗 以묒엯?덈떎.",
+              message: "SKP 모델을 생성하는 중입니다.",
             });
             const exportBody = await buildSkpFromSiteContextWithRetry(
               siteContext,
@@ -16374,7 +16573,7 @@ async function createApp() {
             );
             completeRequestProgress(
               progressToken,
-              "SKP ?뚯씪 ?ㅼ슫濡쒕뱶瑜??쒖옉?⑸땲??"
+              "SKP 파일 다운로드를 시작합니다."
             );
             writeExportArtifactCache(exportCacheKey, exportBody, {
               contentType: "application/octet-stream",
@@ -16436,7 +16635,7 @@ async function createApp() {
           if (format === "dxf") {
             updateRequestProgress(progressToken, {
               percent: 48,
-              message: "DXF 筌뤴뫀?????밴쉐??롫뮉 餓λ쵐???덈뼄.",
+              message: "DXF 紐⑤뜽???앹꽦?섎뒗 以묒엯?덈떎.",
             });
             const exportBody = buildDxfFromSiteContext(
               siteContext,
@@ -16450,7 +16649,7 @@ async function createApp() {
             );
             completeRequestProgress(
               progressToken,
-              "DXF ???뵬 ??쇱뒲嚥≪뮆諭띄몴???뽰삂??몃빍??"
+              "DXF ?뚯씪 ?ㅼ슫濡쒕뱶瑜??쒖옉?⑸땲??"
             );
             const exportBuffer = Buffer.from(exportBody, "utf8");
             writeExportArtifactCache(exportCacheKey, exportBuffer, {
@@ -16479,7 +16678,7 @@ async function createApp() {
           );
           completeRequestProgress(
             progressToken,
-            "OBJ ?뚯씪 ?ㅼ슫濡쒕뱶瑜??쒖옉?⑸땲??"
+            "OBJ 파일 다운로드를 시작합니다."
           );
             const exportBuffer = Buffer.from(exportBody, "utf8");
             writeExportArtifactCache(exportCacheKey, exportBuffer, {
@@ -16509,31 +16708,38 @@ async function createApp() {
 
       await serveStatic(requestUrl.pathname, response);
     } catch (error) {
+      const publicError = normalizePublicError(error);
       const statusCode =
-        error instanceof HttpError ? error.statusCode : 500;
+        publicError instanceof HttpError ? publicError.statusCode : 500;
       const errorHeaders =
-        error instanceof HttpError ? error.headers : {};
+        publicError instanceof HttpError ? publicError.headers : {};
 
       if (!(error instanceof HttpError) || statusCode >= 500) {
         logServerError(`${request.method} ${requestUrl.pathname}`, error);
       }
 
       sendJson(response, statusCode, {
-        error: error instanceof Error ? error.message : "Unexpected error",
+        error:
+          publicError instanceof Error ? publicError.message : "Unexpected error",
       }, errorHeaders);
     }
   };
 
-  async function listenOnConfiguredPort(port) {
+  async function listenOnConfiguredPort(port, host) {
     const server = createServer(requestHandler);
 
     try {
       await new Promise((resolve, reject) => {
         server.once("error", reject);
+        if (host) {
+          server.listen(port, host, resolve);
+          return;
+        }
+
         server.listen(port, resolve);
       });
 
-      return { port, server };
+      return { port, host: host || "", server };
     } catch (error) {
       server.close();
 
@@ -16547,9 +16753,14 @@ async function createApp() {
     }
   }
 
-  const { port, server } = await listenOnConfiguredPort(config.port);
-  console.log(`Space Work running at http://localhost:${port}`);
-  return { port, server };
+  const { port, host, server } = await listenOnConfiguredPort(
+    config.port,
+    config.bindHost
+  );
+  const displayHost =
+    !host || host === "0.0.0.0" || host === "::" ? "localhost" : host;
+  console.log(`Space Work running at http://${displayHost}:${port}`);
+  return { port, host, server };
 }
 
 export {
@@ -16572,8 +16783,11 @@ export {
   centroidOfRing,
   collectBuildingFootprintElevationSamples,
   ensureRhinoLayer,
+  fetchWithTimeout,
   getRhino3dm,
+  isPathInsideDirectory,
   localMetersFromLngLat,
+  normalizePublicError,
   prepareSiteContextForExport,
   resolveRawTerrainHeightAtLocalPoint,
   siteHeightAtLocalPoint,
