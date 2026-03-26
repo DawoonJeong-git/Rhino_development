@@ -58,11 +58,11 @@ const DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS = 1500;
 const DEFAULT_MAX_CONCURRENT_EXPORT_JOBS = 2;
 const DEFAULT_CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
-  "script-src 'self'",
+  "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com",
   "style-src 'self'",
   "img-src 'self' data: blob: https:",
   "font-src 'self' data: https:",
-  "connect-src 'self'",
+  "connect-src 'self' https://cloudflareinsights.com https://*.cloudflareinsights.com https://static.cloudflareinsights.com",
   "object-src 'none'",
   "base-uri 'self'",
   "frame-ancestors 'none'",
