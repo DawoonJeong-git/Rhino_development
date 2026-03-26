@@ -75,20 +75,20 @@ Note:
 Copy the contour dataset to a stable directory on the server, for example:
 
 ```bash
-/opt/site-context-planner/data/contours
+/opt/space-work/data/contours
 ```
 
 Set:
 
 ```bash
-TERRAIN_CONTOUR_PATH=/opt/site-context-planner/data/contours
+TERRAIN_CONTOUR_PATH=/opt/space-work/data/contours
 TERRAIN_CONTOUR_CRS=EPSG:5179
 ```
 
 ## Step 3. Build the Container
 
 ```bash
-docker build -t site-context-planner:latest .
+docker build -t space-work:latest .
 ```
 
 Or with Compose:
@@ -105,7 +105,7 @@ Example:
 
 ```bash
 docker run -d \
-  --name site-context-planner \
+  --name space-work \
   -p 3000:3000 \
   -e PORT=3000 \
   -e VWORLD_API_KEY=... \
@@ -116,9 +116,9 @@ docker run -d \
   -e TERRAIN_CONTOUR_PATH=/app/data/contours \
   -e TERRAIN_CONTOUR_CRS=EPSG:5179 \
   -e USE_NOMINATIM_FALLBACK=true \
-  -v /opt/site-context-planner/data/contours:/app/data/contours:ro \
+  -v /opt/space-work/data/contours:/app/data/contours:ro \
   --restart unless-stopped \
-  site-context-planner:latest
+  space-work:latest
 ```
 
 ## Step 5. Reverse Proxy

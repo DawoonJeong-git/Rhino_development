@@ -2,7 +2,7 @@
 
 ## Goal
 
-Run the app on your home Windows PC, expose it to the web, and allow only specific public IP addresses to access it.
+Run the app on your home Windows PC, expose it privately, and allow only specific public IP addresses to access it.
 
 This guide assumes:
 
@@ -13,20 +13,34 @@ This guide assumes:
 
 For the safest day-to-day workflow on one PC, keep two folders:
 
-- development: `C:\Rhino_develop`
-- production: `C:\Rhino_deploy`
+- development: `C:\SpaceWork_develop`
+- production: `C:\SpaceWork_deploy`
 
 Edit code only in the development folder. Run the public website only from the production folder.
 
+If you already have older folders such as `C:\Rhino_develop` and `C:\Rhino_deploy`, you can keep using them temporarily and pass the path explicitly to the deploy scripts until you finish the folder rename.
+
 ## High-Level Structure
 
-Your home PC will do three jobs:
+Safer recommended flow:
+
+1. run the Node app on `localhost:3000`
+2. run Cloudflare Tunnel on the same PC
+3. keep the Node app private behind the tunnel
+
+```text
+friend's browser
+-> your domain
+-> Cloudflare
+-> Cloudflare Tunnel on your PC
+-> Node app on localhost:3000
+```
+
+Optional direct-access flow if you are not using a tunnel:
 
 1. run the Node app on `localhost:3000`
 2. run Caddy on ports `80` and `443`
 3. only accept connections from approved public IP addresses
-
-The flow is:
 
 ```text
 friend's browser
@@ -45,7 +59,7 @@ friend's browser
 - a domain or DDNS hostname
 - the public IP addresses you want to allow
 - Node.js installed
-- Caddy installed
+- Caddy installed if you want a local reverse proxy
 
 ## Important Limits
 
@@ -68,9 +82,9 @@ For home-PC hosting, you can run the app directly with Node first.
 
 Recommended split on one PC:
 
-1. Keep developing in `C:\Rhino_develop`
-2. Create a separate production clone in `C:\Rhino_deploy`
-3. Run the public app only from `C:\Rhino_deploy`
+1. Keep developing in `C:\SpaceWork_develop`
+2. Create a separate production clone in `C:\SpaceWork_deploy`
+3. Run the public app only from `C:\SpaceWork_deploy`
 
 Helper scripts in this repo:
 
@@ -96,8 +110,8 @@ Do not commit `config.local.json` to Git.
 
 Important:
 
-- keep separate `config.local.json` files in `C:\Rhino_develop` and `C:\Rhino_deploy`
-- production should only read the config inside `C:\Rhino_deploy`
+- keep separate `config.local.json` files in `C:\SpaceWork_develop` and `C:\SpaceWork_deploy`
+- production should only read the config inside `C:\SpaceWork_deploy`
 
 ## Step 3. Start the App Locally
 
@@ -117,7 +131,7 @@ If you are separating development and production on one PC, do this for producti
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File deploy\setup-home-prod.ps1
-cd C:\Rhino_deploy
+cd C:\SpaceWork_deploy
 npm.cmd install
 powershell -ExecutionPolicy Bypass -File deploy\start-server.ps1
 ```
@@ -138,9 +152,17 @@ If your ISP changes your public IP, update DNS automatically with DDNS.
 
 Without DDNS, the link may break after your home IP changes.
 
-## Step 6. Set Router Port Forwarding
+## Step 6. Router Port Forwarding Is Optional
 
-Forward these ports from your router to your Windows PC:
+If you are already using Cloudflare Tunnel, do not open router ports.
+
+Recommended with Cloudflare Tunnel:
+
+- keep router port forwarding for `80` and `443` disabled
+- remove old forwarding rules if they were used before
+- keep Node bound to localhost only
+
+Only if you are not using Cloudflare Tunnel, forward these ports from your router to your Windows PC:
 
 - `80` -> your PC
 - `443` -> your PC
@@ -155,7 +177,9 @@ If your PC local IP changes, port forwarding will break.
 
 ## Step 7. Install and Configure Caddy
 
-Use Caddy as the HTTPS reverse proxy in front of Node.
+Use Caddy as the local reverse proxy in front of Node when you need it.
+
+If Cloudflare Tunnel points directly to `localhost:3000`, Caddy is optional.
 
 Example Caddyfile:
 
@@ -181,7 +205,7 @@ Replace:
 
 ## Step 8. Add a Windows Firewall Allowlist
 
-For stronger filtering, also restrict inbound traffic in Windows Firewall.
+For stronger filtering, restrict inbound traffic in Windows Firewall when direct ports are open.
 
 Allow only the trusted public IPs on:
 
@@ -189,6 +213,8 @@ Allow only the trusted public IPs on:
 - TCP `443`
 
 This is recommended even if Caddy already blocks other IPs.
+
+If you only use Cloudflare Tunnel and keep router ports closed, this step is usually not needed for public access.
 
 ## Step 9. Keep the App Running
 
@@ -220,7 +246,7 @@ Recommended flow:
 1. edit locally
 2. test locally
 3. push to Git
-4. update `C:\Rhino_deploy`
+4. update `C:\SpaceWork_deploy`
 5. restart the production app
 
 If the home PC is the same machine you use for development, keep the public app in the separate production folder and use:

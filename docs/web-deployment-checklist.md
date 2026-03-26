@@ -41,14 +41,29 @@ Recommended:
 
 ## 4. Browser QA Before Release
 
+Run these first from the repo root:
+
+- `npm run verify:baseline`
+- `npm run verify:dxf`
+
+The baseline script verifies the local hub route, feature route, health/config shape, security headers, progress-token guard, body-size limit, and radius limit without depending on live external APIs.
+
+Then run the live browser QA:
+
 - Address search from the top search bar
 - Map click -> address -> land summary -> land detail popup
 - Map click -> building summary -> building detail popup
 - `100m`, `200m`, `1000m` range preview
+- Direct range selection preview
 - OBJ download
 - 3DM download in Rhino 6
+- DXF download in CAD
+- SKP payload download
+- `토지이음 열기` handoff
+- `세움터 열기` handoff
 - Target building highlight color
 - Floating building check against terrain
+- Hub `/` -> feature `/contour3dmodel` route transition
 - Popup blocking behavior on Chrome and Edge
 - Mobile-width layout for the side panel
 
@@ -60,3 +75,4 @@ Recommended:
 - Confirm building register keys are approved for the deployed server IP/domain policy
 - Keep a rollback build for the last known-good version
 - Capture one real parcel test set and reuse it as a regression checklist after each deployment
+- Re-run `npm run verify:baseline` after any route/UI/security change

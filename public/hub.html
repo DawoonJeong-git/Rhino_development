@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Space Work Hub</title>
+    <link rel="stylesheet" href="/hub.css?v=20260326-hub2" />
+  </head>
+  <body>
+    <main class="hub-shell">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Space Work Hub</p>
+          <h1>대지 분석 기능을 허브에서 나눠서 들어가는 구조</h1>
+          <p class="hero-lead">
+            메인 페이지는 허브로 두고, 실제 작업은 기능별 주소에서 이어가도록
+            정리했습니다. 현재는 3D 대지모형이 운영 중이고, 다음 확장으로 문화재
+            발굴 위험도 지도와 법규 기반 최대 매스 생성 페이지를 준비하고 있습니다.
+          </p>
+        </div>
+        <div class="hero-status">
+          <div class="status-chip">
+            <span>운영 중</span>
+            <strong>3D 대지모형</strong>
+          </div>
+          <div class="status-chip">
+            <span>준비 중</span>
+            <strong>문화재 위험도 지도</strong>
+          </div>
+          <div class="status-chip">
+            <span>준비 중</span>
+            <strong>법규 기반 최대 매스</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="hub-grid" aria-label="기능 목록">
+        <article class="feature-card feature-card-live">
+          <div class="feature-head">
+            <p class="card-kicker">Live Now</p>
+            <span class="feature-badge is-live">사용 가능</span>
+          </div>
+          <h2>3D 대지모형 스튜디오</h2>
+          <p class="card-copy">
+            주소 선택, 범위 지정, 다중 필지 선택, 대지/건물 컨텍스트 확인, 3D와
+            CAD export를 한 화면에서 이어가는 현재 메인 기능입니다.
+          </p>
+          <dl class="feature-meta">
+            <div>
+              <dt>진입 주소</dt>
+              <dd><code>/contour3dmodel</code></dd>
+            </div>
+            <div>
+              <dt>현재 출력</dt>
+              <dd>OBJ / DXF / SKP / 3DM</dd>
+            </div>
+          </dl>
+          <div class="feature-actions">
+            <a class="feature-link" href="/contour3dmodel">기능 열기</a>
+          </div>
+        </article>
+
+        <article class="feature-card feature-card-plan">
+          <div class="feature-head">
+            <p class="card-kicker">Next Track</p>
+            <span class="feature-badge">준비 중</span>
+          </div>
+          <h2>문화재 발굴 위험도 지도</h2>
+          <p class="card-copy">
+            후보지 주변의 문화재 조사 및 발굴 위험도를 지도 중심으로 검토하는
+            페이지입니다. 향후 규제·리스크 해석 카드와 함께 이어갈 예정입니다.
+          </p>
+          <dl class="feature-meta">
+            <div>
+              <dt>예정 주소</dt>
+              <dd><code>/heritage-risk</code></dd>
+            </div>
+            <div>
+              <dt>핵심 방향</dt>
+              <dd>지도 중심 위험도 해석</dd>
+            </div>
+          </dl>
+          <div class="feature-actions">
+            <a class="feature-link is-secondary" href="/heritage-risk">페이지 보기</a>
+          </div>
+        </article>
+
+        <article class="feature-card feature-card-plan">
+          <div class="feature-head">
+            <p class="card-kicker">Next Track</p>
+            <span class="feature-badge">준비 중</span>
+          </div>
+          <h2>법규 기반 최대 매스 생성</h2>
+          <p class="card-copy">
+            대지와 법규 조건을 바탕으로 초기 최대 매스를 검토하는 페이지입니다.
+            이후 안별 비교, 규제 요약, 그룹별 3D 연계까지 확장하기 좋은 구조를
+            목표로 둡니다.
+          </p>
+          <dl class="feature-meta">
+            <div>
+              <dt>예정 주소</dt>
+              <dd><code>/max-mass</code></dd>
+            </div>
+            <div>
+              <dt>핵심 방향</dt>
+              <dd>법규 해석 + 초기 매스 생성</dd>
+            </div>
+          </dl>
+          <div class="feature-actions">
+            <a class="feature-link is-secondary" href="/max-mass">페이지 보기</a>
+          </div>
+        </article>
+      </section>
+
+      <section class="roadmap-card" aria-label="확장 메모">
+        <div>
+          <p class="card-kicker">Structure Note</p>
+          <h2>기능별 주소 체계로 계속 확장합니다</h2>
+        </div>
+        <p class="card-copy">
+          루트 <code>/</code>는 허브, 각 기능은 뒤에 주소를 붙이는 방식으로
+          유지합니다. 현재 운영 중인 페이지를 흔들지 않으면서 새 기능을
+          단계적으로 붙이기 위한 구조입니다.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>

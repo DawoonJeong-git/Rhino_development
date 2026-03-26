@@ -1,6 +1,6 @@
 param(
-  [string]$ProdRoot = "C:\Rhino_deploy",
-  [string]$RepoUrl = "https://github.com/DawoonJeong-git/Rhino_development.git",
+  [string]$ProdRoot = "C:\SpaceWork_deploy",
+  [string]$RepoUrl = "",
   [string]$Branch = "main"
 )
 
@@ -8,6 +8,18 @@ $ErrorActionPreference = "Stop"
 
 $devRoot = Split-Path -Parent $PSScriptRoot
 $sourceConfig = Join-Path $devRoot "config.local.json"
+
+if (-not $RepoUrl) {
+  try {
+    $RepoUrl = (git -C $devRoot remote get-url origin).Trim()
+  } catch {
+    $RepoUrl = ""
+  }
+}
+
+if (-not $RepoUrl) {
+  throw "Repository URL could not be resolved automatically. Pass -RepoUrl explicitly."
+}
 
 if (Test-Path $ProdRoot) {
   throw "Production folder already exists: $ProdRoot"

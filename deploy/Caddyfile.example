@@ -1,3 +1,5 @@
+# Use this only for a direct reverse-proxy setup.
+# If you are using Cloudflare Tunnel, keep router 80/443 closed unless you explicitly need them.
 your-domain.example {
   encode gzip zstd
 

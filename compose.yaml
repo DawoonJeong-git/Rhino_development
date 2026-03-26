@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: site-context-planner
+    container_name: space-work
     restart: unless-stopped
     env_file:
       - .env.production

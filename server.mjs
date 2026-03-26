@@ -26,6 +26,10 @@ const OPEN_METEO_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
 const OPEN_METEO_MAX_POINTS_PER_REQUEST = 100;
 const SITE_CONTEXT_CACHE_TTL_MS = 1000 * 60 * 10;
 const GEOCODE_CACHE_TTL_MS = 1000 * 60 * 10;
+const EXPORT_ARTIFACT_CACHE_TTL_MS = 1000 * 60 * 5;
+const EXPORT_ARTIFACT_CACHE_MAX_ENTRIES = 8;
+const EXPORT_ARTIFACT_CACHE_MAX_TOTAL_BYTES = 96 * 1024 * 1024;
+const EXPORT_ARTIFACT_CACHE_MAX_ENTRY_BYTES = 32 * 1024 * 1024;
 const TERRAIN_SOURCE_SPATIAL_RESOLUTION_METERS = 90;
 const MIN_CONTOUR_INTERVAL_METERS = 0.1;
 const TERRAIN_GRID_MIN_STEP_METERS = 10;
@@ -40,6 +44,23 @@ const SKETCHUP_EXPORT_TIMEOUT_MS = 1000 * 60 * 3;
 const DEFAULT_ROAD_WIDTH_METERS = 6;
 const ROAD_SURFACE_MAX_SEGMENT_METERS = 3;
 const CONTOUR_BAND_UNION_MAX_SLICES = 12000;
+const DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024;
+const DEFAULT_MAX_EXPORT_REQUEST_BODY_BYTES = 12 * 1024 * 1024;
+const DEFAULT_MAX_SITE_RADIUS_METERS = 600;
+const DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS = 1500;
+const DEFAULT_MAX_CONCURRENT_EXPORT_JOBS = 2;
+const DEFAULT_CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline' https://unpkg.com https://static.cloudflareinsights.com",
+  "style-src 'self' 'unsafe-inline' https://unpkg.com",
+  "img-src 'self' data: blob: https:",
+  "font-src 'self' data: https:",
+  "connect-src 'self' https://unpkg.com https://cloudflareinsights.com https://*.cloudflareinsights.com",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "frame-ancestors 'none'",
+  "form-action 'self' https://www.eum.go.kr",
+].join("; ");
 const ROAD_LAYER_CANDIDATES = [
   {
     layer: "lt_c_upisuq151",
@@ -60,10 +81,12 @@ const ROAD_LAYER_CANDIDATES = [
 const openMeteoElevationCache = new Map();
 const geocodeCache = new Map();
 const siteContextCache = new Map();
+const exportArtifactCache = new Map();
 const terrainContourCatalogCache = new Map();
 const terrainContourDatasetCache = new Map();
 const terrainContourRecordIndexCache = new Map();
 const requestProgressStore = new Map();
+const rateLimitStore = new Map();
 const contourBandGroupCache = new WeakMap();
 const contourCumulativeBandGroupCache = new WeakMap();
 const contourRenderableBandGroupCache = new WeakMap();
@@ -71,6 +94,7 @@ const contourTopSurfaceCache = new WeakMap();
 const roadFootprintMultiPolygonCache = new WeakMap();
 const roadContourSurfaceGroupCache = new WeakMap();
 let rhino3dmInstancePromise = null;
+let activeExportJobs = 0;
 
 proj4.defs(
   "EPSG:5179",
@@ -317,6 +341,118 @@ function shouldPreserveNativeContourDisplayLines(format) {
   );
 }
 
+function isSketchUpExportFormat(formatOrSiteContext) {
+  const normalizedFormat =
+    typeof formatOrSiteContext === "string"
+      ? String(formatOrSiteContext || "").trim().toLowerCase()
+      : String(formatOrSiteContext?.options?.exportFormat || "")
+          .trim()
+          .toLowerCase();
+
+  return normalizedFormat === "skp" || normalizedFormat === "skp-payload";
+}
+
+function hasOfficialContourDisplaySource(siteContext) {
+  return (
+    String(siteContext?.dataSources?.contours?.provider || "")
+      .trim()
+      .toLowerCase() === "official-contours" &&
+    Number(siteContext?.contourLines?.features?.length || 0) > 0
+  );
+}
+
+function shouldRefineSketchUpTerrainGrid(siteContext) {
+  return Boolean(
+    isSketchUpExportFormat(siteContext) &&
+      siteContext?.options?.terrainMode === "contour" &&
+      siteContext?.terrainGrid?.elevations?.length &&
+      siteContext?.clipBoundary &&
+      hasOfficialContourDisplaySource(siteContext)
+  );
+}
+
+function resolveSketchUpTerrainRefineStep(siteContext) {
+  const currentStep = Number(siteContext?.terrainGrid?.step || 0);
+  const sourceContourInterval = resolveSourceContourInterval(siteContext);
+  const radiusMeters = Math.max(30, Number(siteContext?.options?.radius) || 120);
+  const maxPreferredStep =
+    sourceContourInterval <= 1
+      ? 0.5
+      : sourceContourInterval <= 2
+        ? 0.7
+        : sourceContourInterval <= 5
+          ? 0.95
+          : sourceContourInterval <= 10
+            ? 1.25
+            : 1.6;
+  const radiusScaledStep =
+    radiusMeters <= 120
+      ? currentStep * 0.6
+      : radiusMeters <= 220
+        ? currentStep * 0.72
+        : currentStep * 0.82;
+  const minimumStep =
+    radiusMeters <= 120 ? 0.35 : radiusMeters <= 220 ? 0.45 : 0.6;
+  const targetStep = Math.max(
+    minimumStep,
+    Math.min(
+      Number.isFinite(radiusScaledStep) && radiusScaledStep > 0
+        ? radiusScaledStep
+        : maxPreferredStep,
+      maxPreferredStep
+    )
+  );
+
+  return Number(targetStep.toFixed(3));
+}
+
+function maybeRefineSketchUpTerrainGrid(siteContext) {
+  if (!shouldRefineSketchUpTerrainGrid(siteContext)) {
+    return siteContext;
+  }
+
+  const currentStep = Number(siteContext?.terrainGrid?.step || 0);
+  const targetStep = resolveSketchUpTerrainRefineStep(siteContext);
+
+  if (
+    !Number.isFinite(targetStep) ||
+    targetStep <= 0 ||
+    (Number.isFinite(currentStep) && currentStep > 0 && targetStep >= currentStep - 1e-6)
+  ) {
+    return siteContext;
+  }
+
+  try {
+    const refinedGrid = buildTerrainGridFromContourCollection(
+      siteContext.location,
+      siteContext.clipBoundary,
+      siteContext.contourLines,
+      resolveSourceContourInterval(siteContext),
+      { sampleStep: targetStep }
+    );
+
+    if (refinedGrid?.elevations?.length) {
+      siteContext.terrainGrid = refinedGrid;
+      siteContext.stats = {
+        ...(siteContext?.stats || {}),
+        skpTerrainGridRefined: true,
+        skpTerrainGridSourceStep: Number.isFinite(currentStep)
+          ? Number(currentStep.toFixed(3))
+          : null,
+        skpTerrainGridStep: Number(
+          Number(refinedGrid.step || targetStep).toFixed(3)
+        ),
+      };
+    }
+  } catch (error) {
+    console.warn(
+      `[skp-contours] terrain-grid refinement fallback error=${formatErrorForLog(error)}`
+    );
+  }
+
+  return siteContext;
+}
+
 function resolveEffectiveContourBandInterval(siteContext) {
   const requestedInterval = normalizeContourInterval(
     siteContext?.options?.contourInterval
@@ -534,15 +670,103 @@ function normalizeCustomBounds(bounds) {
   };
 }
 
+function measureCustomBoundsMeters(bounds) {
+  const normalizedBounds = normalizeCustomBounds(bounds);
+
+  if (!normalizedBounds) {
+    return null;
+  }
+
+  const center = {
+    lat: (normalizedBounds.minLat + normalizedBounds.maxLat) / 2,
+    lng: (normalizedBounds.minLng + normalizedBounds.maxLng) / 2,
+  };
+  const southWest = localMetersFromLngLat(
+    [normalizedBounds.minLng, normalizedBounds.minLat],
+    center
+  );
+  const northEast = localMetersFromLngLat(
+    [normalizedBounds.maxLng, normalizedBounds.maxLat],
+    center
+  );
+
+  return {
+    width: Math.abs(northEast[0] - southWest[0]),
+    height: Math.abs(northEast[1] - southWest[1]),
+  };
+}
+
+function assertSiteRequestWithinLimits(location, options, customBounds, config) {
+  const lat = Number(location?.lat);
+  const lng = Number(location?.lng);
+
+  if (
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    lat < -90 ||
+    lat > 90 ||
+    lng < -180 ||
+    lng > 180
+  ) {
+    throw createHttpError(400, "위치 좌표가 올바르지 않습니다.");
+  }
+
+  const normalizedRadius = Math.max(30, Number(options?.radius) || 120);
+  if (normalizedRadius > config.maxSiteRadiusMeters) {
+    throw createHttpError(
+      400,
+      `반경은 서버 제한인 ${config.maxSiteRadiusMeters}m 이하로 요청해야 합니다.`
+    );
+  }
+
+  const normalizedBounds = normalizeCustomBounds(customBounds);
+
+  if (!normalizedBounds) {
+    return;
+  }
+
+  const boundsSize = measureCustomBoundsMeters(normalizedBounds);
+
+  if (
+    boundsSize &&
+    (boundsSize.width > config.maxManualRangeSideMeters ||
+      boundsSize.height > config.maxManualRangeSideMeters)
+  ) {
+    throw createHttpError(
+      400,
+      `직접 지정 범위는 가로/세로 ${config.maxManualRangeSideMeters}m 이하로 요청해야 합니다.`
+    );
+  }
+}
+
+function assertSiteContextWithinLimits(siteContext, config) {
+  if (!siteContext?.location || !siteContext?.options) {
+    throw createHttpError(400, "모델 컨텍스트가 올바르지 않습니다.");
+  }
+
+  assertSiteRequestWithinLimits(
+    siteContext.location,
+    siteContext.options,
+    siteContext.location?.customBounds,
+    config
+  );
+}
+
 function buildSiteContextCacheKey(location = {}, options = {}, customBounds = null) {
   const normalizedCustomBounds = normalizeCustomBounds(
     customBounds || location?.customBounds
   );
+  const selectedParcels = normalizeSelectedParcelFeatures(location?.selectedParcels || []);
 
   return JSON.stringify({
     lat: Number(location.lat || 0).toFixed(6),
     lng: Number(location.lng || 0).toFixed(6),
     customBounds: normalizedCustomBounds,
+    selectedParcels: selectedParcels.map((feature, index) => ({
+      key: buildParcelSelectionKey(feature, index),
+      groupName: resolveParcelGroupName(feature, index),
+      groupLabel: buildParcelGroupLabel(feature, index),
+    })),
     radius: Math.max(30, Number(options.radius) || 120),
     contourInterval: normalizeContourInterval(options.contourInterval),
     terrainMode: options.terrainMode === "flat" ? "flat" : "contour",
@@ -650,6 +874,63 @@ function buildRuntimeConfig(localConfig) {
           localConfig.USE_NOMINATIM_FALLBACK ??
           "true"
       ).toLowerCase() !== "false",
+    maxRequestBodyBytes: resolvePositiveInteger(
+      process.env.MAX_REQUEST_BODY_BYTES ||
+        localConfig.MAX_REQUEST_BODY_BYTES ||
+        DEFAULT_MAX_REQUEST_BODY_BYTES,
+      DEFAULT_MAX_REQUEST_BODY_BYTES
+    ),
+    maxExportRequestBodyBytes: resolvePositiveInteger(
+      process.env.MAX_EXPORT_REQUEST_BODY_BYTES ||
+        localConfig.MAX_EXPORT_REQUEST_BODY_BYTES ||
+        DEFAULT_MAX_EXPORT_REQUEST_BODY_BYTES,
+      DEFAULT_MAX_EXPORT_REQUEST_BODY_BYTES
+    ),
+    maxSiteRadiusMeters: resolvePositiveInteger(
+      process.env.MAX_SITE_RADIUS_METERS ||
+        localConfig.MAX_SITE_RADIUS_METERS ||
+        DEFAULT_MAX_SITE_RADIUS_METERS,
+      DEFAULT_MAX_SITE_RADIUS_METERS
+    ),
+    maxManualRangeSideMeters: resolvePositiveInteger(
+      process.env.MAX_MANUAL_RANGE_SIDE_METERS ||
+        localConfig.MAX_MANUAL_RANGE_SIDE_METERS ||
+        DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS,
+      DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS
+    ),
+    maxConcurrentExportJobs: resolvePositiveInteger(
+      process.env.MAX_CONCURRENT_EXPORT_JOBS ||
+        localConfig.MAX_CONCURRENT_EXPORT_JOBS ||
+        DEFAULT_MAX_CONCURRENT_EXPORT_JOBS,
+      DEFAULT_MAX_CONCURRENT_EXPORT_JOBS
+    ),
+    rateLimits: {
+      api: {
+        maxRequests: 120,
+        windowMs: 1000 * 60,
+        message: "요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
+      },
+      search: {
+        maxRequests: 60,
+        windowMs: 1000 * 60,
+        message: "검색 요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
+      },
+      heavy: {
+        maxRequests: 24,
+        windowMs: 1000 * 60,
+        message: "무거운 데이터 요청이 잠시 몰리고 있습니다. 조금 후 다시 시도해주세요.",
+      },
+      export: {
+        maxRequests: 8,
+        windowMs: 1000 * 60 * 10,
+        message: "모델 내보내기 요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
+      },
+      progress: {
+        maxRequests: 240,
+        windowMs: 1000 * 60,
+        message: "진행률 조회 요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
+      },
+    },
   };
 }
 
@@ -664,13 +945,9 @@ function pruneRequestProgressStore() {
 }
 
 function readRequestProgressToken(request) {
-  const headerValue = request?.headers?.["x-progress-token"];
-
-  if (Array.isArray(headerValue)) {
-    return String(headerValue[0] || "").trim();
-  }
-
-  return String(headerValue || "").trim();
+  return normalizeProgressToken(
+    readSingleHeaderValue(request?.headers?.["x-progress-token"])
+  );
 }
 
 function updateRequestProgress(token, nextState) {
@@ -690,6 +967,7 @@ function updateRequestProgress(token, nextState) {
     updatedAt: now,
     completedAt: null,
     error: "",
+    clientIp: "",
   };
   const merged = {
     ...existing,
@@ -708,14 +986,16 @@ function updateRequestProgress(token, nextState) {
 }
 
 function beginRequestProgress(token, operation, message) {
-  if (!token) {
+  const normalizedToken = normalizeProgressToken(token);
+
+  if (!normalizedToken) {
     return null;
   }
 
   const now = Date.now();
   pruneRequestProgressStore();
   const entry = {
-    token,
+    token: normalizedToken,
     operation: String(operation || "request"),
     state: "active",
     percent: 0,
@@ -724,9 +1004,10 @@ function beginRequestProgress(token, operation, message) {
     updatedAt: now,
     completedAt: null,
     error: "",
+    clientIp: "",
   };
 
-  requestProgressStore.set(token, entry);
+  requestProgressStore.set(normalizedToken, entry);
   return entry;
 }
 
@@ -772,11 +1053,15 @@ function createRangedProgressReporter(token, startPercent, endPercent) {
   };
 }
 
-function sendJson(response, statusCode, payload) {
-  response.writeHead(statusCode, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store",
-  });
+function sendJson(response, statusCode, payload, extraHeaders = {}) {
+  response.writeHead(
+    statusCode,
+    buildResponseHeaders({
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...(extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {}),
+    })
+  );
   response.end(JSON.stringify(payload, null, 2));
 }
 
@@ -806,7 +1091,13 @@ function buildContentDispositionHeader(filename) {
   return `attachment; filename="${asciiFilename}"; filename*=UTF-8''${encodedFilename}`;
 }
 
-function sendText(response, statusCode, payload, filename = null) {
+function sendText(
+  response,
+  statusCode,
+  payload,
+  filename = null,
+  extraHeaders = {}
+) {
   const headers = {
     "Content-Type": "text/plain; charset=utf-8",
     "Cache-Control": "no-store",
@@ -816,7 +1107,13 @@ function sendText(response, statusCode, payload, filename = null) {
     headers["Content-Disposition"] = buildContentDispositionHeader(filename);
   }
 
-  response.writeHead(statusCode, headers);
+  response.writeHead(
+    statusCode,
+    buildResponseHeaders({
+      ...headers,
+      ...(extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {}),
+    })
+  );
   response.end(payload);
 }
 
@@ -825,7 +1122,8 @@ function sendBinary(
   statusCode,
   payload,
   contentType = "application/octet-stream",
-  filename = null
+  filename = null,
+  extraHeaders = {}
 ) {
   const headers = {
     "Content-Type": contentType,
@@ -836,27 +1134,82 @@ function sendBinary(
     headers["Content-Disposition"] = buildContentDispositionHeader(filename);
   }
 
-  response.writeHead(statusCode, headers);
+  response.writeHead(
+    statusCode,
+    buildResponseHeaders({
+      ...headers,
+      ...(extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {}),
+    })
+  );
   response.end(payload);
 }
 
-function sendHtml(response, statusCode, payload) {
-  response.writeHead(statusCode, {
-    "Content-Type": "text/html; charset=utf-8",
-    "Cache-Control": "no-store",
-  });
+function sendHtml(response, statusCode, payload, extraHeaders = {}) {
+  response.writeHead(
+    statusCode,
+    buildResponseHeaders({
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...(extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {}),
+    })
+  );
   response.end(payload);
 }
 
-async function readJsonBody(request) {
+async function readJsonBody(request, options = {}) {
   return new Promise((resolve, reject) => {
+    const maxBytes = Math.max(
+      1,
+      Number(options?.maxBytes) || DEFAULT_MAX_REQUEST_BODY_BYTES
+    );
+    const declaredContentLength = parseRequestContentLength(request);
+
+    if (
+      Number.isFinite(declaredContentLength) &&
+      declaredContentLength > maxBytes
+    ) {
+      reject(
+        createHttpError(
+          413,
+          `요청 본문은 ${formatByteLimit(maxBytes)} 이하만 허용됩니다.`
+        )
+      );
+      return;
+    }
+
     let rawBody = "";
+    let totalBytes = 0;
+    let settled = false;
 
     request.on("data", (chunk) => {
+      if (settled) {
+        return;
+      }
+
+      totalBytes += Buffer.byteLength(chunk);
+
+      if (totalBytes > maxBytes) {
+        settled = true;
+        request.resume();
+        reject(
+          createHttpError(
+            413,
+            `요청 본문은 ${formatByteLimit(maxBytes)} 이하만 허용됩니다.`
+          )
+        );
+        return;
+      }
+
       rawBody += chunk;
     });
 
     request.on("end", () => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+
       if (!rawBody) {
         resolve({});
         return;
@@ -869,16 +1222,30 @@ async function readJsonBody(request) {
       }
     });
 
-    request.on("error", reject);
+    request.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      reject(error);
+    });
   });
 }
 
 async function serveStatic(requestPath, response) {
-  const indexAliases = new Set(["/", "/contour3dmodel", "/contour3dmodel/"]);
-  const resolvedPath =
-    indexAliases.has(requestPath)
-      ? path.join(publicDir, "index.html")
-      : path.join(publicDir, requestPath);
+  const staticPageAliases = new Map([
+    ["/", "hub.html"],
+    ["/contour3dmodel", "index.html"],
+    ["/contour3dmodel/", "index.html"],
+    ["/heritage-risk", "heritage-risk/index.html"],
+    ["/heritage-risk/", "heritage-risk/index.html"],
+    ["/max-mass", "max-mass/index.html"],
+    ["/max-mass/", "max-mass/index.html"],
+  ]);
+  const resolvedPath = staticPageAliases.has(requestPath)
+    ? path.join(publicDir, staticPageAliases.get(requestPath))
+    : path.join(publicDir, requestPath);
   const normalizedPath = path.normalize(resolvedPath);
 
   if (!normalizedPath.startsWith(publicDir)) {
@@ -894,10 +1261,13 @@ async function serveStatic(requestPath, response) {
     const body = await readFile(filePath);
     const ext = path.extname(filePath).toLowerCase();
 
-    response.writeHead(200, {
-      "Content-Type":
-        contentTypes[ext] || "application/octet-stream; charset=utf-8",
-    });
+    response.writeHead(
+      200,
+      buildResponseHeaders({
+        "Content-Type":
+          contentTypes[ext] || "application/octet-stream; charset=utf-8",
+      })
+    );
     response.end(body);
   } catch {
     sendJson(response, 404, { error: "Not found" });
@@ -1528,6 +1898,87 @@ function featureIntersectsRing(feature, clipRing) {
 
     return false;
   });
+}
+
+function featureIntersectsFeature(feature, targetFeature) {
+  return getOuterRings(targetFeature).some((ring) =>
+    featureIntersectsRing(feature, ring)
+  );
+}
+
+function getFeatureAreaSquareMeters(feature) {
+  return Number(
+    getOuterRings(feature)
+      .reduce((sum, ring) => sum + polygonAreaSquareMeters(ring), 0)
+      .toFixed(3)
+  );
+}
+
+function centroidOfFeature(feature) {
+  const outerRings = getOuterRings(feature);
+
+  if (!outerRings.length) {
+    return null;
+  }
+
+  let weightedLng = 0;
+  let weightedLat = 0;
+  let totalWeight = 0;
+
+  for (const ring of outerRings) {
+    const area = polygonAreaSquareMeters(ring);
+    const centroid = centroidOfRing(ring);
+
+    if (!centroid) {
+      continue;
+    }
+
+    const weight = area > 0.001 ? area : 1;
+    weightedLng += centroid[0] * weight;
+    weightedLat += centroid[1] * weight;
+    totalWeight += weight;
+  }
+
+  if (totalWeight > 0.001) {
+    return [
+      Number((weightedLng / totalWeight).toFixed(8)),
+      Number((weightedLat / totalWeight).toFixed(8)),
+    ];
+  }
+
+  return outerRings[0]?.[0] || null;
+}
+
+function buildCombinedPolygonFeature(features, properties = {}) {
+  const polygons = (features || []).flatMap((feature) =>
+    getGeometryPolygonCoordinateSets(feature?.geometry)
+  );
+
+  if (!polygons.length) {
+    return null;
+  }
+
+  if (polygons.length === 1) {
+    return {
+      type: "Feature",
+      properties,
+      geometry: {
+        type: "Polygon",
+        coordinates: polygons[0].map((ring) => closeRing(ring)),
+      },
+    };
+  }
+
+  return {
+    type: "Feature",
+    properties,
+    geometry: {
+      type: "MultiPolygon",
+      coordinates: polygons.map((polygon) =>
+        polygon.map((ring) => closeRing(ring))
+      ),
+    },
+  };
 }
 
 function createMockParcelFeature(location) {
@@ -3596,6 +4047,225 @@ function normalizeParcelFeature(feature) {
   };
 }
 
+function buildParcelSelectionKey(feature, fallbackIndex = 0) {
+  const normalizedFeature = normalizeParcelFeature(feature);
+  const pnu = extractPnuFromProperties(normalizedFeature?.properties || {});
+
+  if (pnu) {
+    return pnu;
+  }
+
+  return buildFeatureMapKey(normalizedFeature, ["pk", "PK", "id", "ID"]) ||
+    `parcel-group-${fallbackIndex + 1}`;
+}
+
+function buildParcelGroupName(index = 0) {
+  return `PARCEL_GROUP_${index + 1}`;
+}
+
+function isGeneratedParcelGroupName(value = "") {
+  return /^PARCEL_GROUP_\d+$/i.test(String(value || "").trim());
+}
+
+function resolveExplicitParcelGroupText(properties = {}) {
+  const preferredText = String(
+    properties.groupLabel || properties.groupName || ""
+  ).trim();
+
+  if (!preferredText) {
+    return "";
+  }
+
+  const hasCustomSource =
+    String(properties.groupNameSource || "").trim().toLowerCase() === "custom";
+  const fallbackText = String(
+    properties.addr || properties.jibun || extractPnuFromProperties(properties) || ""
+  ).trim();
+
+  if (
+    hasCustomSource ||
+    !fallbackText ||
+    !isGeneratedParcelGroupName(preferredText)
+  ) {
+    return preferredText;
+  }
+
+  return "";
+}
+
+function resolveParcelGroupName(feature, index = 0) {
+  const properties = feature?.properties || {};
+  return resolveExplicitParcelGroupText(properties) || buildParcelGroupLabel(feature, index);
+}
+
+function buildParcelGroupLabel(feature, index = 0) {
+  const properties = feature?.properties || {};
+  return String(
+    resolveExplicitParcelGroupText(properties) ||
+      properties.addr ||
+      properties.jibun ||
+      extractPnuFromProperties(properties) ||
+      buildParcelGroupName(index)
+  ).trim();
+}
+
+function buildParcelGroupExportName(feature, index = 0) {
+  return (
+    String(resolveParcelGroupName(feature, index)).trim() || buildParcelGroupName(index)
+  );
+}
+
+function normalizeSelectedParcelFeature(feature) {
+  const polygons = getGeometryPolygonCoordinateSets(feature?.geometry).map((polygon) =>
+    polygon.map((ring) =>
+      closeRing(
+        (ring || [])
+          .map((point) =>
+            Array.isArray(point) && point.length >= 2
+              ? [Number(point[0]), Number(point[1])]
+              : null
+          )
+          .filter(
+            (point) => point && Number.isFinite(point[0]) && Number.isFinite(point[1])
+          )
+      )
+    )
+  );
+  const filteredPolygons = polygons.filter((polygon) =>
+    polygon.some((ring) => ring.length >= 4)
+  );
+
+  if (!filteredPolygons.length) {
+    return null;
+  }
+
+  const normalizedFeature =
+    filteredPolygons.length === 1
+      ? {
+          type: "Feature",
+          properties: { ...(feature?.properties || {}) },
+          geometry: {
+            type: "Polygon",
+            coordinates: filteredPolygons[0],
+          },
+        }
+      : {
+          type: "Feature",
+          properties: { ...(feature?.properties || {}) },
+          geometry: {
+            type: "MultiPolygon",
+            coordinates: filteredPolygons,
+          },
+        };
+
+  return normalizeParcelFeature(normalizedFeature);
+}
+
+function normalizeSelectedParcelFeatures(features) {
+  const featureMap = new Map();
+
+  for (const [index, candidate] of (Array.isArray(features) ? features : []).entries()) {
+    const normalizedFeature = normalizeSelectedParcelFeature(candidate);
+
+    if (!normalizedFeature) {
+      continue;
+    }
+
+    const key = buildParcelSelectionKey(normalizedFeature, index);
+
+    if (!featureMap.has(key)) {
+      featureMap.set(key, normalizedFeature);
+    }
+  }
+
+  return [...featureMap.values()];
+}
+
+function buildTargetParcelGroupFeatures(features) {
+  return normalizeSelectedParcelFeatures(features).map((feature, index) => ({
+    ...feature,
+    properties: {
+      ...(feature.properties || {}),
+      isTarget: true,
+      groupIndex: index + 1,
+      groupId: buildParcelSelectionKey(feature, index),
+      groupName: resolveParcelGroupName(feature, index),
+      groupLabel: buildParcelGroupLabel(feature, index),
+      sourceLayer: "LP_PA_CBND_BUBUN",
+    },
+  }));
+}
+
+function getTargetParcelGroupFeatures(siteContext) {
+  const targetParcelGroups = siteContext?.targetParcelGroups?.features || [];
+
+  if (targetParcelGroups.length) {
+    return targetParcelGroups;
+  }
+
+  if (siteContext?.selectionMode === "range" || !siteContext?.parcelBoundary) {
+    return [];
+  }
+
+  return buildTargetParcelGroupFeatures([siteContext.parcelBoundary]);
+}
+
+function resolveTargetParcelGroupForFeature(feature, targetParcelFeatures = []) {
+  const normalizedTargets = Array.isArray(targetParcelFeatures)
+    ? targetParcelFeatures.filter(Boolean)
+    : targetParcelFeatures
+      ? [targetParcelFeatures]
+      : [];
+
+  if (!normalizedTargets.length) {
+    return null;
+  }
+
+  const featureCentroid = centroidOfFeature(feature);
+
+  if (featureCentroid) {
+    const directMatch = normalizedTargets.find((targetFeature) =>
+      isPointInsideFeature(featureCentroid, targetFeature)
+    );
+
+    if (directMatch) {
+      return directMatch;
+    }
+  }
+
+  return normalizedTargets.find((targetFeature) =>
+    featureIntersectsFeature(feature, targetFeature)
+  ) || null;
+}
+
+function resolveTargetParcelGroupForLineString(lineString, targetParcelFeatures = []) {
+  if (!Array.isArray(lineString) || lineString.length < 2) {
+    return null;
+  }
+
+  const normalizedTargets = Array.isArray(targetParcelFeatures)
+    ? targetParcelFeatures.filter(Boolean)
+    : targetParcelFeatures
+      ? [targetParcelFeatures]
+      : [];
+  let bestMatch = null;
+  let bestScore = 0;
+
+  for (const targetFeature of normalizedTargets) {
+    const score = lineString.reduce(
+      (sum, point) => sum + (isPointInsideFeature(point, targetFeature) ? 1 : 0),
+      0
+    );
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = targetFeature;
+    }
+  }
+
+  return bestScore > 0 ? bestMatch : null;
+}
+
 function buildFeatureMapKey(feature, preferredPropertyKeys = []) {
   const properties = feature?.properties || {};
 
@@ -3756,7 +4426,7 @@ out geom;`;
     method: "POST",
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
-      "User-Agent": "site-context-planner/0.1 (local development)",
+      "User-Agent": "space-work/0.1 (local development)",
     },
     body,
   });
@@ -3797,7 +4467,8 @@ function normalizeBuildingFeature(feature, parcelFeature = null) {
   const properties = feature?.properties || {};
   const ring = getOuterRing(feature);
   const centroid = ring ? centroidOfRing(ring) : null;
-  const parcelRing = parcelFeature ? getOuterRing(parcelFeature) : null;
+  const targetParcelFeature = resolveTargetParcelGroupForFeature(feature, parcelFeature);
+  const targetParcelProperties = targetParcelFeature?.properties || {};
 
   return {
     ...feature,
@@ -3818,8 +4489,12 @@ function normalizeBuildingFeature(feature, parcelFeature = null) {
       ),
       centroidLng: centroid ? Number(centroid[0].toFixed(8)) : null,
       centroidLat: centroid ? Number(centroid[1].toFixed(8)) : null,
-      isTarget:
-        Boolean(parcelRing && featureIntersectsRing(feature, parcelRing)),
+      isTarget: Boolean(targetParcelFeature),
+      targetParcelGroupIndex: Number(
+        targetParcelProperties.groupIndex || Number.NaN
+      ) || null,
+      targetParcelGroupId: String(targetParcelProperties.groupId || "").trim(),
+      targetParcelGroupName: String(targetParcelProperties.groupName || "").trim(),
       sourceLayer: "lt_c_spbd",
     },
   };
@@ -4664,7 +5339,7 @@ async function geocodeWithNominatim(query) {
     `https://nominatim.openstreetmap.org/search?${params}`,
     {
       headers: {
-        "User-Agent": "site-context-planner/0.1 (local development)",
+        "User-Agent": "space-work/0.1 (local development)",
       },
     }
   );
@@ -4984,7 +5659,7 @@ async function reverseWithNominatim(lat, lng) {
     `https://nominatim.openstreetmap.org/reverse?${params}`,
     {
       headers: {
-        "User-Agent": "site-context-planner/0.1 (local development)",
+        "User-Agent": "space-work/0.1 (local development)",
       },
     }
   );
@@ -5031,6 +5706,43 @@ function buildClipBoundary(location, options, parcelFeature, customBounds = null
   return polygonFeature(createRectangleRing(location, radius * 2, radius * 2), {
     shape: "rectangle",
   });
+}
+
+function buildClipBoundaryForTargetParcels(location, options, parcelFeatures) {
+  const targetParcelFeatures = buildTargetParcelGroupFeatures(parcelFeatures);
+
+  if (!targetParcelFeatures.length) {
+    return buildClipBoundary(location, options, null);
+  }
+
+  const radius = Math.max(30, Number(options.radius) || 120);
+  const localPoints = targetParcelFeatures.flatMap((feature) =>
+    getOuterRings(feature).flatMap((ring) =>
+      ring.map((point) => localMetersFromLngLat(point, location))
+    )
+  );
+
+  if (!localPoints.length) {
+    return buildClipBoundary(location, options, null);
+  }
+
+  const minX = Math.min(...localPoints.map((point) => point[0])) - radius;
+  const maxX = Math.max(...localPoints.map((point) => point[0])) + radius;
+  const minY = Math.min(...localPoints.map((point) => point[1])) - radius;
+  const maxY = Math.max(...localPoints.map((point) => point[1])) + radius;
+
+  return polygonFeature(
+    [
+      lngLatFromMeters(location, minX, minY),
+      lngLatFromMeters(location, maxX, minY),
+      lngLatFromMeters(location, maxX, maxY),
+      lngLatFromMeters(location, minX, maxY),
+    ],
+    {
+      shape: "rectangle",
+      selectionMode: "multi-parcel",
+    }
+  );
 }
 
 function createSyntheticContours(location, clipFeature, options) {
@@ -5182,7 +5894,7 @@ async function fetchOpenMeteoElevationChunk(points) {
       });
       const response = await fetch(`https://api.open-meteo.com/v1/elevation?${params}`, {
         headers: {
-          "User-Agent": "site-context-planner/0.1",
+          "User-Agent": "space-work/0.1",
         },
       });
 
@@ -5253,7 +5965,7 @@ async function fetchOpenTopoDataElevations(points) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "User-Agent": "site-context-planner/0.1",
+        "User-Agent": "space-work/0.1",
       },
       body: JSON.stringify({
         locations: chunk
@@ -5658,7 +6370,8 @@ function buildTerrainGridFromContourCollection(
   location,
   clipFeature,
   contourCollection,
-  contourInterval
+  contourInterval,
+  options = {}
 ) {
   const contourRecords = buildContourPolylineRecords(contourCollection, location);
 
@@ -5672,11 +6385,15 @@ function buildTerrainGridFromContourCollection(
   const maxX = localMetersFromLngLat([bounds.maxLng, location.lat], location)[0];
   const minY = localMetersFromLngLat([location.lng, bounds.minLat], location)[1];
   const maxY = localMetersFromLngLat([location.lng, bounds.maxLat], location)[1];
-  const step = resolveContourDrivenSampleStep(
-    maxX - minX,
-    maxY - minY,
-    contourInterval
-  );
+  const configuredStep = Number(options?.sampleStep);
+  const step =
+    Number.isFinite(configuredStep) && configuredStep > 0
+      ? Number(Math.max(0.35, Math.min(8, configuredStep)).toFixed(3))
+      : resolveContourDrivenSampleStep(
+          maxX - minX,
+          maxY - minY,
+          contourInterval
+        );
   const sampleGrid = buildTerrainSampleGridWithExplicitStep(
     location,
     clipFeature,
@@ -6411,7 +7128,14 @@ async function resolveParcelContext(
     const clipRing = getOuterRing(clipFeature);
     const queryPlan = buildBuildingQueryPlan(location, clipFeature);
     const featureMap = new Map();
-    const targetPnu = extractPnuFromProperties(parcelFeature?.properties || {});
+    const targetParcelFeatures = buildTargetParcelGroupFeatures(
+      Array.isArray(parcelFeature) ? parcelFeature : parcelFeature ? [parcelFeature] : []
+    );
+    const targetParcelKeys = new Set(
+      targetParcelFeatures.map((feature, index) =>
+        buildParcelSelectionKey(feature, index)
+      )
+    );
 
     for (const query of queryPlan) {
       const collection = await fetchAllVWorldFeatureCollections(
@@ -6439,8 +7163,8 @@ async function resolveParcelContext(
       .filter(Boolean)
       .map((feature) => normalizeParcelFeature(feature))
       .filter((feature) => {
-        const pnu = extractPnuFromProperties(feature.properties);
-        return !targetPnu || pnu !== targetPnu;
+        const featureKey = buildParcelSelectionKey(feature);
+        return !targetParcelKeys.has(featureKey);
       })
       .map((feature) => ({
         ...feature,
@@ -6737,6 +7461,9 @@ async function resolveBuildingContext(
     const clipRing = getOuterRing(clipFeature);
     const queryPlan = buildBuildingQueryPlan(location, clipFeature);
     const featureMap = new Map();
+    const targetParcelFeatures = buildTargetParcelGroupFeatures(
+      Array.isArray(parcelFeature) ? parcelFeature : parcelFeature ? [parcelFeature] : []
+    );
 
     for (const query of queryPlan) {
       const collection = await fetchAllVWorldFeatureCollections(
@@ -6765,7 +7492,7 @@ async function resolveBuildingContext(
     const filteredFeatures = [...featureMap.values()]
       .map((feature) => clipFeatureToRing(feature, clipRing, location))
       .filter(Boolean)
-      .map((feature) => normalizeBuildingFeature(feature, parcelFeature))
+      .map((feature) => normalizeBuildingFeature(feature, targetParcelFeatures))
       .filter((feature) => Number(feature.properties?.footprintAreaSqm || 0) > 2)
       .sort((left, right) => {
         const targetDelta =
@@ -6782,7 +7509,9 @@ async function resolveBuildingContext(
         );
       });
 
-    const parcelReference = decomposePnu(parcelFeature?.properties?.pnu);
+    const registerParcelFeature =
+      targetParcelFeatures.length === 1 ? targetParcelFeatures[0] : null;
+    const parcelReference = decomposePnu(registerParcelFeature?.properties?.pnu);
     let enrichedFeatures = filteredFeatures;
     let registerMatchedCount = 0;
 
@@ -6795,7 +7524,7 @@ async function resolveBuildingContext(
         enrichedFeatures = attachBuildingRegisterMetadata(
           filteredFeatures,
           registerItems,
-          parcelFeature
+          registerParcelFeature
         );
         registerMatchedCount = enrichedFeatures.filter(
           (feature) => feature.properties?.registerMatched
@@ -6832,6 +7561,7 @@ async function buildSiteContext(body, config, reportProgress = null) {
   const options = {
     ...(body.options || {}),
     previewOnly: body.previewOnly === true || body.options?.previewOnly === true,
+    radius: Math.max(30, Number(body.options?.radius) || 120),
   };
   const customBounds = normalizeCustomBounds(body.customBounds || location.customBounds);
   const isManualRange = Boolean(customBounds);
@@ -6841,15 +7571,20 @@ async function buildSiteContext(body, config, reportProgress = null) {
   const progress =
     typeof reportProgress === "function" ? reportProgress : () => null;
 
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-    throw new Error("Invalid location payload");
-  }
-
   const normalizedLocation = {
     ...location,
     lat,
     lng,
+    selectedParcels: normalizeSelectedParcelFeatures(
+      body.selectedParcels || location.selectedParcels || []
+    ),
   };
+  const targetParcelGroupFeatures = isManualRange
+    ? []
+    : buildTargetParcelGroupFeatures(normalizedLocation.selectedParcels);
+  const isMultiParcelSelection =
+    !isManualRange && targetParcelGroupFeatures.length > 1;
+  assertSiteRequestWithinLimits(normalizedLocation, options, customBounds, config);
   const cacheKey = buildSiteContextCacheKey(normalizedLocation, options, customBounds);
   const cachedSiteContext = siteContextCache.get(cacheKey);
 
@@ -6869,17 +7604,42 @@ async function buildSiteContext(body, config, reportProgress = null) {
         isFallback: false,
         note: "User-defined rectangle range was applied.",
       }
-    : await resolveParcelBoundary(normalizedLocation, config);
+    : targetParcelGroupFeatures.length
+      ? {
+          feature: buildCombinedPolygonFeature(targetParcelGroupFeatures, {
+            isTarget: true,
+            sourceLayer: "LP_PA_CBND_BUBUN",
+          }),
+          provider: "selection-cache",
+          isFallback: false,
+          note:
+            targetParcelGroupFeatures.length > 1
+              ? `Using ${targetParcelGroupFeatures.length} selected parcel boundaries.`
+              : "Using the selected parcel boundary.",
+        }
+      : await resolveParcelBoundary(normalizedLocation, config);
   progress(24, "대지 범위를 계산하는 중입니다.");
   const clipBoundary = isManualRange
     ? parcelResult.feature
     : isSelectionPreview
-      ? parcelResult.feature
-      : buildClipBoundary(
-          normalizedLocation,
-          options,
-          parcelResult.feature
-        );
+      ? targetParcelGroupFeatures.length > 1
+        ? buildClipBoundaryForTargetParcels(
+            normalizedLocation,
+            { ...options, radius: 30 },
+            targetParcelGroupFeatures
+          )
+        : parcelResult.feature
+      : targetParcelGroupFeatures.length
+        ? buildClipBoundaryForTargetParcels(
+            normalizedLocation,
+            options,
+            targetParcelGroupFeatures
+          )
+        : buildClipBoundary(
+            normalizedLocation,
+            options,
+            parcelResult.feature
+          );
   progress(42, "지형 데이터를 준비하는 중입니다.");
   const terrainResult = isSelectionPreview
     ? {
@@ -6915,7 +7675,7 @@ async function buildSiteContext(body, config, reportProgress = null) {
     : await resolveParcelContext(
         normalizedLocation,
         clipBoundary,
-        isManualRange ? null : parcelResult.feature,
+        isManualRange ? null : targetParcelGroupFeatures.length ? targetParcelGroupFeatures : parcelResult.feature,
         config
       );
   progress(
@@ -6935,7 +7695,7 @@ async function buildSiteContext(body, config, reportProgress = null) {
       : await resolveBuildingContext(
           normalizedLocation,
           clipBoundary,
-          isManualRange ? null : parcelResult.feature,
+          isManualRange ? null : targetParcelGroupFeatures.length ? targetParcelGroupFeatures : parcelResult.feature,
           config
         );
   progress(
@@ -6963,11 +7723,24 @@ async function buildSiteContext(body, config, reportProgress = null) {
       ? "건물 컨텍스트를 생략하고 있습니다."
       : "건물 컨텍스트를 정리하는 중입니다."
   );
-  const parcelRing = getOuterRing(parcelResult.feature);
+  const selectedTargetParcelFeatures = isManualRange
+    ? []
+    : targetParcelGroupFeatures.length
+      ? targetParcelGroupFeatures
+      : buildTargetParcelGroupFeatures([parcelResult.feature]);
   const clipRing = getOuterRing(clipBoundary);
-  const parcelArea = polygonAreaSquareMeters(parcelRing);
+  const parcelArea = isManualRange
+    ? polygonAreaSquareMeters(clipRing)
+    : selectedTargetParcelFeatures.reduce(
+        (sum, feature) => sum + getFeatureAreaSquareMeters(feature),
+        0
+      );
   const clipArea = polygonAreaSquareMeters(clipRing);
-  const parcelCenter = centroidOfRing(parcelRing);
+  const parcelCenter = isManualRange
+    ? centroidOfRing(clipRing)
+    : centroidOfFeature(
+        buildCombinedPolygonFeature(selectedTargetParcelFeatures) || parcelResult.feature
+      );
   const buildingCount = buildingResult.collection.features.length;
   const targetBuildingCount = isManualRange
     ? 0
@@ -6984,7 +7757,13 @@ async function buildSiteContext(body, config, reportProgress = null) {
           sourceLayer: "MANUAL_RANGE",
         },
       }
-    : normalizeParcelFeature(parcelResult.feature);
+    : selectedTargetParcelFeatures.length === 1
+      ? normalizeParcelFeature(selectedTargetParcelFeatures[0])
+      : buildCombinedPolygonFeature(selectedTargetParcelFeatures, {
+          isTarget: true,
+          sourceLayer: "LP_PA_CBND_BUBUN",
+          selectedParcelCount: selectedTargetParcelFeatures.length,
+        });
   const targetParcelFeature = normalizedTargetParcelFeature
     ? {
         ...normalizedTargetParcelFeature,
@@ -6997,7 +7776,11 @@ async function buildSiteContext(body, config, reportProgress = null) {
     : null;
 
   const siteContext = {
-    selectionMode: isManualRange ? "range" : "address",
+    selectionMode: isManualRange
+      ? "range"
+      : isMultiParcelSelection
+        ? "multi-parcel"
+        : "address",
     location: normalizedLocation,
     options: {
       shape: "rectangle",
@@ -7052,6 +7835,7 @@ async function buildSiteContext(body, config, reportProgress = null) {
     stats: {
       parcelAreaSqm: Number((isManualRange ? clipArea : parcelArea).toFixed(2)),
       clipAreaSqm: Number(clipArea.toFixed(2)),
+      targetParcelCount: selectedTargetParcelFeatures.length || (isManualRange ? 0 : 1),
       contextParcelCount: parcelContextCount,
       contourCount: contourCollection.features.length,
       contourInterval: normalizeContourInterval(options.contourInterval),
@@ -7068,6 +7852,7 @@ async function buildSiteContext(body, config, reportProgress = null) {
       parcelCenter,
     },
     parcelBoundary: targetParcelFeature,
+    targetParcelGroups: featureCollection(selectedTargetParcelFeatures),
     parcelContext: parcelContextResult.collection,
     clipBoundary,
     contourLines: contourCollection,
@@ -9741,7 +10526,9 @@ function shouldSplitTerrainAlongParcelBoundary(siteContext) {
   return Boolean(
     siteContext?.options?.splitParcelBoundary === true &&
       siteContext?.selectionMode !== "range" &&
-      getOpenRing(getOuterRing(siteContext?.parcelBoundary)).length >= 3
+      getTargetParcelGroupFeatures(siteContext).some(
+        (feature) => getOpenRing(getOuterRing(feature)).length >= 3
+      )
   );
 }
 
@@ -9749,15 +10536,15 @@ function shouldGroupParcelCutContent(siteContext) {
   return shouldSplitTerrainAlongParcelBoundary(siteContext);
 }
 
-function isLineMostlyInsideParcelRing(lineString, parcelRing) {
-  if (!Array.isArray(lineString) || lineString.length < 2 || !parcelRing?.length) {
+function isLineMostlyInsideParcelFeature(lineString, parcelFeature) {
+  if (!Array.isArray(lineString) || lineString.length < 2 || !parcelFeature) {
     return false;
   }
 
   let insideCount = 0;
 
   for (const point of lineString) {
-    if (pointInRing(point, parcelRing)) {
+    if (isPointInsideFeature(point, parcelFeature)) {
       insideCount += 1;
     }
   }
@@ -9790,12 +10577,28 @@ function splitTerrainMultiPolygonByParcelBoundary(siteContext, multiPolygon) {
     ];
   }
 
-  const parcelRing = getOpenRing(getOuterRing(siteContext.parcelBoundary)).map(
-    (point) => localMetersFromLngLat(point, siteContext.location)
-  );
-  const parcelMultiPolygon = buildLocalMultiPolygonFromOpenRing(parcelRing);
+  const targetParcelGroups = getTargetParcelGroupFeatures(siteContext)
+    .map((feature, index) => {
+      const parcelRing = getOpenRing(getOuterRing(feature)).map((point) =>
+        localMetersFromLngLat(point, siteContext.location)
+      );
+      const parcelMultiPolygon = buildLocalMultiPolygonFromOpenRing(parcelRing);
 
-  if (!parcelMultiPolygon.length) {
+      return parcelMultiPolygon.length
+        ? {
+            feature,
+            groupIndex: Number(feature?.properties?.groupIndex || index + 1),
+            groupId:
+              String(feature?.properties?.groupId || "").trim() ||
+              buildParcelSelectionKey(feature, index),
+            groupName: buildParcelGroupExportName(feature, index),
+            parcelMultiPolygon,
+          }
+        : null;
+    })
+    .filter(Boolean);
+
+  if (!targetParcelGroups.length) {
     return [
       {
         kind: "combined",
@@ -9806,31 +10609,58 @@ function splitTerrainMultiPolygonByParcelBoundary(siteContext, multiPolygon) {
   }
 
   let contextMultiPolygon = sourceMultiPolygon;
-  let parcelSegmentMultiPolygon = [];
-
-  try {
-    parcelSegmentMultiPolygon =
-      polygonClipping.intersection(sourceMultiPolygon, parcelMultiPolygon) || [];
-  } catch (error) {
-    console.warn(
-      `[terrain-split] parcel intersection fallback error=${formatErrorForLog(
-        error
-      )}`
-    );
-  }
-
-  try {
-    contextMultiPolygon =
-      polygonClipping.difference(sourceMultiPolygon, parcelMultiPolygon) || [];
-  } catch (error) {
-    console.warn(
-      `[terrain-split] parcel difference fallback error=${formatErrorForLog(
-        error
-      )}`
-    );
-  }
-
   const segments = [];
+
+  for (const targetGroup of targetParcelGroups) {
+    let parcelSegmentMultiPolygon = [];
+
+    try {
+      parcelSegmentMultiPolygon =
+        polygonClipping.intersection(
+          contextMultiPolygon,
+          targetGroup.parcelMultiPolygon
+        ) || [];
+    } catch (error) {
+      console.warn(
+        `[terrain-split] parcel intersection fallback error=${formatErrorForLog(
+          error
+        )}`
+      );
+    }
+
+    try {
+      contextMultiPolygon =
+        polygonClipping.difference(
+          contextMultiPolygon,
+          targetGroup.parcelMultiPolygon
+        ) || [];
+    } catch (error) {
+      console.warn(
+        `[terrain-split] parcel difference fallback error=${formatErrorForLog(
+          error
+        )}`
+      );
+    }
+
+    if (!parcelSegmentMultiPolygon.length) {
+      continue;
+    }
+
+    const regions = buildContourBandRegionsFromMultiPolygon(
+      parcelSegmentMultiPolygon
+    );
+
+    if (regions.length) {
+      segments.push({
+        kind: "parcel",
+        groupIndex: targetGroup.groupIndex,
+        groupId: targetGroup.groupId,
+        groupName: targetGroup.groupName,
+        multiPolygon: parcelSegmentMultiPolygon,
+        regions,
+      });
+    }
+  }
 
   if (contextMultiPolygon.length) {
     const regions = buildContourBandRegionsFromMultiPolygon(contextMultiPolygon);
@@ -9839,20 +10669,6 @@ function splitTerrainMultiPolygonByParcelBoundary(siteContext, multiPolygon) {
       segments.push({
         kind: "context",
         multiPolygon: contextMultiPolygon,
-        regions,
-      });
-    }
-  }
-
-  if (parcelSegmentMultiPolygon.length) {
-    const regions = buildContourBandRegionsFromMultiPolygon(
-      parcelSegmentMultiPolygon
-    );
-
-    if (regions.length) {
-      segments.push({
-        kind: "parcel",
-        multiPolygon: parcelSegmentMultiPolygon,
         regions,
       });
     }
@@ -10750,12 +11566,12 @@ function appendContourBandRoadObjGeometry(
 function buildObjFromSiteContext(siteContext, reportProgress = null) {
   const location = siteContext.location;
   const center = { lat: location.lat, lng: location.lng };
-  const parcelRing = getOuterRing(siteContext.parcelBoundary);
+  const targetParcelFeatures = getTargetParcelGroupFeatures(siteContext);
   const seed = Math.round(Math.abs(center.lat * 1000) + Math.abs(center.lng * 1000));
   const progress =
     typeof reportProgress === "function" ? reportProgress : () => null;
   const lines = [
-    "# Site Context Planner OBJ export",
+    "# Space Work OBJ export",
     `# Generated at ${new Date().toISOString()}`,
   ];
   let vertexIndex = 1;
@@ -10776,20 +11592,36 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
 
   if (siteContext.options?.includeParcelBoundary !== false) {
     progress(48, "필지 경계선을 추가하는 중입니다.");
-    lines.push("o PARCEL_BOUNDARY");
-    const parcelVertexIndices = [];
+    const parcelFeatures = targetParcelFeatures.length
+      ? targetParcelFeatures
+      : [siteContext.parcelBoundary].filter(Boolean);
 
-    for (const point of parcelRing) {
-      const [xMeters, yMeters] = localMetersFromLngLat(point, center);
-      const elevation =
-        siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.15;
-      appendObjVertex(lines, xMeters, yMeters, elevation);
-      parcelVertexIndices.push(vertexIndex);
-      vertexIndex += 1;
-    }
+    for (const [featureIndex, feature] of parcelFeatures.entries()) {
+      const groupIndex = Number(feature?.properties?.groupIndex || featureIndex + 1);
 
-    if (parcelVertexIndices.length >= 2) {
-      lines.push(`l ${parcelVertexIndices.join(" ")}`);
+      for (const ring of getFeaturePolygonRings(feature)) {
+        lines.push(
+          `o ${
+            parcelFeatures.length > 1
+              ? `PARCEL_BOUNDARY_${groupIndex}`
+              : "PARCEL_BOUNDARY"
+          }`
+        );
+        const parcelVertexIndices = [];
+
+        for (const point of ring) {
+          const [xMeters, yMeters] = localMetersFromLngLat(point, center);
+          const elevation =
+            siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.15;
+          appendObjVertex(lines, xMeters, yMeters, elevation);
+          parcelVertexIndices.push(vertexIndex);
+          vertexIndex += 1;
+        }
+
+        if (parcelVertexIndices.length >= 2) {
+          lines.push(`l ${parcelVertexIndices.join(" ")}`);
+        }
+      }
     }
   }
 
@@ -11087,7 +11919,7 @@ function buildSketchUpPrismGroup(
   );
 }
 
-function buildSketchUpPolyline(points, closed = false) {
+function buildSketchUpPolyline(points, closed = false, options = {}) {
   const normalizedPoints = closed
     ? dedupeLocalPolygonPoints(points, 0.001)
     : (points || []).filter(
@@ -11103,6 +11935,7 @@ function buildSketchUpPolyline(points, closed = false) {
 
   return {
     closed,
+    curve: options?.curve === true && !closed,
     points: normalizedPoints.map(([xMeters, yMeters, elevation]) =>
       buildSketchUpFacePoint(xMeters, yMeters, elevation)
     ),
@@ -11116,25 +11949,34 @@ function buildSketchUpContourPolyline(points, elevation) {
       Number(yMeters || 0),
       Number(elevation || 0),
     ]),
-    false
+    false,
+    { curve: true }
   );
 }
 
-function appendSketchUpTerrainSegmentSolids(
-  targetSolidsByKind,
-  segments,
-  topElevation,
-  bottomElevation
-) {
-  for (const segment of segments || []) {
-    const bucketKey =
-      segment?.kind === "parcel" || segment?.kind === "context"
-        ? segment.kind
-        : "combined";
+function createSketchUpSegmentSolidBuckets() {
+  return {
+    context: [],
+    groups: new Map(),
+  };
+}
 
-    if (!Array.isArray(targetSolidsByKind?.[bucketKey])) {
-      targetSolidsByKind[bucketKey] = [];
-    }
+function appendSketchUpTerrainSegmentSolids(buckets, segments, topElevation, bottomElevation) {
+  for (const segment of segments || []) {
+    const groupIndex =
+      segment?.kind === "parcel" && Number.isInteger(segment?.groupIndex)
+        ? segment.groupIndex
+        : null;
+    const bucket =
+      groupIndex !== null
+        ? (() => {
+            if (!buckets.groups.has(groupIndex)) {
+              buckets.groups.set(groupIndex, []);
+            }
+
+            return buckets.groups.get(groupIndex);
+          })()
+        : buckets.context;
 
     for (const region of segment.regions || []) {
       const terrainSolid = buildSketchUpRegionSolidDefinition(
@@ -11144,10 +11986,27 @@ function appendSketchUpTerrainSegmentSolids(
       );
 
       if (terrainSolid) {
-        targetSolidsByKind[bucketKey].push(terrainSolid);
+        bucket.push(terrainSolid);
       }
     }
   }
+}
+
+function buildSketchUpParcelContainerMap(siteContext) {
+  return new Map(
+    getTargetParcelGroupFeatures(siteContext).map((feature, index) => [
+      Number(feature?.properties?.groupIndex || index + 1),
+      buildParcelGroupExportName(feature, index),
+    ])
+  );
+}
+
+function resolveSketchUpGroupContainer(containerMap, groupIndex) {
+  if (!Number.isInteger(groupIndex)) {
+    return "";
+  }
+
+  return containerMap.get(groupIndex) || "";
 }
 
 function buildSketchUpPayloadFromSiteContext(siteContext) {
@@ -11155,12 +12014,12 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
   const center = { lat: location.lat, lng: location.lng };
   const seed = Math.round(Math.abs(center.lat * 1000) + Math.abs(center.lng * 1000));
   const groups = [];
-  const terrainSolidBuckets = { combined: [], context: [], parcel: [] };
-  const roadSolidBuckets = { combined: [], context: [], parcel: [] };
-  const parcelRing = shouldGroupParcelCutContent(siteContext)
-    ? getOuterRing(siteContext.parcelBoundary)
-    : null;
-  const parcelContainerName = parcelRing?.length ? "PARCEL_CUT_CONTENT" : "";
+  const terrainSolidBuckets = createSketchUpSegmentSolidBuckets();
+  const roadSolidBuckets = createSketchUpSegmentSolidBuckets();
+  const targetParcelFeatures = getTargetParcelGroupFeatures(siteContext);
+  const parcelContainerMap = shouldGroupParcelCutContent(siteContext)
+    ? buildSketchUpParcelContainerMap(siteContext)
+    : new Map();
   const pushGroup = (group) => {
     if (
       group &&
@@ -11274,8 +12133,11 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
           layer,
           name: objectName,
           container:
-            feature.properties?.isTarget && parcelContainerName
-              ? parcelContainerName
+            feature.properties?.isTarget
+              ? resolveSketchUpGroupContainer(
+                  parcelContainerMap,
+                  Number(feature.properties?.targetParcelGroupIndex || Number.NaN)
+                )
               : "",
           faces: [],
           polylines: [],
@@ -11318,31 +12180,46 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
   }
 
   if (siteContext.options?.includeParcelBoundary !== false) {
-    const parcelRing = getOuterRing(siteContext.parcelBoundary);
-    const parcelPolyline = buildSketchUpPolyline(
-      parcelRing.map((point) => {
-        const [xMeters, yMeters] = localMetersFromLngLat(point, center);
-        return [
-          xMeters,
-          yMeters,
-          siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.15,
-        ];
-      }),
-      true
-    );
+    const parcelFeatures = targetParcelFeatures.length
+      ? targetParcelFeatures
+      : [siteContext.parcelBoundary].filter(Boolean);
 
-    pushGroup({
-      layer: "site-parcel",
-      name: "PARCEL_BOUNDARY",
-      container: parcelContainerName,
-      faces: [],
-      polylines: parcelPolyline ? [parcelPolyline] : [],
-    });
+    for (const [featureIndex, feature] of parcelFeatures.entries()) {
+      const groupIndex = Number(feature?.properties?.groupIndex || featureIndex + 1);
+      const containerName = resolveSketchUpGroupContainer(parcelContainerMap, groupIndex);
+      const featureRings = getFeaturePolygonRings(feature);
+      const polylines = featureRings
+        .map((ring) =>
+          buildSketchUpPolyline(
+            ring.map((point) => {
+              const [xMeters, yMeters] = localMetersFromLngLat(point, center);
+              return [
+                xMeters,
+                yMeters,
+                siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.15,
+              ];
+            }),
+            true
+          )
+        )
+        .filter(Boolean);
+
+      pushGroup({
+        layer: "site-parcel",
+        name:
+          parcelFeatures.length > 1
+            ? `PARCEL_BOUNDARY_${groupIndex}`
+            : "PARCEL_BOUNDARY",
+        container: containerName,
+        faces: [],
+        polylines,
+      });
+    }
   }
 
   if (siteContext.options?.includeContours !== false) {
     const contourPolylines = [];
-    const parcelContourPolylines = [];
+    const parcelContourPolylines = new Map();
 
     for (const feature of siteContext.contourLines?.features || []) {
       const elevation = Number(feature?.properties?.elevation || 0);
@@ -11354,8 +12231,19 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
         const polyline = buildSketchUpContourPolyline(localPoints, elevation);
 
         if (polyline) {
-          if (parcelRing?.length && isLineMostlyInsideParcelRing(lineString, parcelRing)) {
-            parcelContourPolylines.push(polyline);
+          const targetParcelFeature = resolveTargetParcelGroupForLineString(
+            lineString,
+            targetParcelFeatures
+          );
+          const targetGroupIndex = Number(
+            targetParcelFeature?.properties?.groupIndex || Number.NaN
+          );
+
+          if (Number.isInteger(targetGroupIndex)) {
+            if (!parcelContourPolylines.has(targetGroupIndex)) {
+              parcelContourPolylines.set(targetGroupIndex, []);
+            }
+            parcelContourPolylines.get(targetGroupIndex).push(polyline);
           } else {
             contourPolylines.push(polyline);
           }
@@ -11373,23 +12261,21 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
       });
     }
 
-    if (parcelContourPolylines.length) {
+    for (const [groupIndex, polylines] of [...parcelContourPolylines.entries()].sort(
+      (left, right) => left[0] - right[0]
+    )) {
       pushGroup({
         layer: "contours",
-        name: "CONTOURS_PARCEL",
-        container: parcelContainerName,
+        name: `CONTOURS_PARCEL_${groupIndex}`,
+        container: resolveSketchUpGroupContainer(parcelContainerMap, groupIndex),
         faces: [],
-        polylines: parcelContourPolylines,
+        polylines,
         solids: [],
       });
     }
   }
 
-  const contextTerrainSolids = [
-    ...(terrainSolidBuckets.combined || []),
-    ...(terrainSolidBuckets.context || []),
-  ];
-  const parcelTerrainSolids = terrainSolidBuckets.parcel || [];
+  const contextTerrainSolids = terrainSolidBuckets.context || [];
 
   if (contextTerrainSolids.length) {
     pushGroup({
@@ -11401,22 +12287,20 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
     });
   }
 
-  if (parcelTerrainSolids.length) {
+  for (const [groupIndex, solids] of [...terrainSolidBuckets.groups.entries()].sort(
+    (left, right) => left[0] - right[0]
+  )) {
     pushGroup({
       layer: "terrain",
-      name: "TERRAIN_PARCEL",
-      container: parcelContainerName,
+      name: `TERRAIN_PARCEL_${groupIndex}`,
+      container: resolveSketchUpGroupContainer(parcelContainerMap, groupIndex),
       faces: [],
       polylines: [],
-      solids: parcelTerrainSolids,
+      solids,
     });
   }
 
-  const contextRoadSolids = [
-    ...(roadSolidBuckets.combined || []),
-    ...(roadSolidBuckets.context || []),
-  ];
-  const parcelRoadSolids = roadSolidBuckets.parcel || [];
+  const contextRoadSolids = roadSolidBuckets.context || [];
 
   if (contextRoadSolids.length) {
     pushGroup({
@@ -11428,14 +12312,16 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
     });
   }
 
-  if (parcelRoadSolids.length) {
+  for (const [groupIndex, solids] of [...roadSolidBuckets.groups.entries()].sort(
+    (left, right) => left[0] - right[0]
+  )) {
     pushGroup({
       layer: "roads",
-      name: "ROADS_PARCEL",
-      container: parcelContainerName,
+      name: `ROADS_PARCEL_${groupIndex}`,
+      container: resolveSketchUpGroupContainer(parcelContainerMap, groupIndex),
       faces: [],
       polylines: [],
-      solids: parcelRoadSolids,
+      solids,
     });
   }
 
@@ -11611,8 +12497,12 @@ def add_polylines_to_group(group, polylines)
   polylines.each do |polyline|
     points = (polyline['points'] || []).map { |point| point_from_triplet(point) }
     next if points.length < 2
-    points << points.first if polyline['closed'] && points.first != points.last
-    ents.add_edges(points)
+    if polyline['curve'] && !polyline['closed']
+      ents.add_curve(points)
+    else
+      points << points.first if polyline['closed'] && points.first != points.last
+      ents.add_edges(points)
+    end
   end
 end
 
@@ -12024,6 +12914,29 @@ function getGeometryPolygonRings(geometry) {
   return [];
 }
 
+function getGeometryPolygonCoordinateSets(geometry) {
+  if (!geometry) {
+    return [];
+  }
+
+  if (geometry.type === "Polygon") {
+    const coordinates = (geometry.coordinates || []).filter(
+      (ring) => Array.isArray(ring) && ring.length
+    );
+    return coordinates.length ? [coordinates] : [];
+  }
+
+  if (geometry.type === "MultiPolygon") {
+    return (geometry.coordinates || [])
+      .map((polygon) =>
+        (polygon || []).filter((ring) => Array.isArray(ring) && ring.length)
+      )
+      .filter((polygon) => polygon.length);
+  }
+
+  return [];
+}
+
 function getFeaturePolygonRings(feature) {
   return getGeometryPolygonRings(feature?.geometry);
 }
@@ -12124,6 +13037,249 @@ function normalizeDxfPolylinePoints(
   }
 
   return normalized;
+}
+
+function resolvePositiveInteger(value, fallback) {
+  const normalized = Number(value);
+
+  if (!Number.isFinite(normalized) || normalized <= 0) {
+    return fallback;
+  }
+
+  return Math.round(normalized);
+}
+
+class HttpError extends Error {
+  constructor(statusCode, message, headers = {}) {
+    super(String(message || "Unexpected error"));
+    this.name = "HttpError";
+    this.statusCode = Number(statusCode) || 500;
+    this.headers = headers && typeof headers === "object" ? headers : {};
+  }
+}
+
+function createHttpError(statusCode, message, headers = {}) {
+  return new HttpError(statusCode, message, headers);
+}
+
+function formatByteLimit(bytes) {
+  const normalized = Math.max(1, Number(bytes) || 0);
+
+  if (normalized >= 1024 * 1024) {
+    return `${(normalized / (1024 * 1024)).toFixed(
+      normalized % (1024 * 1024) === 0 ? 0 : 1
+    )}MB`;
+  }
+
+  if (normalized >= 1024) {
+    return `${Math.round(normalized / 1024)}KB`;
+  }
+
+  return `${normalized}B`;
+}
+
+function normalizeIpAddress(value) {
+  const normalized = String(value || "").trim();
+
+  if (!normalized) {
+    return "";
+  }
+
+  if (normalized === "::1") {
+    return "127.0.0.1";
+  }
+
+  if (normalized.startsWith("::ffff:")) {
+    return normalized.slice("::ffff:".length);
+  }
+
+  return normalized;
+}
+
+function isLoopbackIp(ipAddress) {
+  const normalized = normalizeIpAddress(ipAddress);
+  return normalized === "127.0.0.1" || normalized === "";
+}
+
+function readSingleHeaderValue(value) {
+  if (Array.isArray(value)) {
+    return String(value[0] || "").trim();
+  }
+
+  return String(value || "").trim();
+}
+
+function getClientIp(request) {
+  const socketIp = normalizeIpAddress(request?.socket?.remoteAddress);
+
+  if (isLoopbackIp(socketIp)) {
+    const cfConnectingIp = normalizeIpAddress(
+      readSingleHeaderValue(request?.headers?.["cf-connecting-ip"])
+    );
+
+    if (cfConnectingIp) {
+      return cfConnectingIp;
+    }
+
+    const xForwardedFor = readSingleHeaderValue(
+      request?.headers?.["x-forwarded-for"]
+    );
+    const forwardedIp = normalizeIpAddress(
+      xForwardedFor.split(",")[0] || socketIp
+    );
+
+    if (forwardedIp) {
+      return forwardedIp;
+    }
+  }
+
+  return socketIp || "unknown";
+}
+
+function normalizeProgressToken(value) {
+  const token = String(value || "").trim();
+
+  if (!token) {
+    return "";
+  }
+
+  return /^[A-Za-z0-9._:-]{1,120}$/.test(token) ? token : "";
+}
+
+function parseRequestContentLength(request) {
+  const headerValue = readSingleHeaderValue(request?.headers?.["content-length"]);
+
+  if (!headerValue) {
+    return null;
+  }
+
+  const parsed = Number(headerValue);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function buildSecurityHeaders() {
+  return {
+    "Content-Security-Policy": DEFAULT_CONTENT_SECURITY_POLICY,
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+  };
+}
+
+function buildResponseHeaders(headers = {}) {
+  return {
+    ...buildSecurityHeaders(),
+    ...headers,
+  };
+}
+
+function pruneRateLimitStore(now = Date.now()) {
+  for (const [key, entry] of rateLimitStore.entries()) {
+    if (Number(entry?.resetAt || 0) <= now) {
+      rateLimitStore.delete(key);
+    }
+  }
+}
+
+function resolveRateLimitBucket(pathname, method) {
+  if (!pathname.startsWith("/api/")) {
+    return null;
+  }
+
+  if (pathname === "/api/request-progress" && method === "GET") {
+    return "progress";
+  }
+
+  if (
+    (pathname === "/api/export-model" ||
+      pathname === "/api/export-obj" ||
+      pathname === "/api/export-skp-payload") &&
+    method === "POST"
+  ) {
+    return "export";
+  }
+
+  if (
+    (pathname === "/api/site-context" ||
+      pathname === "/api/land-info" ||
+      pathname === "/api/land-info-details" ||
+      pathname === "/api/building-register") &&
+    method === "POST"
+  ) {
+    return "heavy";
+  }
+
+  if (
+    (pathname === "/api/geocode" || pathname === "/api/reverse-geocode") &&
+    method === "GET"
+  ) {
+    return "search";
+  }
+
+  return "api";
+}
+
+function enforceRateLimit(request, response, config, bucket) {
+  const policy = config.rateLimits?.[bucket];
+
+  if (!policy?.maxRequests || !policy?.windowMs) {
+    return true;
+  }
+
+  pruneRateLimitStore();
+  const clientIp = getClientIp(request);
+  const now = Date.now();
+  const key = `${bucket}:${clientIp}`;
+  const existing = rateLimitStore.get(key);
+  const entry =
+    existing && Number(existing.resetAt || 0) > now
+      ? existing
+      : {
+          count: 0,
+          resetAt: now + policy.windowMs,
+        };
+
+  if (entry.count >= policy.maxRequests) {
+    sendJson(
+      response,
+      429,
+      {
+        error: policy.message || "요청이 너무 많습니다. 잠시 후 다시 시도해주세요.",
+      },
+      {
+        "Retry-After": String(
+          Math.max(1, Math.ceil((entry.resetAt - now) / 1000))
+        ),
+      }
+    );
+    return false;
+  }
+
+  entry.count += 1;
+  rateLimitStore.set(key, entry);
+  return true;
+}
+
+async function withExportJobSlot(config, work) {
+  const maxConcurrentJobs = Math.max(
+    1,
+    Number(config?.maxConcurrentExportJobs) || DEFAULT_MAX_CONCURRENT_EXPORT_JOBS
+  );
+
+  if (activeExportJobs >= maxConcurrentJobs) {
+    throw createHttpError(429, "다른 모델 내보내기가 진행 중입니다. 잠시 후 다시 시도해주세요.", {
+      "Retry-After": "15",
+    });
+  }
+
+  activeExportJobs += 1;
+
+  try {
+    return await work();
+  } finally {
+    activeExportJobs = Math.max(0, activeExportJobs - 1);
+  }
 }
 
 function appendDxfPolylineEntity(
@@ -12723,12 +13879,24 @@ function addRhinoContourTerrainRegions(
   }
 }
 
+function resolveRhinoParcelGroupIndices(parcelGroupIndexMap, targetGroupIndex) {
+  if (
+    parcelGroupIndexMap instanceof Map &&
+    Number.isInteger(targetGroupIndex) &&
+    parcelGroupIndexMap.has(targetGroupIndex)
+  ) {
+    return [parcelGroupIndexMap.get(targetGroupIndex)];
+  }
+
+  return [];
+}
+
 function addRhinoContourBandTerrain(
   doc,
   rhino,
   layerIndex,
   siteContext,
-  parcelGroupIndex = null
+  parcelGroupIndexMap = null
 ) {
   const terrainPlan = resolveContourTerrainRenderPlan(siteContext);
 
@@ -12754,10 +13922,10 @@ function addRhinoContourBandTerrain(
     );
 
     for (const segment of flatSegments) {
-      const segmentGroupIndices =
-        segment.kind === "parcel" && Number.isInteger(parcelGroupIndex)
-          ? [parcelGroupIndex]
-          : [];
+      const segmentGroupIndices = resolveRhinoParcelGroupIndices(
+        parcelGroupIndexMap,
+        Number(segment?.groupIndex || Number.NaN)
+      );
 
       if (segment.kind === "combined" && segment.regions.length === 1) {
         addRhinoPrismFromPolygon(
@@ -12805,10 +13973,10 @@ function addRhinoContourBandTerrain(
     );
 
     for (const segment of baseSegments) {
-      const segmentGroupIndices =
-        segment.kind === "parcel" && Number.isInteger(parcelGroupIndex)
-          ? [parcelGroupIndex]
-          : [];
+      const segmentGroupIndices = resolveRhinoParcelGroupIndices(
+        parcelGroupIndexMap,
+        Number(segment?.groupIndex || Number.NaN)
+      );
 
       if (segment.kind === "combined" && segment.regions.length === 1) {
         addRhinoPrismFromPolygon(
@@ -12862,10 +14030,10 @@ function addRhinoContourBandTerrain(
     );
 
     for (const segment of groupSegments) {
-      const segmentGroupIndices =
-        segment.kind === "parcel" && Number.isInteger(parcelGroupIndex)
-          ? [parcelGroupIndex]
-          : [];
+      const segmentGroupIndices = resolveRhinoParcelGroupIndices(
+        parcelGroupIndexMap,
+        Number(segment?.groupIndex || Number.NaN)
+      );
 
       addRhinoContourTerrainRegions(
         doc,
@@ -13002,7 +14170,7 @@ function addRhinoBuildings(
   siteContext,
   center,
   seed,
-  parcelGroupIndex = null
+  parcelGroupIndexMap = null
 ) {
   for (const feature of siteContext.buildings?.features || []) {
     const ring = getOpenRing(getOuterRing(feature));
@@ -13077,8 +14245,11 @@ function addRhinoBuildings(
           ? { r: 180, g: 74, b: 58 }
           : { r: 88, g: 96, b: 107 }
         ,
-        feature.properties?.isTarget && Number.isInteger(parcelGroupIndex)
-          ? [parcelGroupIndex]
+        feature.properties?.isTarget
+          ? resolveRhinoParcelGroupIndices(
+              parcelGroupIndexMap,
+              Number(feature.properties?.targetParcelGroupIndex || Number.NaN)
+            )
           : []
       )
     );
@@ -13224,7 +14395,7 @@ function addRhinoContourBandRoadSolids(
   layerIndex,
   siteContext,
   center,
-  parcelGroupIndex = null
+  parcelGroupIndexMap = null
 ) {
   const roadSurfaceGroups = buildRoadContourSurfaceGroups(siteContext, center);
   let objectCount = 0;
@@ -13243,10 +14414,10 @@ function addRhinoContourBandRoadSolids(
     );
 
     for (const segment of groupSegments) {
-      const segmentGroupIndices =
-        segment.kind === "parcel" && Number.isInteger(parcelGroupIndex)
-          ? [parcelGroupIndex]
-          : [];
+      const segmentGroupIndices = resolveRhinoParcelGroupIndices(
+        parcelGroupIndexMap,
+        Number(segment?.groupIndex || Number.NaN)
+      );
 
       for (
         let regionIndex = 0;
@@ -13354,7 +14525,7 @@ function addRhinoPolylineCollection(
       feature?.geometry?.type === "LineString" ||
       feature?.geometry?.type === "MultiLineString"
         ? getLineStringsFromGeometry(feature.geometry)
-        : [getOuterRing(feature)].filter(Boolean);
+        : getFeaturePolygonRings(feature);
 
     for (const coordinates of coordinateSets) {
       if (!coordinates?.length) {
@@ -13402,6 +14573,7 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
         : siteContext?.dataSources?.contours,
     },
   };
+  maybeRefineSketchUpTerrainGrid(exportSiteContext);
   const requestedContourInterval = normalizeContourInterval(
     exportSiteContext.options?.contourInterval
   );
@@ -13433,7 +14605,7 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
   );
   const preserveNativeContourDisplayLines =
     shouldPreserveNativeContourDisplayLines(format) &&
-    exportSiteContext.contourLines?.features?.length;
+    Boolean(exportSiteContext.contourLines?.features?.length);
 
   exportSiteContext.stats.effectiveContourDisplayInterval =
     preserveNativeContourDisplayLines &&
@@ -13468,7 +14640,7 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
   }
 
   console.log(
-    `[export-terrain] format=${format} requested=${requestedContourInterval} source=${sourceContourInterval} effective=${effectiveContourBandInterval} display=${exportSiteContext.stats.effectiveContourDisplayInterval} preserveNativeContours=${preserveNativeContourDisplayLines}`
+    `[export-terrain] format=${format} requested=${requestedContourInterval} source=${sourceContourInterval} effective=${effectiveContourBandInterval} display=${exportSiteContext.stats.effectiveContourDisplayInterval} preserveNativeContours=${preserveNativeContourDisplayLines} skpTerrainStep=${Number(exportSiteContext?.terrainGrid?.step || 0).toFixed(3)} refined=${exportSiteContext?.stats?.skpTerrainGridRefined === true}`
   );
 
   return exportSiteContext;
@@ -13493,12 +14665,20 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
   const seed = Math.round(Math.abs(center.lat * 1000) + Math.abs(center.lng * 1000));
   const layerIndexCache = new Map();
   const groupIndexCache = new Map();
-  const parcelContentGroupIndex = shouldGroupParcelCutContent(siteContext)
-    ? ensureRhinoGroup(doc, rhino, groupIndexCache, "PARCEL_CUT_CONTENT")
-    : null;
-  const parcelRing = Number.isInteger(parcelContentGroupIndex)
-    ? getOuterRing(siteContext.parcelBoundary)
-    : null;
+  const targetParcelFeatures = getTargetParcelGroupFeatures(siteContext);
+  const parcelGroupIndexMap = shouldGroupParcelCutContent(siteContext)
+    ? new Map(
+        targetParcelFeatures.map((feature, index) => {
+          const targetGroupIndex = Number(feature?.properties?.groupIndex || index + 1);
+          const groupName = buildParcelGroupExportName(feature, index);
+
+          return [
+            targetGroupIndex,
+            ensureRhinoGroup(doc, rhino, groupIndexCache, groupName),
+          ];
+        })
+      )
+    : new Map();
   const terrainLayer = ensureRhinoLayer(doc, layerIndexCache, "terrain", {
     r: 181,
     g: 143,
@@ -13544,7 +14724,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
       rhino,
       terrainLayer,
       siteContext,
-      parcelContentGroupIndex
+      parcelGroupIndexMap
     );
   } else {
     addRhinoTerrainMesh(doc, rhino, terrainLayer, siteContext, center, seed);
@@ -13560,7 +14740,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
       siteContext,
       center,
       seed,
-      parcelContentGroupIndex
+      parcelGroupIndexMap
     );
   }
 
@@ -13570,14 +14750,19 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
       doc,
       rhino,
       targetParcelLayer,
-      [siteContext.parcelBoundary],
+      targetParcelFeatures.length
+        ? targetParcelFeatures
+        : [siteContext.parcelBoundary].filter(Boolean),
       center,
       (_point, xMeters, yMeters) =>
         siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.15,
       {
         objectNamePrefix: "PARCEL_BOUNDARY",
-        groupIndicesResolver: () =>
-          Number.isInteger(parcelContentGroupIndex) ? [parcelContentGroupIndex] : [],
+        groupIndicesResolver: (feature) =>
+          resolveRhinoParcelGroupIndices(
+            parcelGroupIndexMap,
+            Number(feature?.properties?.groupIndex || Number.NaN)
+          ),
       }
     );
 
@@ -13621,11 +14806,16 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
             contourLayer,
             `CONTOUR_${index + 1}_${lineIndex + 1}`,
             null,
-            parcelRing?.length &&
-              isLineMostlyInsideParcelRing(lineStrings[lineIndex], parcelRing) &&
-              Number.isInteger(parcelContentGroupIndex)
-              ? [parcelContentGroupIndex]
-              : []
+            (() => {
+              const targetParcelFeature = resolveTargetParcelGroupForLineString(
+                lineStrings[lineIndex],
+                targetParcelFeatures
+              );
+              return resolveRhinoParcelGroupIndices(
+                parcelGroupIndexMap,
+                Number(targetParcelFeature?.properties?.groupIndex || Number.NaN)
+              );
+            })()
           )
         );
       }
@@ -13646,7 +14836,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
         roadLayer,
         siteContext,
         center,
-        parcelContentGroupIndex
+        parcelGroupIndexMap
       );
       console.log(
         `[export-3dm] roads features=${Number(
@@ -13712,6 +14902,140 @@ function normalizeExportFormat(value) {
   }
 
   return "obj";
+}
+
+function estimateExportArtifactSizeBytes(payload, payloadType = "binary") {
+  if (payloadType === "json") {
+    return Buffer.byteLength(JSON.stringify(payload), "utf8");
+  }
+
+  if (Buffer.isBuffer(payload)) {
+    return payload.byteLength;
+  }
+
+  if (payload instanceof Uint8Array) {
+    return payload.byteLength;
+  }
+
+  return Buffer.byteLength(String(payload || ""), "utf8");
+}
+
+function pruneExportArtifactCache(now = Date.now()) {
+  for (const [cacheKey, entry] of exportArtifactCache.entries()) {
+    if (now - Number(entry?.cachedAt || 0) >= EXPORT_ARTIFACT_CACHE_TTL_MS) {
+      exportArtifactCache.delete(cacheKey);
+    }
+  }
+
+  const entries = [...exportArtifactCache.entries()].sort(
+    (left, right) =>
+      Number(left[1]?.lastAccessedAt || left[1]?.cachedAt || 0) -
+      Number(right[1]?.lastAccessedAt || right[1]?.cachedAt || 0)
+  );
+  let totalBytes = entries.reduce(
+    (sum, [, entry]) => sum + Number(entry?.sizeBytes || 0),
+    0
+  );
+
+  while (
+    entries.length > EXPORT_ARTIFACT_CACHE_MAX_ENTRIES ||
+    totalBytes > EXPORT_ARTIFACT_CACHE_MAX_TOTAL_BYTES
+  ) {
+    const [cacheKey, entry] = entries.shift() || [];
+
+    if (!cacheKey) {
+      break;
+    }
+
+    exportArtifactCache.delete(cacheKey);
+    totalBytes -= Number(entry?.sizeBytes || 0);
+  }
+}
+
+function buildExportArtifactCacheKey(siteContext, format) {
+  const normalizedFormat = normalizeExportFormat(format);
+  const exportOptions = {
+    ...(siteContext?.options || {}),
+    exportFormat: normalizedFormat,
+  };
+
+  return JSON.stringify({
+    version: 2,
+    format: normalizedFormat,
+    request: buildSiteContextCacheKey(
+      siteContext?.location || {},
+      exportOptions,
+      siteContext?.location?.customBounds || null
+    ),
+    stats: {
+      targetParcelCount: Number(siteContext?.stats?.targetParcelCount || 0),
+      contourCount: Number(
+        siteContext?.contourLines?.features?.length ||
+          siteContext?.stats?.contourCount ||
+          0
+      ),
+      buildingCount: Number(siteContext?.stats?.buildingCount || 0),
+      roadCount: Number(siteContext?.stats?.roadCount || 0),
+      effectiveContourBandInterval:
+        siteContext?.stats?.effectiveContourBandInterval ?? null,
+      effectiveContourDisplayInterval:
+        siteContext?.stats?.effectiveContourDisplayInterval ?? null,
+      terrainStep: Number(siteContext?.terrainGrid?.step || 0).toFixed(3),
+    },
+    parcelGroups: getTargetParcelGroupFeatures(siteContext).map((feature, index) =>
+      buildParcelGroupExportName(feature, index)
+    ),
+  });
+}
+
+function readExportArtifactCache(cacheKey, now = Date.now()) {
+  pruneExportArtifactCache(now);
+  const entry = exportArtifactCache.get(cacheKey);
+
+  if (!entry) {
+    return null;
+  }
+
+  if (now - Number(entry.cachedAt || 0) >= EXPORT_ARTIFACT_CACHE_TTL_MS) {
+    exportArtifactCache.delete(cacheKey);
+    return null;
+  }
+
+  entry.lastAccessedAt = now;
+  return entry;
+}
+
+function writeExportArtifactCache(cacheKey, payload, options = {}) {
+  const payloadType =
+    options?.payloadType === "json" ? "json" : "binary";
+  const sizeBytes = estimateExportArtifactSizeBytes(payload, payloadType);
+
+  if (
+    !Number.isFinite(sizeBytes) ||
+    sizeBytes <= 0 ||
+    sizeBytes > EXPORT_ARTIFACT_CACHE_MAX_ENTRY_BYTES
+  ) {
+    return false;
+  }
+
+  const now = Date.now();
+  exportArtifactCache.set(cacheKey, {
+    cachedAt: now,
+    lastAccessedAt: now,
+    sizeBytes,
+    payloadType,
+    payload,
+    contentType: String(options?.contentType || "application/octet-stream"),
+  });
+  pruneExportArtifactCache(now);
+  return true;
+}
+
+function buildCachedSkpPayloadAttachmentBuffer(exportPayload) {
+  return Buffer.from(
+    JSON.stringify(exportPayload?.payload || {}, null, 2),
+    "utf8"
+  );
 }
 
 function buildSkpPayloadEnvelope(siteContext, exportConfig = null) {
@@ -14015,8 +15339,20 @@ async function createApp() {
 
     try {
       if (requestUrl.pathname === "/favicon.ico") {
-        response.writeHead(204);
+        response.writeHead(204, buildResponseHeaders());
         response.end();
+        return;
+      }
+
+      const rateLimitBucket = resolveRateLimitBucket(
+        requestUrl.pathname,
+        request.method
+      );
+
+      if (
+        rateLimitBucket &&
+        !enforceRateLimit(request, response, config, rateLimitBucket)
+      ) {
         return;
       }
 
@@ -14034,15 +15370,9 @@ async function createApp() {
           },
           data: {
             hasVWorldDataKey: Boolean(config.vworldApiKey),
-            hasVWorldDomain: Boolean(config.vworldApiDomain),
           },
           futureSources: {
-            hasJusoKey: Boolean(config.jusoConfirmKey),
             hasBuildingHubKey: Boolean(config.buildingHubServiceKey),
-            hasLawOc: Boolean(config.lawApiOc),
-            hasTerrainDemPath: Boolean(config.terrainDemPath),
-            hasTerrainContourPath: Boolean(config.terrainContourPath),
-            terrainContourCrs: normalizeCrsId(config.terrainContourCrs),
           },
         });
         return;
@@ -14053,14 +15383,6 @@ async function createApp() {
           ok: true,
           uptimeSeconds: Number(process.uptime().toFixed(1)),
           timestamp: new Date().toISOString(),
-          environment: {
-            port: config.port,
-            hasTerrainContourPath: Boolean(config.terrainContourPath),
-            terrainContourCrs: normalizeCrsId(config.terrainContourCrs),
-            hasBuildingHubKey: Boolean(config.buildingHubServiceKey),
-            hasVWorldKey: Boolean(config.vworldApiKey),
-            hasJusoKey: Boolean(config.jusoConfirmKey),
-          },
         });
         return;
       }
@@ -14070,26 +15392,25 @@ async function createApp() {
         request.method === "GET"
       ) {
         pruneRequestProgressStore();
-        const token = String(requestUrl.searchParams.get("token") || "").trim();
+        const token = normalizeProgressToken(
+          requestUrl.searchParams.get("token")
+        );
 
         if (!token) {
-          sendJson(response, 400, { error: "Missing progress token" });
+          sendJson(response, 400, { error: "유효한 진행 토큰이 필요합니다." });
           return;
         }
 
-        const entry =
-          requestProgressStore.get(token) || {
-            token,
-            operation: "request",
-            state: "idle",
-            percent: 0,
-            message: "",
-            startedAt: null,
-            updatedAt: null,
-            completedAt: null,
-            error: "",
-          };
-        sendJson(response, 200, entry);
+        const entry = requestProgressStore.get(token);
+        const clientIp = getClientIp(request);
+
+        if (!entry || (entry.clientIp && entry.clientIp !== clientIp)) {
+          sendJson(response, 404, { error: "진행 상태를 찾을 수 없습니다." });
+          return;
+        }
+
+        const { clientIp: _, ...publicEntry } = entry;
+        sendJson(response, 200, publicEntry);
         return;
       }
 
@@ -14170,14 +15491,19 @@ async function createApp() {
         request.method === "POST"
       ) {
         const progressToken = readRequestProgressToken(request);
+        const clientIp = getClientIp(request);
         beginRequestProgress(
           progressToken,
           "site-context",
           "대지 컨텍스트 요청을 준비하는 중입니다."
         );
 
+        updateRequestProgress(progressToken, { clientIp });
+
         try {
-          const body = await readJsonBody(request);
+          const body = await readJsonBody(request, {
+            maxBytes: config.maxRequestBodyBytes,
+          });
           const payload = await buildSiteContext(
             body,
             config,
@@ -14199,7 +15525,9 @@ async function createApp() {
         requestUrl.pathname === "/api/model-spec" &&
         request.method === "POST"
       ) {
-        const body = await readJsonBody(request);
+        const body = await readJsonBody(request, {
+          maxBytes: config.maxRequestBodyBytes,
+        });
         sendJson(response, 200, createModelSpec(body));
         return;
       }
@@ -14208,7 +15536,9 @@ async function createApp() {
         requestUrl.pathname === "/api/land-info" &&
         request.method === "POST"
       ) {
-        const body = await readJsonBody(request);
+        const body = await readJsonBody(request, {
+          maxBytes: config.maxRequestBodyBytes,
+        });
         const parcelReference = resolveParcelReference(body);
 
         if (!parcelReference) {
@@ -14228,7 +15558,9 @@ async function createApp() {
         requestUrl.pathname === "/api/land-info-details" &&
         request.method === "POST"
       ) {
-        const body = await readJsonBody(request);
+        const body = await readJsonBody(request, {
+          maxBytes: config.maxRequestBodyBytes,
+        });
         const parcelReference = resolveParcelReference(body);
 
         if (!parcelReference) {
@@ -14259,7 +15591,9 @@ async function createApp() {
           return;
         }
 
-        const body = await readJsonBody(request);
+        const body = await readJsonBody(request, {
+          maxBytes: config.maxRequestBodyBytes,
+        });
         const parcelReference = resolveParcelReference(body);
 
         if (!parcelReference) {
@@ -14287,6 +15621,7 @@ async function createApp() {
         request.method === "POST"
       ) {
         const progressToken = readRequestProgressToken(request);
+        const clientIp = getClientIp(request);
         const isSkpPayloadRoute =
           requestUrl.pathname === "/api/export-skp-payload";
         beginRequestProgress(
@@ -14298,17 +15633,22 @@ async function createApp() {
           "3D 파일 요청을 준비하는 중입니다."
         );
 
+        updateRequestProgress(progressToken, { clientIp });
+
         try {
-          const body = await readJsonBody(request);
-          let siteContext = body.siteContext || null;
-          const requestedOptions = body.options || {};
-          const requestedLocation = body.location || siteContext?.location || {};
-          const format =
-            requestUrl.pathname === "/api/export-obj"
-              ? "obj"
-              : isSkpPayloadRoute
-                ? "skp-payload"
-                : normalizeExportFormat(body.options?.exportFormat);
+          const body = await readJsonBody(request, {
+            maxBytes: config.maxExportRequestBodyBytes,
+          });
+          await withExportJobSlot(config, async () => {
+            let siteContext = body.siteContext || null;
+            const requestedOptions = body.options || {};
+            const requestedLocation = body.location || siteContext?.location || {};
+            const format =
+              requestUrl.pathname === "/api/export-obj"
+                ? "obj"
+                : isSkpPayloadRoute
+                  ? "skp-payload"
+                  : normalizeExportFormat(body.options?.exportFormat);
 
           if (
             !siteContext ||
@@ -14343,13 +15683,15 @@ async function createApp() {
             });
           }
 
-          if (siteContext && siteContext === body.siteContext) {
-            console.log(
-              `[export] reusing siteContext format=${format} roads=${Number(
-                siteContext.roads?.features?.length || 0
-              )} includeRoads=${siteContext.options?.includeRoads === true}`
-            );
-          }
+            assertSiteContextWithinLimits(siteContext, config);
+
+            if (siteContext && siteContext === body.siteContext) {
+              console.log(
+                `[export] reusing siteContext format=${format} roads=${Number(
+                  siteContext.roads?.features?.length || 0
+                )} includeRoads=${siteContext.options?.includeRoads === true}`
+              );
+            }
 
           siteContext = prepareSiteContextForExport(
             siteContext,
@@ -14361,6 +15703,60 @@ async function createApp() {
             requestedOptions,
             format
           );
+          const exportCacheKey = buildExportArtifactCacheKey(
+            siteContext,
+            format
+          );
+          const cachedExportArtifact = readExportArtifactCache(exportCacheKey);
+
+          if (cachedExportArtifact) {
+            console.log(
+              `[export] cache-hit format=${format} bytes=${Number(
+                cachedExportArtifact.sizeBytes || 0
+              )}`
+            );
+            updateRequestProgress(progressToken, {
+              percent: 96,
+              message: "이전 출력 결과를 다시 사용하는 중입니다.",
+            });
+            completeRequestProgress(
+              progressToken,
+              `${String(format || "model").toUpperCase()} 캐시 결과를 내려받습니다.`
+            );
+
+            if (format === "skp-payload") {
+              if (isSkpPayloadRoute) {
+                sendJson(response, 200, cachedExportArtifact.payload, {
+                  "X-Export-Cache": "hit",
+                });
+              } else {
+                sendBinary(
+                  response,
+                  200,
+                  buildCachedSkpPayloadAttachmentBuffer(
+                    cachedExportArtifact.payload
+                  ),
+                  "application/json; charset=utf-8",
+                  buildResolvedExportDownloadFilename(
+                    siteContext,
+                    requestedOptions,
+                    "skp-payload"
+                  ),
+                  { "X-Export-Cache": "hit" }
+                );
+              }
+            } else {
+              sendBinary(
+                response,
+                200,
+                cachedExportArtifact.payload,
+                cachedExportArtifact.contentType,
+                exportFilename,
+                { "X-Export-Cache": "hit" }
+              );
+            }
+            return;
+          }
 
           const exportStartedAt = Date.now();
 
@@ -14382,12 +15778,16 @@ async function createApp() {
               progressToken,
               "3DM 파일 다운로드를 시작합니다."
             );
+            writeExportArtifactCache(exportCacheKey, exportBody, {
+              contentType: "application/octet-stream",
+            });
             sendBinary(
               response,
               200,
               exportBody,
               "application/octet-stream",
-              exportFilename
+              exportFilename,
+              { "X-Export-Cache": "miss" }
             );
             return;
           }
@@ -14415,12 +15815,16 @@ async function createApp() {
               progressToken,
               "SKP 파일 다운로드를 시작합니다."
             );
+            writeExportArtifactCache(exportCacheKey, exportBody, {
+              contentType: "application/octet-stream",
+            });
             sendBinary(
               response,
               200,
               exportBody,
               "application/octet-stream",
-              exportFilename
+              exportFilename,
+              { "X-Export-Cache": "miss" }
             );
             return;
           }
@@ -14436,6 +15840,10 @@ async function createApp() {
                 exportPayload?.payload?.groups?.length || 0
               )} ms=${Date.now() - exportStartedAt}`
             );
+            writeExportArtifactCache(exportCacheKey, exportPayload, {
+              payloadType: "json",
+              contentType: "application/json; charset=utf-8",
+            });
             completeRequestProgress(
               progressToken,
               isSkpPayloadRoute
@@ -14444,21 +15852,21 @@ async function createApp() {
             );
 
             if (isSkpPayloadRoute) {
-              sendJson(response, 200, exportPayload);
+              sendJson(response, 200, exportPayload, {
+                "X-Export-Cache": "miss",
+              });
             } else {
               sendBinary(
                 response,
                 200,
-                Buffer.from(
-                  JSON.stringify(exportPayload.payload, null, 2),
-                  "utf8"
-                ),
+                buildCachedSkpPayloadAttachmentBuffer(exportPayload),
                 "application/json; charset=utf-8",
                 buildResolvedExportDownloadFilename(
                   siteContext,
                   requestedOptions,
                   "skp-payload"
-                )
+                ),
+                { "X-Export-Cache": "miss" }
               );
             }
             return;
@@ -14483,12 +15891,17 @@ async function createApp() {
               progressToken,
               "DXF ?뚯씪 ?ㅼ슫濡쒕뱶瑜??쒖옉?⑸땲??"
             );
+            const exportBuffer = Buffer.from(exportBody, "utf8");
+            writeExportArtifactCache(exportCacheKey, exportBuffer, {
+              contentType: "application/dxf; charset=utf-8",
+            });
             sendBinary(
               response,
               200,
-              Buffer.from(exportBody, "utf8"),
+              exportBuffer,
               "application/dxf; charset=utf-8",
-              exportFilename
+              exportFilename,
+              { "X-Export-Cache": "miss" }
             );
             return;
           }
@@ -14507,13 +15920,27 @@ async function createApp() {
             progressToken,
             "OBJ 파일 다운로드를 시작합니다."
           );
-          sendText(response, 200, exportBody, exportFilename);
+            const exportBuffer = Buffer.from(exportBody, "utf8");
+            writeExportArtifactCache(exportCacheKey, exportBuffer, {
+              contentType: "text/plain; charset=utf-8",
+            });
+            sendBinary(
+              response,
+              200,
+              exportBuffer,
+              "text/plain; charset=utf-8",
+              exportFilename,
+              { "X-Export-Cache": "miss" }
+            );
+          });
         } catch (error) {
           failRequestProgress(progressToken, error);
-          logServerError(
-            `Export failed progressToken=${progressToken || "none"}`,
-            error
-          );
+          if (!(error instanceof HttpError) || error.statusCode >= 500) {
+            logServerError(
+              `Export failed progressToken=${progressToken || "none"}`,
+              error
+            );
+          }
           throw error;
         }
         return;
@@ -14521,10 +15948,18 @@ async function createApp() {
 
       await serveStatic(requestUrl.pathname, response);
     } catch (error) {
-      logServerError(`${request.method} ${requestUrl.pathname}`, error);
-      sendJson(response, 500, {
+      const statusCode =
+        error instanceof HttpError ? error.statusCode : 500;
+      const errorHeaders =
+        error instanceof HttpError ? error.headers : {};
+
+      if (!(error instanceof HttpError) || statusCode >= 500) {
+        logServerError(`${request.method} ${requestUrl.pathname}`, error);
+      }
+
+      sendJson(response, statusCode, {
         error: error instanceof Error ? error.message : "Unexpected error",
-      });
+      }, errorHeaders);
     }
   };
 
@@ -14543,7 +15978,7 @@ async function createApp() {
 
       if (error instanceof Error && error.code === "EADDRINUSE") {
         throw new Error(
-          `Port ${port} is already in use. Stop the previous Site Context Planner server and try again.`
+          `Port ${port} is already in use. Stop the previous Space Work server and try again.`
         );
       }
 
@@ -14551,8 +15986,9 @@ async function createApp() {
     }
   }
 
-  const { port } = await listenOnConfiguredPort(config.port);
-  console.log(`Site Context Planner running at http://localhost:${port}`);
+  const { port, server } = await listenOnConfiguredPort(config.port);
+  console.log(`Space Work running at http://localhost:${port}`);
+  return { port, server };
 }
 
 export {
@@ -14571,6 +16007,7 @@ export {
   buildSkpFromSiteContext,
   buildSkpFromSiteContextWithRetry,
   createRhinoObjectAttributes,
+  createApp,
   centroidOfRing,
   collectBuildingFootprintElevationSamples,
   ensureRhinoLayer,

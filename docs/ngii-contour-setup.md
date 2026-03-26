@@ -19,7 +19,7 @@ Example:
 
 ```json
 {
-  "TERRAIN_CONTOUR_PATH": "/opt/site-context-planner/data/contours",
+  "TERRAIN_CONTOUR_PATH": "/opt/space-work/data/contours",
   "TERRAIN_CONTOUR_CRS": "EPSG:5179"
 }
 ```

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>법규 기반 최대 매스 생성</title>
+    <link rel="stylesheet" href="/future-pages.css?v=20260326-future1" />
+  </head>
+  <body data-page="max-mass">
+    <main class="future-shell">
+      <section class="future-hero">
+        <nav class="future-nav" aria-label="페이지 이동">
+          <a href="/">허브로</a>
+          <a href="/contour3dmodel">3D 대지모형</a>
+          <a class="is-primary" href="/max-mass">최대 매스 생성</a>
+        </nav>
+        <p class="eyebrow">Roadmap Stage 8</p>
+        <h1>법규 기반 최대 매스 생성</h1>
+        <p class="hero-copy">
+          대지 조건과 법규 해석을 바탕으로 초기 최대 매스를 검토하는 기능을 위한
+          페이지입니다. 지금은 실제 생성 로직을 넣기 전에, 기능이 들어올 자리와
+          흐름을 먼저 잡아둔 상태입니다.
+        </p>
+        <dl class="hero-meta">
+          <div>
+            <dt>페이지 주소</dt>
+            <dd><code>/max-mass</code></dd>
+          </div>
+          <div>
+            <dt>중심 인터페이스</dt>
+            <dd>규제 요약 + 매스 비교</dd>
+          </div>
+          <div>
+            <dt>현재 상태</dt>
+            <dd>준비 중인 확장 페이지</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="future-grid" aria-label="기능 구상">
+        <article class="future-card">
+          <h2>우선 붙을 흐름</h2>
+          <ul class="future-list">
+            <li>대지와 필지 그룹을 불러옵니다.</li>
+            <li>법규 조건을 요약 카드로 정리합니다.</li>
+            <li>조건에 맞는 초기 최대 매스를 생성합니다.</li>
+            <li>여러 안을 비교하고, 필요 시 3D 대지모형과 교차 검토합니다.</li>
+          </ul>
+        </article>
+
+        <article class="future-card">
+          <h2>예상 출력 방향</h2>
+          <ul class="future-list">
+            <li>규제 요약 카드</li>
+            <li>최대 매스 미리보기</li>
+            <li>안별 비교 패널</li>
+            <li>그룹별 3D 또는 CAD handoff</li>
+          </ul>
+        </article>
+
+        <article class="future-card">
+          <h2>디자인 메모</h2>
+          <p>
+            이 페이지는 지도만 보기보다 규제 해석과 안 비교가 중요하므로,
+            오른쪽에 분석 패널을 두고 중앙에는 대지와 매스를 크게 보여주는 방식이
+            잘 맞습니다.
+          </p>
+        </article>
+
+        <article class="future-card">
+          <h2>연동 메모</h2>
+          <p>
+            다중 필지 선택, 필지 그룹 분리, 이후의 비교 기능과 잘 연결됩니다.
+            현재의 <code>/contour3dmodel</code>이 입력 페이지라면,
+            <code>/max-mass</code>는 초기 설계 검토 페이지가 됩니다.
+          </p>
+        </article>
+      </section>
+
+      <section class="future-note">
+        <h2>현재는 페이지 뼈대만 열어둔 상태입니다</h2>
+        <p>
+          이번 단계에서는 앞으로 붙을 최대 매스 기능의 전용 주소와 화면 틀을
+          먼저 만들었습니다. 실제 규제 해석과 생성 알고리즘은 다음 구현 단계에서
+          이어서 붙이면 됩니다.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>

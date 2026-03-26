@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import process from "node:process";
 import {
+  createApp,
   prepareSiteContextForExport,
   build3dmFromSiteContext,
   buildSketchUpPayloadFromSiteContext,
@@ -9,6 +10,8 @@ import {
 } from "./server.mjs";
 
 const BASE_URL = process.env.SITE_CONTEXT_BASE_URL || "http://127.0.0.1:3000";
+const BASELINE_MODE = process.argv.includes("--baseline");
+const BASELINE_PORT = Number(process.env.VERIFY_BASELINE_PORT || 3034);
 const FULL_SKP_EXPORT = /^(1|true|yes)$/i.test(
   String(process.env.VERIFY_EXPORTS_FULL_SKP || "")
 );
@@ -56,9 +59,17 @@ const CASES = [
   },
 ].filter((testCase) => CASE_FILTER.size === 0 || CASE_FILTER.has(testCase.name));
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function isRetriableFetchError(error) {
   const message = String(error?.message || error || "");
   return /ECONNRESET|fetch failed|socket hang up|ETIMEDOUT/i.test(message);
+}
+
+async function readJson(response) {
+  return response.json().catch(() => ({}));
 }
 
 async function fetchJson(pathname, payload = null, retryCount = 0) {
@@ -69,7 +80,7 @@ async function fetchJson(pathname, payload = null, retryCount = 0) {
       body: payload ? JSON.stringify(payload) : undefined,
     });
 
-    const json = await response.json().catch(() => ({}));
+    const json = await readJson(response);
 
     if (!response.ok) {
       throw new Error(
@@ -167,6 +178,12 @@ async function verifyCase(testCase) {
   const skpBytes = FULL_SKP_EXPORT
     ? (await buildSkpFromSiteContextWithRetry(skp.exportSiteContext)).length
     : 0;
+  const skpCurvePolylineCount = (skpPayload.groups || []).reduce(
+    (sum, group) =>
+      sum +
+      (group?.polylines || []).filter((polyline) => polyline?.curve === true).length,
+    0
+  );
 
   const result = {
     name: testCase.name,
@@ -189,6 +206,9 @@ async function verifyCase(testCase) {
         effective: skp.effective,
         contourCount: skp.contourCount,
         groups: skpPayload.groups?.length || 0,
+        terrainStep: skp.exportSiteContext?.terrainGrid?.step || null,
+        refinedTerrainGrid: skp.exportSiteContext?.stats?.skpTerrainGridRefined === true,
+        curvePolylines: skpCurvePolylineCount,
         bytes: skpBytes,
       },
       obj: {
@@ -205,7 +225,523 @@ async function verifyCase(testCase) {
   return { result, failures };
 }
 
+async function runBaselineVerification() {
+  const baseUrl = `http://127.0.0.1:${BASELINE_PORT}`;
+  const previousPort = process.env.PORT;
+  process.env.PORT = String(BASELINE_PORT);
+  const app = await createApp();
+  const server = app?.server;
+  const multiParcelSelection = [
+    {
+      type: "Feature",
+      properties: {
+        pnu: "1111010100100010000",
+        addr: "테스트 필지 1",
+      },
+      geometry: {
+        type: "Polygon",
+        coordinates: [[
+          [126.978, 37.5664],
+          [126.97818, 37.5664],
+          [126.97818, 37.56655],
+          [126.978, 37.56655],
+          [126.978, 37.5664],
+        ]],
+      },
+    },
+    {
+      type: "Feature",
+      properties: {
+        pnu: "1111010100100020000",
+        addr: "테스트 필지 2",
+      },
+      geometry: {
+        type: "Polygon",
+        coordinates: [[
+          [126.9782, 37.5664],
+          [126.97838, 37.5664],
+          [126.97838, 37.56655],
+          [126.9782, 37.56655],
+          [126.9782, 37.5664],
+        ]],
+      },
+    },
+  ];
+  const namedMultiParcelSelection = multiParcelSelection.map((feature, index) => ({
+    ...feature,
+    properties: {
+      ...(feature.properties || {}),
+      groupName: index === 0 ? "Parcel Cluster A" : "Parcel Cluster B",
+      groupLabel: index === 0 ? "Parcel Cluster A" : "Parcel Cluster B",
+      groupNameSource: "custom",
+    },
+  }));
+
+  try {
+    const healthResponse = await fetch(`${baseUrl}/api/health`);
+    const healthPayload = await readJson(healthResponse);
+    assert.equal(healthResponse.status, 200, "Health endpoint should respond.");
+    assert.equal(healthPayload.ok, true, "Health endpoint should return ok=true.");
+    assert.deepEqual(
+      Object.keys(healthPayload).sort(),
+      ["ok", "timestamp", "uptimeSeconds"],
+      "Health payload shape changed."
+    );
+
+    const configResponse = await fetch(`${baseUrl}/api/config`);
+    const configPayload = await readJson(configResponse);
+    assert.equal(configResponse.status, 200, "Config endpoint should respond.");
+    assert.equal(
+      configPayload?.map?.provider,
+      "openstreetmap",
+      "Map provider should stay on openstreetmap."
+    );
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(
+        configPayload?.futureSources || {},
+        "hasBuildingHubKey"
+      ),
+      "Config should expose hasBuildingHubKey flag for the UI."
+    );
+    assert.deepEqual(
+      Object.keys(configPayload?.data || {}).sort(),
+      ["hasVWorldDataKey"],
+      "Config data payload shape changed."
+    );
+
+    const hubResponse = await fetch(`${baseUrl}/`);
+    const hubHtml = await hubResponse.text();
+    assert.equal(hubResponse.status, 200, "Hub route should respond.");
+    assert.match(hubHtml, /Space Work Hub/, "Hub page title/content should exist.");
+    assert.match(
+      hubHtml,
+      /\/contour3dmodel/,
+      "Hub page should link to the feature route."
+    );
+    assert.match(
+      hubHtml,
+      /\/heritage-risk/,
+      "Hub page should link to the heritage-risk route."
+    );
+    assert.match(
+      hubHtml,
+      /\/max-mass/,
+      "Hub page should link to the max-mass route."
+    );
+    assert.ok(
+      hubResponse.headers.get("content-security-policy"),
+      "Hub page should send a CSP header."
+    );
+    assert.equal(
+      hubResponse.headers.get("x-content-type-options"),
+      "nosniff",
+      "Hub page should send nosniff header."
+    );
+
+    const featureResponse = await fetch(`${baseUrl}/contour3dmodel`);
+    const featureHtml = await featureResponse.text();
+    assert.equal(featureResponse.status, 200, "Feature route should respond.");
+    assert.match(
+      featureHtml,
+      /3D 대지모형 스튜디오/,
+      "Feature page heading should remain visible."
+    );
+    assert.match(featureHtml, /토지이음 열기/, "Land-use CTA should remain visible.");
+    assert.match(featureHtml, /세움터 열기/, "Building register CTA should remain visible.");
+    assert.match(featureHtml, /필지 그룹 분리/, "Split parcel option should remain visible.");
+    assert.match(featureHtml, /모델 미리보기/, "Preview CTA should remain visible.");
+
+    const heritageResponse = await fetch(`${baseUrl}/heritage-risk`);
+    const heritageHtml = await heritageResponse.text();
+    assert.equal(heritageResponse.status, 200, "Heritage route should respond.");
+    assert.match(
+      heritageHtml,
+      /data-page="heritage-risk"/,
+      "Heritage route should render the placeholder page."
+    );
+    assert.match(
+      heritageHtml,
+      /\/contour3dmodel/,
+      "Heritage page should link back to the live feature page."
+    );
+
+    const maxMassResponse = await fetch(`${baseUrl}/max-mass`);
+    const maxMassHtml = await maxMassResponse.text();
+    assert.equal(maxMassResponse.status, 200, "Max-mass route should respond.");
+    assert.match(
+      maxMassHtml,
+      /data-page="max-mass"/,
+      "Max-mass route should render the placeholder page."
+    );
+    assert.match(
+      maxMassHtml,
+      /\/contour3dmodel/,
+      "Max-mass page should link back to the live feature page."
+    );
+
+    const invalidTokenResponse = await fetch(
+      `${baseUrl}/api/request-progress?token=bad token`
+    );
+    assert.equal(invalidTokenResponse.status, 400, "Invalid progress token should be rejected.");
+
+    const missingTokenResponse = await fetch(
+      `${baseUrl}/api/request-progress?token=progress-does-not-exist`
+    );
+    assert.equal(missingTokenResponse.status, 404, "Unknown progress token should not leak state.");
+
+    const modelSpecResponse = await fetch(`${baseUrl}/api/model-spec`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        location: { lat: 37.5665, lng: 126.978 },
+        options: { exportFormat: "dxf" },
+        siteContext: {
+          stats: {
+            buildingCount: 0,
+          },
+        },
+      }),
+    });
+    const modelSpecPayload = await readJson(modelSpecResponse);
+    assert.equal(modelSpecResponse.status, 200, "Model spec endpoint should respond.");
+    assert.ok(
+      Array.isArray(modelSpecPayload.exportTargets) &&
+        modelSpecPayload.exportTargets.includes("dxf"),
+      "Model spec should continue listing DXF export."
+    );
+
+    const oversizedResponse = await fetch(`${baseUrl}/api/model-spec`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        siteContext: "x".repeat(1_100_000),
+      }),
+    });
+    assert.equal(oversizedResponse.status, 413, "Oversized JSON body should be rejected.");
+
+    const oversizedPayload = await readJson(oversizedResponse);
+    assert.match(
+      String(oversizedPayload.error || ""),
+      /허용됩니다/,
+      "Oversized JSON should explain the limit."
+    );
+
+    const radiusResponse = await fetch(`${baseUrl}/api/site-context`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        location: { lat: 37.5665, lng: 126.978 },
+        options: { radius: 5000 },
+      }),
+    });
+    assert.equal(
+      radiusResponse.status,
+      400,
+      "Out-of-range radius should be rejected before live data loading."
+    );
+
+    const radiusPayload = await readJson(radiusResponse);
+    assert.match(
+      String(radiusPayload.error || ""),
+      /반경/,
+      "Radius rejection should mention radius."
+    );
+
+    const multiParcelResponse = await fetch(`${baseUrl}/api/site-context`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        location: {
+          lat: 37.56647,
+          lng: 126.97819,
+          selectionMode: "multi-parcel",
+          selectedParcels: multiParcelSelection,
+        },
+        selectedParcels: multiParcelSelection,
+        options: {
+          radius: 80,
+          includeBuildings: false,
+        },
+        previewOnly: true,
+      }),
+    });
+    const multiParcelPayload = await readJson(multiParcelResponse);
+    assert.equal(multiParcelResponse.status, 200, "Multi-parcel preview should respond.");
+    assert.equal(
+      multiParcelPayload.selectionMode,
+      "multi-parcel",
+      "Multi-parcel preview should preserve selection mode."
+    );
+    assert.equal(
+      multiParcelPayload?.targetParcelGroups?.features?.length,
+      2,
+      "Multi-parcel preview should return the selected parcel groups."
+    );
+    assert.equal(
+      Number(multiParcelPayload?.stats?.targetParcelCount || 0),
+      2,
+      "Multi-parcel preview should report the selected parcel count."
+    );
+
+    const namedMultiParcelResponse = await fetch(`${baseUrl}/api/site-context`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        location: {
+          lat: 37.56647,
+          lng: 126.97819,
+          selectionMode: "multi-parcel",
+          selectedParcels: namedMultiParcelSelection,
+        },
+        selectedParcels: namedMultiParcelSelection,
+        options: {
+          radius: 80,
+          includeBuildings: false,
+        },
+        previewOnly: true,
+      }),
+    });
+    const namedMultiParcelPayload = await readJson(namedMultiParcelResponse);
+    assert.equal(
+      namedMultiParcelResponse.status,
+      200,
+      "Named multi-parcel preview should respond."
+    );
+    assert.deepEqual(
+      (namedMultiParcelPayload?.targetParcelGroups?.features || []).map(
+        (feature) => feature?.properties?.groupName
+      ),
+      ["Parcel Cluster A", "Parcel Cluster B"],
+      "Custom parcel group names should survive preview/export preparation in order."
+    );
+
+    const syntheticContourSiteContext = {
+      location: { lat: 37.56647, lng: 126.97819 },
+      clipBoundary: {
+        type: "Feature",
+        properties: {},
+        geometry: {
+          type: "Polygon",
+          coordinates: [[
+            [126.978, 37.56638],
+            [126.97842, 37.56638],
+            [126.97842, 37.56672],
+            [126.978, 37.56672],
+            [126.978, 37.56638],
+          ]],
+        },
+      },
+      contourLines: {
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            properties: { provider: "official-contours", elevation: 10 },
+            geometry: {
+              type: "LineString",
+              coordinates: [
+                [126.97802, 37.56643],
+                [126.9784, 37.56643],
+              ],
+            },
+          },
+          {
+            type: "Feature",
+            properties: { provider: "official-contours", elevation: 12 },
+            geometry: {
+              type: "LineString",
+              coordinates: [
+                [126.97802, 37.56655],
+                [126.9784, 37.56655],
+              ],
+            },
+          },
+          {
+            type: "Feature",
+            properties: { provider: "official-contours", elevation: 14 },
+            geometry: {
+              type: "LineString",
+              coordinates: [
+                [126.97802, 37.56667],
+                [126.9784, 37.56667],
+              ],
+            },
+          },
+        ],
+      },
+      terrainGrid: {
+        step: 1.25,
+        xValues: [0, 20, 40],
+        yValues: [0, 20, 40],
+        elevations: [
+          [10, 10, 10],
+          [12, 12, 12],
+          [14, 14, 14],
+        ],
+        minElevation: 10,
+        maxElevation: 14,
+      },
+      options: {
+        ...DEFAULT_OPTIONS,
+        radius: 80,
+        includeBuildings: false,
+        includeRoads: false,
+        includeParcelBoundary: false,
+      },
+      stats: {},
+      dataSources: {
+        contours: {
+          provider: "official-contours",
+          mode: "derived",
+          interval: 2,
+        },
+      },
+      buildings: { type: "FeatureCollection", features: [] },
+      roads: { type: "FeatureCollection", features: [] },
+    };
+    const refinedSketchUpSiteContext = prepareSiteContextForExport(
+      syntheticContourSiteContext,
+      syntheticContourSiteContext.options,
+      "skp"
+    );
+    assert.equal(
+      refinedSketchUpSiteContext?.stats?.skpTerrainGridRefined,
+      true,
+      "SKP export should refine official contour terrain sampling when native contours exist."
+    );
+    assert.ok(
+      Number(refinedSketchUpSiteContext?.terrainGrid?.step || 0) > 0 &&
+        Number(refinedSketchUpSiteContext?.terrainGrid?.step || 0) < 1.25,
+      "SKP refined terrain grid should use a tighter sample step than the source grid."
+    );
+    const refinedSketchUpPayload = buildSketchUpPayloadFromSiteContext(
+      refinedSketchUpSiteContext
+    );
+    const refinedContourCurves = (refinedSketchUpPayload.groups || [])
+      .filter((group) => group?.layer === "contours")
+      .flatMap((group) => group?.polylines || [])
+      .map((polyline) => polyline?.curve === true);
+    assert.ok(
+      refinedContourCurves.length > 0,
+      "SKP payload should still contain contour polylines."
+    );
+    assert.ok(
+      refinedContourCurves.every(Boolean),
+      "SKP contour polylines should be exported as curves."
+    );
+
+    const exportCacheRequestBody = {
+      location: syntheticContourSiteContext.location,
+      siteContext: syntheticContourSiteContext,
+      options: {
+        ...syntheticContourSiteContext.options,
+        exportFormat: "skp-payload",
+      },
+    };
+    const firstExportCacheResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(exportCacheRequestBody),
+    });
+    const firstExportCachePayload = await readJson(firstExportCacheResponse);
+    assert.equal(
+      firstExportCacheResponse.status,
+      200,
+      "First export payload request should respond."
+    );
+    assert.equal(
+      firstExportCacheResponse.headers.get("x-export-cache"),
+      "miss",
+      "First export payload response should be a cache miss."
+    );
+    assert.ok(
+      Array.isArray(firstExportCachePayload?.payload?.groups),
+      "First export payload response should include groups."
+    );
+
+    const secondExportCacheResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(exportCacheRequestBody),
+    });
+    assert.equal(
+      secondExportCacheResponse.status,
+      200,
+      "Second export payload request should respond."
+    );
+    assert.equal(
+      secondExportCacheResponse.headers.get("x-export-cache"),
+      "hit",
+      "Repeated export payload response should reuse the export cache."
+    );
+
+    console.log(
+      JSON.stringify(
+        {
+          ok: true,
+          verifiedAt: new Date().toISOString(),
+          mode: "baseline",
+          port: BASELINE_PORT,
+          checks: [
+            "hub-route",
+            "feature-route",
+            "heritage-route",
+            "max-mass-route",
+            "health-shape",
+            "config-shape",
+            "security-headers",
+            "progress-token-guard",
+            "model-spec",
+            "body-size-limit",
+            "site-radius-limit",
+            "multi-parcel-preview",
+            "multi-parcel-custom-groups",
+            "skp-terrain-refine",
+            "skp-contour-curves",
+            "export-cache-hit",
+          ],
+        },
+        null,
+        2
+      )
+    );
+  } finally {
+    if (typeof previousPort === "string") {
+      process.env.PORT = previousPort;
+    } else {
+      delete process.env.PORT;
+    }
+
+    if (server?.listening) {
+      await new Promise((resolve) => {
+        server.close(resolve);
+      });
+    } else {
+      await delay(50);
+    }
+  }
+}
+
 async function main() {
+  if (BASELINE_MODE) {
+    await runBaselineVerification();
+    return;
+  }
+
   assert(CASES.length > 0, "No verification cases selected.");
   const health = await fetchJson("/api/health");
   assert.equal(health?.ok, true, "Health check failed.");

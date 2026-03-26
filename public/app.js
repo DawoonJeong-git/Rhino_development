@@ -18,6 +18,7 @@ const state = {
   searchCache: new Map(),
   searchProviderLabel: "search",
   searchResultItems: [],
+  selectionPreviewCache: new Map(),
   selectedLocation: null,
   siteContext: null,
   siteContextRequest: null,
@@ -37,14 +38,20 @@ const state = {
     contourLines: null,
     parcelContext: null,
     parcelBoundary: null,
+    targetParcelGroups: null,
     rangeDraft: null,
     roads: null,
   },
 };
 
 const providerBadge = document.querySelector("#providerBadge");
+const appShell = document.querySelector(".app-shell");
+const topbar = document.querySelector(".topbar");
 const toolbar = document.querySelector(".toolbar");
+const workspace = document.querySelector(".workspace");
+const mapPanel = document.querySelector(".map-panel");
 const sidePanel = document.querySelector(".side-panel");
+let sidePanelScroll = sidePanel?.querySelector(".side-panel-scroll") || null;
 const selectionSummaryStack = document.querySelector(".selection-summary-stack");
 const selectionSummary = document.querySelector("#selectionSummary");
 const searchResults = document.querySelector("#searchResults");
@@ -63,6 +70,10 @@ const specPreview = document.querySelector("#specPreview");
 const actionFeedback = document.querySelector("#actionFeedback");
 const searchForm = document.querySelector("#searchForm");
 const searchInput = document.querySelector("#searchInput");
+const searchFormLabel = searchForm?.querySelector(".search-label");
+const searchFormHelper = searchForm?.querySelector(".helper-text");
+const searchFormSubmitButton = searchForm?.querySelector('button[type="submit"]');
+const searchFormEmptyState = searchForm?.querySelector(".search-results-empty");
 const modelForm = document.querySelector("#modelForm");
 const loadLandInfoButton = document.querySelector("#loadLandInfoButton");
 const openLandUseDetailButton = document.querySelector("#openLandUseDetailButton");
@@ -89,9 +100,19 @@ let exportProgressFill = null;
 let exportProgressLabel = null;
 const historyList = document.querySelector("#historyList");
 const clearHistoryButton = document.querySelector("#clearHistoryButton");
+let parcelGroupCard = null;
+const selectionCard = selectionMeta?.closest(".card");
+const siteContextCard = siteContextMeta?.closest(".card");
+const landInfoCard = landInfoMeta?.closest(".card");
+const buildingRegisterCard = buildingRegisterMeta?.closest(".card");
+const modelCard = modelForm?.closest(".card");
 const MIN_CONTOUR_INTERVAL_METERS = 0.1;
+const DEFAULT_SELECTION_SUMMARY =
+  "아직 확정된 대상지가 없습니다. 주소를 검색하거나 지도에서 선택하세요.";
 const MODEL_PROGRESS_STORAGE_KEY =
-  "site-context-planner.model-progress-estimates.v1";
+  "space-work.model-progress-estimates.v1";
+const SELECTION_PREVIEW_CACHE_TTL_MS = 1000 * 60 * 2;
+const SELECTION_PREVIEW_CACHE_MAX_ENTRIES = 24;
 const MODEL_PROGRESS_MIN_ESTIMATE_MS = 1500;
 const MODEL_PROGRESS_MAX_ESTIMATE_MS = 90000;
 const MODEL_PROGRESS_POLL_INTERVAL_MS = 400;
@@ -105,6 +126,68 @@ const MODEL_PROGRESS_DEFAULT_ESTIMATES_MS = Object.freeze({
   "export-dxf-cached": 2600,
 });
 
+function updateCardHeading(card, kicker, title) {
+  if (!card) {
+    return;
+  }
+
+  const kickerElement = card.querySelector(".card-kicker");
+  const titleElement = card.querySelector("h2");
+
+  if (kickerElement && kicker) {
+    kickerElement.textContent = kicker;
+  }
+
+  if (titleElement && title) {
+    titleElement.textContent = title;
+  }
+}
+
+function applyStudioChrome() {
+  selectionCard?.classList.add("selection-card");
+  siteContextCard?.classList.add("context-card");
+  landInfoCard?.classList.add("land-card");
+  buildingRegisterCard?.classList.add("building-card");
+  modelCard?.classList.add("model-card-featured");
+  selectionSummaryStack?.classList.add("target-site-stack");
+
+  if (searchFormLabel) {
+    searchFormLabel.textContent = "주소 검색";
+  }
+
+  if (searchInput) {
+    searchInput.placeholder = "예: 서울 중구 세종대로 110, 세평로, 서울시청";
+  }
+
+  if (searchFormSubmitButton) {
+    searchFormSubmitButton.textContent = "주소 찾기";
+  }
+
+  if (searchFormHelper) {
+    searchFormHelper.textContent =
+      "도로명주소, 지번주소, 건물명을 함께 찾을 수 있습니다. 검색 후에는 필지와 대지 맥락이 같은 화면에서 이어집니다.";
+  }
+
+  if (searchFormEmptyState) {
+    searchFormEmptyState.textContent = "검색 결과가 여기에 표시됩니다.";
+  }
+
+  if (!state.selectedLocation && selectionSummary) {
+    selectionSummary.textContent = DEFAULT_SELECTION_SUMMARY;
+  }
+
+  ensureSelectionSummaryChrome();
+  updateCardHeading(selectionCard, "Selection Details", "선택 세부 정보");
+  updateCardHeading(siteContextCard, "Site Context Preview", "대지 · 지형 · 건물 미리보기");
+  updateCardHeading(landInfoCard, "Land & Zoning", "토지이음 기반 토지 정보");
+  updateCardHeading(
+    buildingRegisterCard,
+    "Building Register",
+    "세움터 기반 건축물대장 정보"
+  );
+  updateCardHeading(modelCard, "Model Studio", "3D / CAD 모델 출력");
+}
+
 function clearRangeDraftLayer() {
   if (state.layers.rangeDraft && state.map) {
     state.map.removeLayer(state.layers.rangeDraft);
@@ -113,20 +196,110 @@ function clearRangeDraftLayer() {
   state.layers.rangeDraft = null;
 }
 
-function ensureSidePanelTopStack() {
+function ensureSelectionSummaryChrome() {
+  if (!selectionSummaryStack) {
+    return null;
+  }
+
+  let header = selectionSummaryStack.querySelector(".selection-summary-header");
+
+  if (!header) {
+    header = document.createElement("div");
+    header.className = "selection-summary-header";
+    header.innerHTML = `
+      <p class="card-kicker">Target Site</p>
+      <h2>대상지 주소</h2>
+    `;
+    selectionSummaryStack.prepend(header);
+  }
+
+  return header;
+}
+
+function ensureSidePanelScrollBody() {
   if (!sidePanel) {
     return null;
   }
 
-  let topStack = sidePanel.querySelector(".side-panel-top-stack");
+  if (sidePanelScroll && sidePanelScroll.parentElement === sidePanel) {
+    return sidePanelScroll;
+  }
+
+  sidePanelScroll = sidePanel.querySelector(".side-panel-scroll");
+
+  if (!sidePanelScroll) {
+    sidePanelScroll = document.createElement("div");
+    sidePanelScroll.className = "side-panel-scroll";
+
+    while (sidePanel.firstChild) {
+      sidePanelScroll.append(sidePanel.firstChild);
+    }
+
+    sidePanel.append(sidePanelScroll);
+  }
+
+  return sidePanelScroll;
+}
+
+function ensureSidePanelTopStack() {
+  const scrollBody = ensureSidePanelScrollBody();
+
+  if (!scrollBody) {
+    return null;
+  }
+
+  let topStack = scrollBody.querySelector(".side-panel-top-stack");
 
   if (!topStack) {
     topStack = document.createElement("div");
     topStack.className = "side-panel-top-stack";
-    sidePanel.prepend(topStack);
+    scrollBody.prepend(topStack);
   }
 
   return topStack;
+}
+
+function resetDesktopPanelLayout() {
+  workspace?.style.removeProperty("height");
+  workspace?.style.removeProperty("max-height");
+  mapPanel?.style.removeProperty("height");
+  mapPanel?.style.removeProperty("max-height");
+  sidePanel?.style.removeProperty("height");
+  sidePanel?.style.removeProperty("max-height");
+}
+
+function syncDesktopPanelLayout() {
+  resetDesktopPanelLayout();
+
+  if (
+    !workspace ||
+    !mapPanel ||
+    !sidePanel ||
+    window.matchMedia("(max-width: 1024px)").matches
+  ) {
+    return;
+  }
+
+  const shellBounds = appShell?.getBoundingClientRect();
+  const workspaceBounds = workspace.getBoundingClientRect();
+  const viewportHeight = window.visualViewport?.height || window.innerHeight || 0;
+  const shellBottom = shellBounds?.bottom || viewportHeight;
+  const availableHeight = Math.max(
+    0,
+    Math.min(shellBottom, viewportHeight) - workspaceBounds.top
+  );
+
+  if (!availableHeight) {
+    return;
+  }
+
+  const nextHeight = `${Math.floor(availableHeight)}px`;
+  workspace.style.height = nextHeight;
+  workspace.style.maxHeight = nextHeight;
+  mapPanel.style.height = nextHeight;
+  mapPanel.style.maxHeight = nextHeight;
+  sidePanel.style.height = nextHeight;
+  sidePanel.style.maxHeight = nextHeight;
 }
 
 function relocateSearchUiToSidePanel() {
@@ -136,12 +309,12 @@ function relocateSearchUiToSidePanel() {
     return;
   }
 
-  if (searchForm && searchForm.parentElement !== topStack) {
-    topStack.append(searchForm);
+  if (selectionSummaryStack && selectionSummaryStack.parentElement !== topStack) {
+    topStack.prepend(selectionSummaryStack);
   }
 
-  if (selectionSummaryStack && selectionSummaryStack.parentElement !== topStack) {
-    topStack.append(selectionSummaryStack);
+  if (searchForm && searchForm.parentElement !== topStack) {
+    topStack.append(searchForm);
   }
 
   if (toolbar) {
@@ -149,6 +322,7 @@ function relocateSearchUiToSidePanel() {
   }
 
   ensureSearchSelectionCard();
+  ensureParcelGroupCard();
 }
 
 function ensureSearchSelectionCard() {
@@ -205,6 +379,305 @@ function setSearchSelectionCardVisible(visible) {
 
   card.classList.toggle("is-hidden", !visible);
   card.setAttribute("aria-hidden", visible ? "false" : "true");
+}
+
+function ensureParcelGroupCard() {
+  if (!parcelGroupCard) {
+    const topStack = ensureSidePanelTopStack();
+
+    if (!topStack) {
+      return null;
+    }
+
+    parcelGroupCard = document.createElement("article");
+    parcelGroupCard.id = "parcelGroupCard";
+    parcelGroupCard.className = "card parcel-group-card is-hidden";
+    parcelGroupCard.setAttribute("aria-hidden", "true");
+    parcelGroupCard.innerHTML = `
+      <div class="card-header">
+        <div>
+          <p class="card-kicker">Parcel Groups</p>
+          <h2>필지 그룹</h2>
+        </div>
+        <button type="button" class="text-button" id="clearParcelGroupsButton">
+          모두 해제
+        </button>
+      </div>
+      <p class="helper-text parcel-group-note" id="parcelGroupNote">
+        선택한 주소를 그룹 순서대로 정리하고 이름을 바로 바꿀 수 있습니다.
+      </p>
+      <div class="parcel-group-list" id="parcelGroupList"></div>
+    `;
+
+    if (selectionSummaryStack?.parentElement === topStack) {
+      selectionSummaryStack.insertAdjacentElement("afterend", parcelGroupCard);
+    } else if (searchSelectionCard?.parentElement === topStack) {
+      searchSelectionCard.insertAdjacentElement("afterend", parcelGroupCard);
+    } else {
+      topStack.append(parcelGroupCard);
+    }
+
+    parcelGroupCard
+      .querySelector("#clearParcelGroupsButton")
+      ?.addEventListener("click", () => {
+        clearSelectionForSearch();
+        setActionFeedback("다중 필지 선택을 모두 해제했습니다.");
+      });
+  }
+
+  return parcelGroupCard;
+}
+
+function setParcelGroupCardVisible(visible) {
+  const card = ensureParcelGroupCard();
+
+  if (!card) {
+    return;
+  }
+
+  card.classList.toggle("is-hidden", !visible);
+  card.setAttribute("aria-hidden", visible ? "false" : "true");
+}
+
+function isGeneratedParcelGroupName(value) {
+  return /^PARCEL_GROUP_\d+$/i.test(String(value || "").trim());
+}
+
+function getEditableParcelGroupName(parcel, index = 0) {
+  const properties = parcel?.properties || {};
+  const hasCustomGroupName =
+    String(properties.groupNameSource || "").trim().toLowerCase() === "custom";
+  const explicitName = String(
+    properties.groupLabel || properties.groupName || ""
+  ).trim();
+  const fallbackName = String(
+    properties.addr || properties.jibun || properties.pnu || ""
+  ).trim();
+
+  if (
+    explicitName &&
+    (hasCustomGroupName ||
+      !fallbackName ||
+      !isGeneratedParcelGroupName(explicitName))
+  ) {
+    return explicitName;
+  }
+
+  return (
+    String(
+      fallbackName ||
+        `필지 그룹 ${index + 1}`
+    ).trim() || `필지 그룹 ${index + 1}`
+  );
+}
+
+function applySelectedParcelUpdate(nextParcels, feedbackMessage = "") {
+  if (!nextParcels.length) {
+    clearSelectionForSearch();
+
+    if (feedbackMessage) {
+      setActionFeedback(feedbackMessage);
+    }
+    return;
+  }
+
+  state.suppressNextAutoFit = true;
+  setSelectedLocation(buildMultiParcelSelection(nextParcels), false);
+
+  if (feedbackMessage) {
+    setActionFeedback(feedbackMessage);
+  }
+}
+
+function moveSelectedParcelGroup(index, direction) {
+  const selectedParcels = [...getSelectedParcels()];
+  const nextIndex = index + direction;
+
+  if (
+    index < 0 ||
+    nextIndex < 0 ||
+    index >= selectedParcels.length ||
+    nextIndex >= selectedParcels.length
+  ) {
+    return;
+  }
+
+  const nextParcels = [...selectedParcels];
+  const [movedParcel] = nextParcels.splice(index, 1);
+  nextParcels.splice(nextIndex, 0, movedParcel);
+  applySelectedParcelUpdate(
+    nextParcels,
+    `필지 그룹 순서를 ${nextIndex + 1}번째로 옮겼습니다.`
+  );
+}
+
+function renameSelectedParcelGroup(index, nextName) {
+  const trimmedName = String(nextName || "").trim();
+  const selectedParcels = getSelectedParcels();
+
+  if (index < 0 || index >= selectedParcels.length) {
+    return;
+  }
+
+  const currentParcel = selectedParcels[index];
+  const currentName = getEditableParcelGroupName(currentParcel, index);
+
+  if ((trimmedName || currentName) === currentName && trimmedName) {
+    return;
+  }
+
+  const nextParcels = selectedParcels.map((parcel, parcelIndex) => {
+    if (parcelIndex !== index) {
+      return parcel;
+    }
+
+    const properties = { ...(parcel?.properties || {}) };
+
+    if (trimmedName) {
+      properties.groupName = trimmedName;
+      properties.groupLabel = trimmedName;
+      properties.groupNameSource = "custom";
+    } else {
+      delete properties.groupName;
+      delete properties.groupLabel;
+      delete properties.groupNameSource;
+    }
+
+    return {
+      ...parcel,
+      properties,
+    };
+  });
+
+  applySelectedParcelUpdate(
+    nextParcels,
+    trimmedName
+      ? `필지 그룹 이름을 "${trimmedName}"로 바꿨습니다.`
+      : "필지 그룹 이름을 기본값으로 되돌렸습니다."
+  );
+}
+
+function removeSelectedParcelGroup(index) {
+  const selectedParcels = getSelectedParcels();
+
+  if (index < 0 || index >= selectedParcels.length) {
+    return;
+  }
+
+  const nextParcels = selectedParcels.filter((_, parcelIndex) => parcelIndex !== index);
+  applySelectedParcelUpdate(
+    nextParcels,
+    nextParcels.length
+      ? `필지를 제외했습니다. 현재 ${nextParcels.length}개 필지가 선택되어 있습니다.`
+      : "선택된 필지를 모두 해제했습니다."
+  );
+}
+
+function renderSelectedParcelGroups() {
+  const card = ensureParcelGroupCard();
+
+  if (!card) {
+    return;
+  }
+
+  const list = card.querySelector("#parcelGroupList");
+  const note = card.querySelector("#parcelGroupNote");
+  const selectedParcels = getSelectedParcels();
+
+  if (!isMultiParcelSelection(state.selectedLocation) || !selectedParcels.length) {
+    if (list) {
+      list.innerHTML = "";
+    }
+    setParcelGroupCardVisible(false);
+    return;
+  }
+
+  setParcelGroupCardVisible(true);
+
+  if (note) {
+    note.textContent =
+      selectedParcels.length > 1
+        ? `현재 ${selectedParcels.length}개 필지가 선택되어 있습니다. 위에서 아래 순서가 그룹 1, 2, 3...으로 반영됩니다.`
+        : "현재 1개 필지가 선택되어 있습니다. 이름을 바꾸면 이후 그룹 출력 이름에도 이어집니다.";
+  }
+
+  if (!list) {
+    return;
+  }
+
+  list.innerHTML = "";
+
+  selectedParcels.forEach((parcel, index) => {
+    const properties = parcel?.properties || {};
+    const item = document.createElement("article");
+    const nameInput = document.createElement("input");
+    const actions = document.createElement("div");
+    const meta = document.createElement("p");
+    const header = document.createElement("div");
+    const order = document.createElement("span");
+    const upButton = document.createElement("button");
+    const downButton = document.createElement("button");
+    const removeButton = document.createElement("button");
+
+    item.className = "parcel-group-item";
+    header.className = "parcel-group-item-header";
+    order.className = "parcel-group-order";
+    order.textContent = `그룹 ${index + 1}`;
+
+    nameInput.type = "text";
+    nameInput.className = "parcel-group-name-input";
+    nameInput.value = getEditableParcelGroupName(parcel, index);
+    nameInput.placeholder = `필지 그룹 ${index + 1}`;
+
+    meta.className = "parcel-group-meta";
+    meta.textContent = [
+      properties.addr || properties.jibun || "",
+      properties.pnu ? `PNU ${properties.pnu}` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+
+    actions.className = "parcel-group-actions";
+
+    upButton.type = "button";
+    upButton.className = "parcel-group-action-button";
+    upButton.textContent = "위로";
+    upButton.disabled = index === 0;
+    upButton.addEventListener("click", () => {
+      moveSelectedParcelGroup(index, -1);
+    });
+
+    downButton.type = "button";
+    downButton.className = "parcel-group-action-button";
+    downButton.textContent = "아래로";
+    downButton.disabled = index === selectedParcels.length - 1;
+    downButton.addEventListener("click", () => {
+      moveSelectedParcelGroup(index, 1);
+    });
+
+    removeButton.type = "button";
+    removeButton.className = "parcel-group-action-button is-danger";
+    removeButton.textContent = "제외";
+    removeButton.addEventListener("click", () => {
+      removeSelectedParcelGroup(index);
+    });
+
+    nameInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        nameInput.blur();
+      }
+    });
+
+    nameInput.addEventListener("blur", () => {
+      renameSelectedParcelGroup(index, nameInput.value);
+    });
+
+    header.append(order, nameInput);
+    actions.append(upButton, downButton, removeButton);
+    item.append(header, meta, actions);
+    list.append(item);
+  });
 }
 
 async function readErrorMessageFromResponse(response, fallbackMessage) {
@@ -553,6 +1026,11 @@ function getSystemAddress(location) {
 }
 
 function buildSelectionLabel(location) {
+  if (isMultiParcelSelection(location)) {
+    const selectedParcels = getSelectedParcels(location);
+    return `다중 필지 선택 (${selectedParcels.length}개)`;
+  }
+
   return (
     getSystemAddress(location) ||
     location?.roadAddress ||
@@ -562,8 +1040,141 @@ function buildSelectionLabel(location) {
   );
 }
 
+function getParcelDisplayAddress(parcel, index = 0) {
+  const properties = parcel?.properties || {};
+  const address = String(
+    properties.addr || properties.jibun || properties.pnu || ""
+  ).trim();
+
+  return address || `필지 ${index + 1}`;
+}
+
+function isMultiParcelSelection(location = state.selectedLocation) {
+  return Boolean(
+    location?.selectionMode === "multi-parcel" &&
+      Array.isArray(location?.selectedParcels) &&
+      location.selectedParcels.length
+  );
+}
+
+function getSelectedParcels(location = state.selectedLocation) {
+  return Array.isArray(location?.selectedParcels) ? location.selectedParcels : [];
+}
+
 function isRangeSelection(location = state.selectedLocation) {
   return Boolean(location?.selectionMode === "range" && location?.customBounds);
+}
+
+function getParcelSelectionKey(parcel, fallbackIndex = 0) {
+  const properties = parcel?.properties || {};
+  const pnu = String(properties.pnu || properties.PNU || "").replace(/\D+/g, "");
+
+  if (pnu.length === 19) {
+    return pnu;
+  }
+
+  return String(
+    properties.groupId ||
+      parcel?.id ||
+      `${Number(parcel?.properties?.centroidLat || 0).toFixed(6)}:${Number(
+        parcel?.properties?.centroidLng || 0
+      ).toFixed(6)}:${fallbackIndex + 1}`
+  );
+}
+
+function getFeatureOuterRing(feature) {
+  const geometry = feature?.geometry || {};
+
+  if (geometry.type === "Polygon") {
+    return geometry.coordinates?.[0] || [];
+  }
+
+  if (geometry.type === "MultiPolygon") {
+    return geometry.coordinates?.[0]?.[0] || [];
+  }
+
+  return [];
+}
+
+function estimateFeatureCenter(feature) {
+  const ring = getFeatureOuterRing(feature);
+
+  if (!ring.length) {
+    return null;
+  }
+
+  let minLng = Number.POSITIVE_INFINITY;
+  let maxLng = Number.NEGATIVE_INFINITY;
+  let minLat = Number.POSITIVE_INFINITY;
+  let maxLat = Number.NEGATIVE_INFINITY;
+
+  for (const point of ring) {
+    if (!Array.isArray(point) || point.length < 2) {
+      continue;
+    }
+
+    minLng = Math.min(minLng, Number(point[0]));
+    maxLng = Math.max(maxLng, Number(point[0]));
+    minLat = Math.min(minLat, Number(point[1]));
+    maxLat = Math.max(maxLat, Number(point[1]));
+  }
+
+  if (
+    !Number.isFinite(minLng) ||
+    !Number.isFinite(maxLng) ||
+    !Number.isFinite(minLat) ||
+    !Number.isFinite(maxLat)
+  ) {
+    return null;
+  }
+
+  return {
+    lng: Number(((minLng + maxLng) / 2).toFixed(8)),
+    lat: Number(((minLat + maxLat) / 2).toFixed(8)),
+  };
+}
+
+function buildMultiParcelSelection(parcels) {
+  const selectedParcels = (Array.isArray(parcels) ? parcels : []).filter(Boolean);
+
+  if (!selectedParcels.length) {
+    return null;
+  }
+
+  const parcelCenters = selectedParcels
+    .map((parcel) => estimateFeatureCenter(parcel))
+    .filter(Boolean);
+  const avgLat =
+    parcelCenters.reduce((sum, point) => sum + Number(point.lat || 0), 0) /
+    Math.max(1, parcelCenters.length);
+  const avgLng =
+    parcelCenters.reduce((sum, point) => sum + Number(point.lng || 0), 0) /
+    Math.max(1, parcelCenters.length);
+  const primaryParcel = selectedParcels[0];
+  const primaryProperties = primaryParcel?.properties || {};
+  const primaryLabel =
+    primaryProperties.groupLabel ||
+    primaryProperties.addr ||
+    primaryProperties.jibun ||
+    primaryProperties.pnu ||
+    "대표 필지";
+  const parcelKeys = selectedParcels.map((parcel, index) =>
+    getParcelSelectionKey(parcel, index)
+  );
+
+  return {
+    id: `multi-${parcelKeys.join("-")}`,
+    label: selectedParcels.length > 1 ? "다중 필지 선택" : String(primaryLabel),
+    roadAddress: "",
+    parcelAddress: String(primaryLabel),
+    lat: Number(avgLat.toFixed(8)),
+    lng: Number(avgLng.toFixed(8)),
+    provider: "multi-parcel",
+    searchType: "parcel-group",
+    selectionMode: "multi-parcel",
+    selectedParcels,
+    selectedParcelCount: selectedParcels.length,
+  };
 }
 
 function normalizeRangeBounds(bounds) {
@@ -700,6 +1311,12 @@ function shouldAutoSelectSearchResult(item, query) {
 }
 
 function buildHistoryKey(location) {
+  if (isMultiParcelSelection(location)) {
+    return getSelectedParcels(location)
+      .map((parcel, index) => getParcelSelectionKey(parcel, index))
+      .join("|");
+  }
+
   return `${location.label || ""}|${formatCoord(location.lat)}|${formatCoord(location.lng)}`;
 }
 
@@ -1018,7 +1635,7 @@ function failModelProgress(message) {
 }
 
 function resetModelProgress(
-  message = "범위를 설정하면 지도 버퍼와 3D 추출 범위가 여기에 표시됩니다."
+  message = "모델 미리보기를 누르면 지도 버퍼와 3D 추출 범위가 여기에 표시됩니다."
 ) {
   clearModelProgressTimer();
   clearModelProgressPollTimer();
@@ -1027,7 +1644,7 @@ function resetModelProgress(
   setScopedModelProgress(
     "export",
     0,
-    "파일 형식과 옵션을 고른 뒤 3D 파일 다운로드를 누르면 여기에서 진행 상태가 표시됩니다.",
+    "출력 형식과 옵션을 고른 뒤 모델 파일 다운로드를 누르면 여기에서 진행 상태가 표시됩니다.",
     "idle"
   );
 }
@@ -1105,6 +1722,8 @@ function updateContextLayers(siteContext) {
   clearContextLayers();
   const isRangeMode = siteContext?.selectionMode === "range";
   const isSelectionPreview = siteContext?.layerMode === "selection-preview";
+  const targetParcelGroups = siteContext?.targetParcelGroups?.features || [];
+  const targetParcelPalette = ["#223d2c", "#bb5a34", "#436b75", "#8d6c2d", "#7b4862"];
 
   if (!isSelectionPreview && siteContext.clipBoundary) {
     state.layers.clipBoundary = L.geoJSON(siteContext.clipBoundary, {
@@ -1140,6 +1759,25 @@ function updateContextLayers(siteContext) {
       },
     }).addTo(state.map);
     state.layers.parcelBoundary.bringToFront();
+  }
+
+  if (!isRangeMode && targetParcelGroups.length > 1) {
+    state.layers.targetParcelGroups = L.geoJSON(siteContext.targetParcelGroups, {
+      style: (feature) => {
+        const groupIndex = Number(feature?.properties?.groupIndex || 1) - 1;
+        const stroke = targetParcelPalette[groupIndex % targetParcelPalette.length];
+
+        return {
+          color: stroke,
+          fillColor: stroke,
+          fillOpacity: isSelectionPreview ? 0.14 : 0.04,
+          opacity: 0.98,
+          weight: isSelectionPreview ? 4 : 3,
+          dashArray: isSelectionPreview ? "10 5" : null,
+        };
+      },
+    }).addTo(state.map);
+    state.layers.targetParcelGroups.bringToFront();
   }
 
   if (!isSelectionPreview && siteContext.contourLines) {
@@ -1217,13 +1855,57 @@ function updateContextLayers(siteContext) {
 
 function renderSelectionSummary() {
   if (!state.selectedLocation) {
-    selectionSummary.textContent = "아직 선택된 위치가 없습니다.";
+    selectionSummary.classList.remove("has-multi-list");
+    selectionSummary.textContent = DEFAULT_SELECTION_SUMMARY;
     return;
   }
 
-  selectionSummary.textContent = `${buildSelectionLabel(state.selectedLocation)} / ${formatCoord(
-    state.selectedLocation.lat
-  )}, ${formatCoord(state.selectedLocation.lng)}`;
+  if (isRangeSelection(state.selectedLocation)) {
+    const bounds = normalizeRangeBounds(state.selectedLocation.customBounds);
+    selectionSummary.classList.remove("has-multi-list");
+    selectionSummary.innerHTML = `
+      <div class="selection-summary-primary">직접 지정 범위</div>
+      <div class="selection-summary-secondary">
+        ${escapeHtml(
+          `${bounds.minLat.toFixed(5)}, ${bounds.minLng.toFixed(5)} ~ ${bounds.maxLat.toFixed(5)}, ${bounds.maxLng.toFixed(5)}`
+        )}
+      </div>
+    `;
+    return;
+  }
+
+  if (isMultiParcelSelection(state.selectedLocation)) {
+    const selectedParcels = getSelectedParcels(state.selectedLocation);
+    selectionSummary.classList.add("has-multi-list");
+    selectionSummary.innerHTML = `
+      <div class="selection-summary-primary">다중 필지 선택</div>
+      <ol class="selection-summary-list">
+        ${selectedParcels
+          .map(
+            (parcel, index) => `
+              <li class="selection-summary-list-item">
+                <span class="selection-summary-order">${index + 1}</span>
+                <span>${escapeHtml(getParcelDisplayAddress(parcel, index))}</span>
+              </li>
+            `
+          )
+          .join("")}
+      </ol>
+    `;
+    return;
+  }
+
+  const primaryAddress = buildSelectionLabel(state.selectedLocation);
+  const parcelAddress = normalizeSystemAddress(state.selectedLocation.parcelAddress || "");
+  selectionSummary.classList.remove("has-multi-list");
+  selectionSummary.innerHTML = `
+    <div class="selection-summary-primary">${escapeHtml(primaryAddress)}</div>
+    ${
+      parcelAddress && parcelAddress !== primaryAddress
+        ? `<div class="selection-summary-secondary">${escapeHtml(parcelAddress)}</div>`
+        : ""
+    }
+  `;
 }
 
 function renderSelectionMeta() {
@@ -1247,6 +1929,34 @@ function renderSelectionMeta() {
       <div><dt>범위 좌표</dt><dd>${bounds.minLat.toFixed(6)}, ${bounds.minLng.toFixed(6)} ~ ${bounds.maxLat.toFixed(6)}, ${bounds.maxLng.toFixed(6)}</dd></div>
       <div><dt>중심 좌표</dt><dd>${formatCoord(item.lat)}, ${formatCoord(item.lng)}</dd></div>
       <div><dt>설명</dt><dd>지도의 두 점으로 지정한 사각형 범위</dd></div>
+    `;
+    return;
+  }
+
+  if (isMultiParcelSelection(item)) {
+    const selectedParcels = getSelectedParcels(item);
+    const parcelLabels = selectedParcels
+      .slice(0, 3)
+      .map((parcel, index) => {
+        const properties = parcel?.properties || {};
+        return (
+          properties.groupLabel ||
+          properties.addr ||
+          properties.jibun ||
+          properties.pnu ||
+          `필지 ${index + 1}`
+        );
+      })
+      .join(", ");
+    const moreCount = Math.max(0, selectedParcels.length - 3);
+
+    selectionMeta.innerHTML = `
+      <div><dt>선택 방식</dt><dd>다중 필지 선택</dd></div>
+      <div><dt>선택 필지 수</dt><dd>${escapeHtml(String(selectedParcels.length))}개</dd></div>
+      <div><dt>중심 좌표</dt><dd>${formatCoord(item.lat)}, ${formatCoord(item.lng)}</dd></div>
+      <div><dt>대표 필지</dt><dd>${escapeHtml(parcelLabels || "미확인")}${moreCount > 0 ? ` 외 ${moreCount}개` : ""}</dd></div>
+      <div><dt>그룹 출력</dt><dd>필지 그룹 분리 옵션과 함께 각 필지를 그룹으로 내보낼 수 있습니다.</dd></div>
+      <div><dt>선택 조작</dt><dd>지도에서 필지를 계속 클릭해 추가하고, 같은 필지를 다시 클릭하면 해제됩니다.</dd></div>
     `;
     return;
   }
@@ -1281,11 +1991,12 @@ function renderSiteContextMeta() {
   const terrain = state.siteContext.dataSources?.terrain;
   const buildings = state.siteContext.dataSources?.buildings;
   const stats = state.siteContext.stats || {};
+  const targetParcelCount = Number(stats.targetParcelCount || 0);
 
   siteContextMeta.innerHTML = `
     <div><dt>대지 경계</dt><dd>${escapeHtml(
       describeDataSource(parcel?.provider, parcel?.mode)
-    )}</dd></div>
+    )}${targetParcelCount > 1 ? ` / ${targetParcelCount}개 필지` : ""}</dd></div>
     <div><dt>지형 생성</dt><dd>${escapeHtml(
       describeDataSource(terrain?.provider, terrain?.mode)
     )}</dd></div>
@@ -1370,6 +2081,22 @@ function renderLandInfo() {
     return;
   }
 
+  if (isMultiParcelSelection(state.selectedLocation)) {
+    landInfoMeta.innerHTML = `
+      <div><dt>조회 상태</dt><dd>다중 선택</dd></div>
+      <div><dt>지목</dt><dd>단건 조회 비활성</dd></div>
+      <div><dt>면적</dt><dd>필지 그룹 기준 확인</dd></div>
+      <div><dt>지역지구 수</dt><dd>단건 조회 비활성</dd></div>
+      <div><dt>공시지가</dt><dd>단건 조회 비활성</dd></div>
+      <div><dt>기준 주소</dt><dd>필지별 개별 확인 필요</dd></div>
+    `;
+    landInfoNote.textContent =
+      "다중 필지 선택 모드에서는 토지이음 단건 조회를 자동으로 연결하지 않습니다. 그룹 모델을 먼저 검토한 뒤 필요한 필지를 개별로 열어보는 흐름에 맞춰두었습니다.";
+    renderInfoItems(landInfoList, [], "다중 필지 선택에서는 단건 토지이음 요약 대신 그룹 컨텍스트를 우선 확인합니다.");
+    renderInfoItems(lawInfoList, [], "필지별 법규 확인은 개별 주소 선택으로 이어서 검토할 수 있습니다.");
+    return;
+  }
+
   if (!state.landInfo) {
     landInfoMeta.innerHTML = `
       <div><dt>조회 상태</dt><dd>조회 전</dd></div>
@@ -1429,6 +2156,23 @@ function renderBuildingRegister() {
       "건축HUB 서비스키를 넣으면 앱 안에서 건축물대장 요약을 불러올 수 있습니다.";
     buildingRegisterList.innerHTML =
       '<p class="search-results-empty">건축HUB 키를 설정하면 결과가 표시됩니다.</p>';
+    return;
+  }
+
+  if (isMultiParcelSelection(state.selectedLocation)) {
+    buildingRegisterMeta.innerHTML = `
+      <div><dt>조회 상태</dt><dd>다중 선택</dd></div>
+      <div><dt>건물 수</dt><dd>그룹 모델에서 확인</dd></div>
+      <div><dt>대표 용도</dt><dd>단건 조회 비활성</dd></div>
+      <div><dt>대표 연면적</dt><dd>단건 조회 비활성</dd></div>
+      <div><dt>대표 층수</dt><dd>단건 조회 비활성</dd></div>
+      <div><dt>대표 구조</dt><dd>단건 조회 비활성</dd></div>
+    `;
+    trimMetaGrid(buildingRegisterMeta, 5);
+    buildingRegisterNote.textContent =
+      "다중 필지 선택 모드에서는 세움터 단건 요약을 자동으로 묶지 않습니다. 그룹 모델과 대상 건물 배치를 먼저 본 뒤 필요한 필지를 개별 조회하는 흐름으로 두었습니다.";
+    buildingRegisterList.innerHTML =
+      '<p class="search-results-empty">다중 필지 선택에서는 건축물대장 요약 대신 그룹별 3D 컨텍스트를 우선 표시합니다.</p>';
     return;
   }
 
@@ -2227,6 +2971,36 @@ function buildSearchCacheKey(query) {
     .toLowerCase();
 }
 
+function pruneSelectionPreviewCache(now = Date.now()) {
+  for (const [cacheKey, entry] of state.selectionPreviewCache.entries()) {
+    if (now - Number(entry?.cachedAt || 0) >= SELECTION_PREVIEW_CACHE_TTL_MS) {
+      state.selectionPreviewCache.delete(cacheKey);
+    }
+  }
+
+  while (state.selectionPreviewCache.size > SELECTION_PREVIEW_CACHE_MAX_ENTRIES) {
+    const oldestKey = state.selectionPreviewCache.keys().next().value;
+
+    if (!oldestKey) {
+      break;
+    }
+
+    state.selectionPreviewCache.delete(oldestKey);
+  }
+}
+
+function buildSelectionPreviewCacheKey(location) {
+  const bounds = normalizeRangeBounds(location?.customBounds);
+
+  return JSON.stringify({
+    lat: Number(location?.lat || 0).toFixed(6),
+    lng: Number(location?.lng || 0).toFixed(6),
+    selectionMode: String(location?.selectionMode || "address"),
+    customBounds: bounds,
+    options: buildModelOptionsSignature(buildSelectionPreviewOptions()),
+  });
+}
+
 async function geocodeAddress(query, currentRequestId) {
   const response = await fetch(`/api/geocode?q=${encodeURIComponent(query)}`);
   const payload = await response.json();
@@ -2242,11 +3016,11 @@ async function geocodeAddress(query, currentRequestId) {
   return payload;
 }
 
-function clearSelectionForSearch() {
+function clearSelectionForSearch(options = {}) {
+  const preserveSearchResults = options?.preserveSearchResults === true;
   clearPreviewMarker();
   clearRangeDraftLayer();
   state.manualRangePoints = [];
-  state.pendingSearchSelectionId = "";
   state.activeSelectionKey = "";
   state.selectedLocation = null;
   state.siteContext = null;
@@ -2255,7 +3029,11 @@ function clearSelectionForSearch() {
   state.landInfo = null;
   state.landInfoDetails = null;
   state.latestSpec = null;
-  state.searchResultItems = [];
+
+  if (!preserveSearchResults) {
+    state.pendingSearchSelectionId = "";
+    state.searchResultItems = [];
+  }
 
   if (state.map) {
     state.map.closePopup();
@@ -2269,11 +3047,12 @@ function clearSelectionForSearch() {
   clearContextLayers();
   renderSelectionSummary();
   renderSelectionMeta();
+  renderSelectedParcelGroups();
   renderSiteContextMeta();
   renderLandInfo();
   renderBuildingRegister();
   syncSelectionModeFormState();
-  selectionSummary.textContent = "아직 선택된 위치가 없습니다.";
+  selectionSummary.textContent = DEFAULT_SELECTION_SUMMARY;
   siteContextNote.textContent =
     "주소를 검색하거나 지도에서 위치를 클릭하면 필지 경계와 건물 외곽선을 미리 볼 수 있습니다.";
   landInfoNote.textContent =
@@ -2283,6 +3062,30 @@ function clearSelectionForSearch() {
     buildingRegisterNote.textContent =
       "위치를 선택하면 건축물대장 요약을 불러옵니다.";
   }
+
+  [
+    loadLandInfoButton,
+    openLandUseDetailButton,
+    loadBuildingRegisterButton,
+    showBuildingRegisterDetailsButton,
+    openOfficialBuildingRegisterButton,
+  ].forEach((button) => {
+    if (button) {
+      button.disabled = false;
+    }
+  });
+}
+
+function hasActiveMapSelectionState() {
+  if (state.selectedLocation || state.marker || state.previewMarker) {
+    return true;
+  }
+
+  if (Array.isArray(state.manualRangePoints) && state.manualRangePoints.length) {
+    return true;
+  }
+
+  return Object.values(state.layers || {}).some(Boolean);
 }
 
 async function reverseGeocode(lat, lng) {
@@ -2439,7 +3242,7 @@ function buildAppliedModelSummary(
   options = collectModelOptions()
 ) {
   if (!options) {
-    return "범위 설정을 누르면 현재 반경과 추출 조건이 여기에 표시됩니다.";
+    return "모델 미리보기를 누르면 현재 반경과 추출 조건이 여기에 표시됩니다.";
   }
 
   const requestedInterval = normalizeContourInterval(options.contourInterval);
@@ -2526,7 +3329,7 @@ function ensureExportProgressUi(exportSection) {
         <div class="model-progress-fill" id="exportProgressFill"></div>
       </div>
       <p class="model-progress-label" id="exportProgressLabel">
-        파일 형식과 옵션을 고른 뒤 3D 파일 다운로드를 누르면 여기에서 진행 상태가 표시됩니다.
+        출력 형식과 옵션을 고른 뒤 모델 파일 다운로드를 누르면 여기에서 진행 상태가 표시됩니다.
       </p>
     `;
   }
@@ -2610,6 +3413,10 @@ function showRangeDraftBounds(bounds) {
 }
 
 function selectionHasParcelReference(location = state.selectedLocation) {
+  if (isMultiParcelSelection(location)) {
+    return getSelectedParcels(location).length > 0;
+  }
+
   return Boolean(
     location?.pnu ||
       location?.juso?.admCd ||
@@ -2637,7 +3444,7 @@ function markModelOptionsDirty() {
     return;
   }
 
-  resetModelProgress("범위 설정을 누르면 지도에 버퍼가 반영되고 추출 준비 상태가 갱신됩니다.");
+  resetModelProgress("모델 미리보기를 누르면 지도에 버퍼가 반영되고 추출 준비 상태가 갱신됩니다.");
 
   if (!state.selectedLocation || !state.siteContext) {
     return;
@@ -2691,6 +3498,7 @@ async function loadSiteContext(
       body: JSON.stringify({
         location,
         options,
+        selectedParcels: getSelectedParcels(state.selectedLocation),
         customBounds: isRangeSelection(location) ? location.customBounds : null,
         previewOnly: requestOptions.previewOnly === true,
       }),
@@ -2754,6 +3562,9 @@ async function loadSiteContext(
         "",
       parcelAddress:
         state.selectedLocation?.parcelAddress || parcelProperties.addr || "",
+      selectedParcels: isMultiParcelSelection(state.selectedLocation)
+        ? getSelectedParcels(state.selectedLocation)
+        : state.selectedLocation?.selectedParcels,
     };
     renderSiteContextMeta();
     updateContextLayers(state.siteContext);
@@ -2877,7 +3688,7 @@ async function printBuildingRegister(printWindow = null) {
 }
 
 function openOfficialBuildingRegister() {
-  const popup = openPendingWindow("건축물대장 공식 열람");
+  const popup = openPendingWindow("세움터 열기");
 
   if (!popup) {
     return;
@@ -3262,7 +4073,7 @@ function scheduleSearch() {
 
 function updateDownloadButtonLabel() {
   if (downloadObjButton) {
-    downloadObjButton.textContent = "3D 파일 다운로드";
+    downloadObjButton.textContent = "모델 파일 다운로드";
   }
 
   if (download3dmButton) {
@@ -3272,7 +4083,7 @@ function updateDownloadButtonLabel() {
   }
 
   if (previewSiteContextButton) {
-    previewSiteContextButton.textContent = "범위 설정";
+    previewSiteContextButton.textContent = "모델 미리보기";
   }
 }
 
@@ -3294,6 +4105,8 @@ function syncPanelStatusChips() {
   if (landChip) {
     landChip.textContent = !state.selectedLocation
       ? "대기"
+      : isMultiParcelSelection(state.selectedLocation)
+        ? "그룹 모드"
       : state.landInfo
         ? "조회 완료"
         : state.isLandInfoRequesting
@@ -3302,12 +4115,16 @@ function syncPanelStatusChips() {
   }
 }
 
-function createModelOptionLabel(name, title, options, value) {
+function createModelOptionLabel(name, title, options, value, description = "") {
   const label = document.createElement("label");
+  const copy = document.createElement("span");
   const caption = document.createElement("span");
   const select = document.createElement("select");
 
   label.dataset.modelOption = name;
+  label.classList.add("model-select-card");
+  copy.className = "model-option-copy";
+  caption.className = "model-option-title";
   caption.textContent = title;
   select.name = name;
 
@@ -3323,7 +4140,16 @@ function createModelOptionLabel(name, title, options, value) {
     select.append(optionElement);
   }
 
-  label.append(caption, select);
+  copy.append(caption);
+
+  if (description) {
+    const detail = document.createElement("span");
+    detail.className = "model-option-description";
+    detail.textContent = description;
+    copy.append(detail);
+  }
+
+  label.append(copy, select);
   return label;
 }
 
@@ -3355,15 +4181,23 @@ function ensureModelFormOptionLayout() {
   }
 
   if (splitParcelLabel && splitParcelInput) {
-    let caption = splitParcelLabel.querySelector(".checkbox-label");
+    splitParcelLabel.classList.add("checkbox-featured");
+    splitParcelLabel
+      .querySelectorAll(".checkbox-copy, .checkbox-label, .checkbox-description")
+      .forEach((element) => element.remove());
 
-    if (!caption) {
-      caption = document.createElement("span");
-      caption.className = "checkbox-label";
-      splitParcelLabel.append(caption);
-    }
+    const copy = document.createElement("span");
+    const caption = document.createElement("span");
+    const description = document.createElement("span");
 
-    caption.textContent = "대지 경계 분할";
+    copy.className = "checkbox-copy";
+    caption.className = "checkbox-label checkbox-title";
+    description.className = "checkbox-description";
+    caption.textContent = "필지 그룹 분리";
+    description.textContent =
+      "대지 경계를 그룹별 오브젝트로 나눠서 3D/CAD로 내보냅니다.";
+    copy.append(caption, description);
+    splitParcelLabel.append(copy);
   }
 
   toggleGrid
@@ -3379,12 +4213,13 @@ function ensureModelFormOptionLayout() {
   if (!buildingPlacementLabel) {
     buildingPlacementLabel = createModelOptionLabel(
       "buildingPlacement",
-      "건물 배치",
+      "건물 높이 기준",
       [
         { value: "dominant", label: "기준 레벨" },
         { value: "embed-lowest", label: "최저 레벨" },
       ],
-      "dominant"
+      "dominant",
+      "건물 높이를 어떤 지형 기준으로 맞출지 선택합니다."
     );
   }
 
@@ -3393,14 +4228,15 @@ function ensureModelFormOptionLayout() {
   if (!exportLabel) {
     exportLabel = createModelOptionLabel(
       "exportFormat",
-      "파일 형식",
+      "출력 형식",
       [
         { value: "3dm", label: "3DM" },
         { value: "obj", label: "OBJ" },
         { value: "dxf", label: "DXF (2D CAD)" },
         { value: "skp", label: "SKP (SketchUp)" },
       ],
-      "3dm"
+      "3dm",
+      "작업 환경에 맞는 3D/CAD 포맷을 고릅니다."
     );
   }
 
@@ -3417,7 +4253,7 @@ function ensureModelFormOptionLayout() {
     rangeSection = document.createElement("div");
     rangeSection.className = "form-section range-action-section";
     rangeSection.innerHTML = `
-      <p class="form-section-title">범위 설정</p>
+      <p class="form-section-title">모델 범위</p>
       <div class="range-action-grid"></div>
     `;
     modelForm.prepend(rangeSection);
@@ -3458,7 +4294,7 @@ function ensureModelFormOptionLayout() {
     exportSection = document.createElement("div");
     exportSection.className = "form-section output-section";
     exportSection.innerHTML = `
-      <p class="form-section-title">출력 옵션</p>
+      <p class="form-section-title">모델 출력</p>
       <div class="output-grid"></div>
       <div class="download-action-grid"></div>
     `;
@@ -3516,7 +4352,7 @@ function prepareModelFormUi() {
   }
 
   specPreview.textContent =
-    "범위 설정을 누르면 현재 반경, 표고, 포함 건물 수를 먼저 확인할 수 있습니다.";
+    "모델 미리보기를 누르면 현재 반경, 표고, 포함 건물 수를 먼저 확인할 수 있습니다.";
 }
 
 function resolveDownloadFilename(response, fallbackFormat) {
@@ -3849,7 +4685,7 @@ function attachEvents() {
   });
 
   openLandUseDetailButton?.addEventListener("click", async () => {
-    const popup = openPendingWindow();
+    const popup = openPendingWindow("토지이음 열기");
 
     try {
       await openLandUseDetail(popup);
@@ -3913,10 +4749,25 @@ function updateMapModeControlUi() {
 }
 
 function setMapSelectionMode(mode = "address") {
-  state.mapSelectionMode = mode === "range" ? "range" : "address";
+  const nextMode =
+    mode === "range"
+      ? "range"
+      : mode === "multi-parcel"
+        ? "multi-parcel"
+        : "address";
+  const modeChanged = state.mapSelectionMode !== nextMode;
+  const hadActiveSelection = hasActiveMapSelectionState();
+
+  state.mapSelectionMode = nextMode;
   state.manualRangePoints = [];
   clearPreviewMarker();
   clearRangeDraftLayer();
+
+  if (modeChanged && hadActiveSelection) {
+    clearSelectionForSearch({
+      preserveSearchResults: true,
+    });
+  }
 
   if (state.map?.doubleClickZoom) {
     if (state.mapSelectionMode === "range") {
@@ -3930,8 +4781,10 @@ function setMapSelectionMode(mode = "address") {
 
   setActionFeedback(
     state.mapSelectionMode === "range"
-      ? "범위 지정 모드입니다. 지도에서 첫 번째 점과 두 번째 점을 차례로 클릭하면 사각형 범위가 확정됩니다."
-      : "주소 선택 모드입니다. 지도에서 위치를 클릭하면 해당 주소를 바로 선택합니다."
+      ? `범위 지정 모드입니다. 지도에서 첫 번째 점과 두 번째 점을 차례로 클릭하면 사각형 범위가 확정됩니다.${modeChanged && hadActiveSelection ? " 이전 선택은 정리되었습니다." : ""}`
+      : state.mapSelectionMode === "multi-parcel"
+        ? `다중 필지 선택 모드입니다. 지도에서 필지를 계속 클릭해 누적 선택하고, 같은 필지를 다시 클릭하면 해제됩니다.${modeChanged && hadActiveSelection ? " 이전 선택은 정리되었습니다." : ""}`
+        : `주소 선택 모드입니다. 지도에서 위치를 클릭하면 해당 주소를 바로 선택합니다.${modeChanged && hadActiveSelection ? " 이전 선택은 정리되었습니다." : ""}`
   );
 }
 
@@ -3948,6 +4801,9 @@ function ensureMapModeControl() {
   control.innerHTML = `
     <button type="button" class="map-mode-button is-active" data-map-selection-mode="address" aria-pressed="true">
       주소 선택
+    </button>
+    <button type="button" class="map-mode-button" data-map-selection-mode="multi-parcel" aria-pressed="false">
+      다중 필지
     </button>
     <button type="button" class="map-mode-button" data-map-selection-mode="range" aria-pressed="false">
       범위 지정
@@ -4025,7 +4881,129 @@ async function handleRangeSelectionMapClick(latlng) {
 
   setSelectedLocation(rangeSelection, false);
   setActionFeedback(
-    "범위가 지정되었습니다. 현재는 선택한 사각형만 지도에 표시됩니다. 범위 설정을 누르면 옵션에 따른 전체 컨텍스트를 계산합니다."
+    "범위가 지정되었습니다. 현재는 선택한 사각형만 지도에 표시됩니다. 모델 미리보기를 누르면 옵션에 따른 전체 컨텍스트를 계산합니다."
+  );
+}
+
+async function requestSelectionPreviewForLocation(location) {
+  const cacheKey = buildSelectionPreviewCacheKey(location);
+  const now = Date.now();
+  const cachedEntry = state.selectionPreviewCache.get(cacheKey);
+
+  if (
+    cachedEntry &&
+    now - Number(cachedEntry.cachedAt || 0) < SELECTION_PREVIEW_CACHE_TTL_MS
+  ) {
+    if (cachedEntry.payload) {
+      return cachedEntry.payload;
+    }
+
+    if (cachedEntry.promise) {
+      return cachedEntry.promise;
+    }
+  }
+
+  const requestPromise = (async () => {
+    const response = await fetchWithDiagnostics(
+      "/api/site-context",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          location,
+          options: buildSelectionPreviewOptions(),
+          customBounds: isRangeSelection(location) ? location.customBounds : null,
+          previewOnly: true,
+        }),
+      },
+      "필지 미리보기에 실패했습니다."
+    );
+    const payload = await response.json();
+
+    if (!response.ok) {
+      throw new Error(payload.error || "필지 미리보기에 실패했습니다.");
+    }
+
+    return payload;
+  })();
+
+  state.selectionPreviewCache.set(cacheKey, {
+    cachedAt: now,
+    promise: requestPromise,
+  });
+  pruneSelectionPreviewCache(now);
+
+  try {
+    const payload = await requestPromise;
+
+    state.selectionPreviewCache.set(cacheKey, {
+      cachedAt: Date.now(),
+      payload,
+    });
+    pruneSelectionPreviewCache();
+    return payload;
+  } catch (error) {
+    const activeEntry = state.selectionPreviewCache.get(cacheKey);
+
+    if (activeEntry?.promise === requestPromise) {
+      state.selectionPreviewCache.delete(cacheKey);
+    }
+
+    throw error;
+  }
+}
+
+async function handleMultiParcelSelectionMapClick(latlng) {
+  if (!latlng) {
+    return;
+  }
+
+  selectionSummary.textContent = "선택한 지점의 필지 경계를 확인하는 중입니다...";
+
+  const clickedLocation = {
+    id: `multi-${Number(latlng.lat).toFixed(6)}-${Number(latlng.lng).toFixed(6)}`,
+    label: `${formatCoord(latlng.lat)}, ${formatCoord(latlng.lng)}`,
+    roadAddress: "",
+    parcelAddress: "",
+    lat: Number(latlng.lat),
+    lng: Number(latlng.lng),
+    provider: "manual",
+    searchType: "parcel",
+  };
+  const previewPayload = await requestSelectionPreviewForLocation(clickedLocation);
+  const selectedFeature =
+    previewPayload?.targetParcelGroups?.features?.[0] || previewPayload?.parcelBoundary;
+
+  if (!selectedFeature) {
+    throw new Error("클릭한 지점의 필지 경계를 찾지 못했습니다.");
+  }
+
+  const currentParcels = isMultiParcelSelection(state.selectedLocation)
+    ? getSelectedParcels(state.selectedLocation)
+    : [];
+  const clickedParcelKey = getParcelSelectionKey(selectedFeature, currentParcels.length);
+  const existingIndex = currentParcels.findIndex(
+    (parcel, index) => getParcelSelectionKey(parcel, index) === clickedParcelKey
+  );
+  const nextParcels =
+    existingIndex >= 0
+      ? currentParcels.filter((_, index) => index !== existingIndex)
+      : [...currentParcels, selectedFeature];
+
+  if (!nextParcels.length) {
+    clearSelectionForSearch();
+    setActionFeedback("모든 다중 필지 선택을 해제했습니다.");
+    return;
+  }
+
+  state.suppressNextAutoFit = true;
+  setSelectedLocation(buildMultiParcelSelection(nextParcels), false);
+  setActionFeedback(
+    existingIndex >= 0
+      ? `필지 선택을 해제했습니다. 현재 ${nextParcels.length}개 필지가 선택되어 있습니다.`
+      : `필지를 추가했습니다. 현재 ${nextParcels.length}개 필지가 선택되어 있습니다.`
   );
 }
 
@@ -4047,6 +5025,7 @@ function createMap(config) {
   }).addTo(map);
 
   const refreshMapSize = () => {
+    syncDesktopPanelLayout();
     if (state.map) {
       state.map.invalidateSize(false);
     }
@@ -4055,10 +5034,22 @@ function createMap(config) {
   window.requestAnimationFrame(refreshMapSize);
   window.setTimeout(refreshMapSize, 80);
   window.addEventListener("resize", refreshMapSize, { passive: true });
+  window.visualViewport?.addEventListener("resize", refreshMapSize, {
+    passive: true,
+  });
 
   map.on("click", async (event) => {
     if (state.mapSelectionMode === "range") {
       await handleRangeSelectionMapClick(event.latlng);
+      return;
+    }
+
+    if (state.mapSelectionMode === "multi-parcel") {
+      try {
+        await handleMultiParcelSelectionMapClick(event.latlng);
+      } catch (error) {
+        window.alert(error instanceof Error ? error.message : "필지 선택에 실패했습니다.");
+      }
       return;
     }
 
@@ -4136,6 +5127,7 @@ function setSelectedLocation(location, moveMap = true) {
   setSearchSelectionCardVisible(false);
   state.selectedLocation = location;
   const rangeMode = isRangeSelection(location);
+  const multiParcelMode = isMultiParcelSelection(location);
   state.activeSelectionKey = buildHistoryKey(location);
   state.siteContext = null;
   state.siteContextOptionsSignature = "";
@@ -4145,9 +5137,9 @@ function setSelectedLocation(location, moveMap = true) {
   state.latestSpec = null;
 
   specPreview.textContent =
-    "범위 설정을 누르면 현재 반경, 표고, 포함 건물을 먼저 확인할 수 있습니다.";
+    "모델 미리보기를 누르면 현재 반경, 표고, 포함 건물을 먼저 확인할 수 있습니다.";
   resetModelProgress(
-    "범위를 설정하면 지도 버퍼와 3D 추출 범위가 여기에 표시됩니다."
+    "모델 미리보기를 누르면 지도 버퍼와 3D 추출 범위가 여기에 표시됩니다."
   );
 
   if (state.map) {
@@ -4173,6 +5165,7 @@ function setSelectedLocation(location, moveMap = true) {
   clearContextLayers({ preserveRangeDraft: rangeMode });
   renderSelectionSummary();
   renderSelectionMeta();
+  renderSelectedParcelGroups();
   renderSiteContextMeta();
   renderLandInfo();
   renderBuildingRegister();
@@ -4182,7 +5175,7 @@ function setSelectedLocation(location, moveMap = true) {
     openPopup(location);
   }
   siteContextNote.textContent =
-    "현재 위치가 선택되었습니다. 범위 설정을 누르면 현재 반경으로 버퍼와 건물 범위를 다시 계산합니다.";
+    "현재 위치가 선택되었습니다. 모델 미리보기를 누르면 현재 반경으로 버퍼와 건물 범위를 다시 계산합니다.";
   landInfoNote.textContent =
     "선택한 위치 기준으로 토지이음 요약을 자동으로 불러오는 중입니다.";
 
@@ -4196,12 +5189,25 @@ function setSelectedLocation(location, moveMap = true) {
       "직접 지정 범위는 특정 필지 토지요약 대신 범위 안의 컨텍스트를 확인합니다.";
     buildingRegisterNote.textContent =
       "직접 지정 범위는 특정 건축물대장 대신 범위 안의 건물 컨텍스트를 확인합니다.";
+  } else if (multiParcelMode) {
+    siteContextNote.textContent =
+      "다중 필지가 선택되었습니다. 모델 미리보기로 그룹별 대지/건물 컨텍스트를 계산할 수 있습니다.";
+    landInfoNote.textContent =
+      "다중 필지 선택은 그룹 모델 검토에 집중하고, 토지이음 단건 조회는 잠시 비활성화합니다.";
+    buildingRegisterNote.textContent =
+      "다중 필지 선택은 그룹 모델 검토에 집중하고, 세움터 단건 조회는 잠시 비활성화합니다.";
   }
 
-  [loadLandInfoButton, openLandUseDetailButton, loadBuildingRegisterButton].forEach(
+  [
+    loadLandInfoButton,
+    openLandUseDetailButton,
+    loadBuildingRegisterButton,
+    showBuildingRegisterDetailsButton,
+    openOfficialBuildingRegisterButton,
+  ].forEach(
     (button) => {
       if (button) {
-        button.disabled = rangeMode;
+        button.disabled = rangeMode || multiParcelMode;
       }
     }
   );
@@ -4228,6 +5234,40 @@ async function hydrateSelectedLocationParcelReference(selectionKey) {
       "직접 지정 범위는 토지 요약 대신 범위 안의 필지/건물 컨텍스트를 지도에서 확인합니다.";
     buildingRegisterNote.textContent =
       "직접 지정 범위는 특정 건축물대장 대신 범위 안의 건물 컨텍스트를 지도에서 확인합니다.";
+    return;
+  }
+
+  if (isMultiParcelSelection()) {
+    state.landInfo = null;
+    state.landInfoDetails = null;
+    state.buildingRegister = null;
+    renderLandInfo();
+    renderBuildingRegister();
+    syncPanelStatusChips();
+
+    try {
+      const previewSiteContext = await loadSiteContext(selectionKey, {
+        optionOverrides: buildSelectionPreviewOptions(),
+        layerMode: "selection-preview",
+        previewOnly: true,
+      });
+
+      if (isSelectionRequestCurrent(selectionKey) && previewSiteContext) {
+        state.siteContext = {
+          ...previewSiteContext,
+          layerMode: "selection-preview",
+        };
+        updateContextLayers(state.siteContext);
+      }
+
+      setActionFeedback(
+        `선택한 ${getSelectedParcels(state.selectedLocation).length}개 필지의 그룹 경계를 지도에 표시했습니다.`
+      );
+    } catch {
+      siteContextNote.textContent =
+        "다중 필지 미리보기를 불러오지 못했습니다. 모델 미리보기로 전체 그룹 컨텍스트를 다시 시도할 수 있습니다.";
+    }
+
     return;
   }
 
@@ -4277,7 +5317,7 @@ async function hydrateSelectedLocationParcelReference(selectionKey) {
     setActionFeedback("선택한 주소의 필지 경계와 대지 내 건물 외곽선을 지도에 표시했습니다.");
   } catch {
     siteContextNote.textContent =
-      "선택한 주소의 필지 미리보기를 불러오지 못했습니다. 범위 설정으로 전체 컨텍스트를 다시 시도할 수 있습니다.";
+      "선택한 주소의 필지 미리보기를 불러오지 못했습니다. 모델 미리보기로 전체 컨텍스트를 다시 시도할 수 있습니다.";
   }
 
   return refreshSelectionDataSafely(selectionKey);
@@ -4338,12 +5378,15 @@ async function refreshSelectionData(selectionKey) {
 }
 
 async function bootstrap() {
+  applyStudioChrome();
   relocateSearchUiToSidePanel();
+  syncDesktopPanelLayout();
   attachEvents();
   loadHistory();
   renderHistory();
   renderSelectionSummary();
   renderSelectionMeta();
+  renderSelectedParcelGroups();
   renderSiteContextMeta();
   renderLandInfo();
   renderBuildingRegister();
@@ -4353,7 +5396,7 @@ async function bootstrap() {
   syncContourIntervalInput();
   syncSelectionModeFormState();
   specPreview.textContent =
-    "범위 설정을 누르면 현재 반경, 표고, 포함 건물 수를 먼저 확인할 수 있습니다.";
+    "모델 미리보기를 누르면 현재 반경, 표고, 포함 건물 수를 먼저 확인할 수 있습니다.";
   syncPanelStatusChips();
   await loadRuntimeConfig();
   createMap(state.runtimeConfig);

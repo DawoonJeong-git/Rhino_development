@@ -53,7 +53,7 @@ npm run dev
 - `TERRAIN_DEM_PATH`: 추후 DEM 파일 기반 지형 생성용 로컬 파일 경로
 - `USE_NOMINATIM_FALLBACK`: 브이월드 키가 없을 때 임시 검색 fallback 사용 여부
 
-API별 준비물과 공식 링크는 [api-setup-guide.md](C:/Users/HDL/Documents/Rhino_develop/docs/api-setup-guide.md)에 정리되어 있습니다.
+API별 준비물과 공식 링크는 [docs/api-setup-guide.md](docs/api-setup-guide.md)에 정리되어 있습니다.
 
 참고:
 
