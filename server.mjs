@@ -155,17 +155,6 @@ async function loadLocalConfig() {
 
 function normalizeConfigString(value) {
   const normalized = String(value || "").trim();
-  const normalizedMatch = normalized.match(
-    /(?:^|\s)(\uC0B0)?\s*(\d+)(?:-(\d+))?\s*$/u
-  );
-
-  if (normalizedMatch) {
-    return {
-      mtYn: normalizedMatch[1] ? "1" : "0",
-      bun: normalizedMatch[2],
-      ji: normalizedMatch[3] || "",
-    };
-  }
 
   if (!normalized) {
     return "";
@@ -6030,6 +6019,17 @@ async function geocodeParcelQueryWithDataFallback(query, fallbackResults, config
 
 function parseParcelAddressReference(value) {
   const normalized = String(value || "").trim();
+  const normalizedMatch = normalized.match(
+    /(?:^|\s)(\uC0B0)?\s*(\d+)(?:-(\d+))?\s*$/u
+  );
+
+  if (normalizedMatch) {
+    return {
+      mtYn: normalizedMatch[1] ? "1" : "0",
+      bun: normalizedMatch[2],
+      ji: normalizedMatch[3] || "",
+    };
+  }
   const match = normalized.match(/(?:^|\s)(산)?\s*(\d+)(?:-(\d+))?\s*$/);
 
   if (!match) {
