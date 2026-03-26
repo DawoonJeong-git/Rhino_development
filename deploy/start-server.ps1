@@ -63,6 +63,79 @@ function Stop-MatchingProcesses {
   }
 }
 
+function Get-ServerPort {
+  param(
+    [string]$RepoRoot
+  )
+
+  $defaultPort = 3000
+  $configPath = Join-Path $RepoRoot "config.local.json"
+
+  if (-not (Test-Path $configPath)) {
+    return $defaultPort
+  }
+
+  try {
+    $config = Get-Content $configPath -Raw | ConvertFrom-Json
+    $resolvedPort = [int]$config.PORT
+
+    if ($resolvedPort -gt 0) {
+      return $resolvedPort
+    }
+  } catch {
+    return $defaultPort
+  }
+
+  return $defaultPort
+}
+
+function Stop-PortListenerProcess {
+  param(
+    [int]$Port
+  )
+
+  if ($Port -le 0) {
+    return
+  }
+
+  $listenerLines = @()
+
+  try {
+    $listenerLines = @(netstat -ano -p tcp | Select-String -Pattern "LISTENING" | Select-String -Pattern ":$Port\s")
+  } catch {
+    return
+  }
+
+  foreach ($listenerLine in $listenerLines) {
+    $columns = ($listenerLine.ToString() -split '\s+') | Where-Object { $_ }
+
+    if ($columns.Count -lt 5) {
+      continue
+    }
+
+    $processId = 0
+
+    if (-not [int]::TryParse($columns[-1], [ref]$processId)) {
+      continue
+    }
+
+    if ($processId -le 0 -or $processId -eq $PID) {
+      continue
+    }
+
+    try {
+      $process = Get-Process -Id $processId -ErrorAction Stop
+    } catch {
+      continue
+    }
+
+    if ($process.ProcessName -eq "node") {
+      Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Milliseconds 400
+    }
+  }
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
@@ -83,8 +156,10 @@ if (-not $PidFile) {
 
 $stdoutLog = Join-Path $LogDir "space-work-server.out.log"
 $stderrLog = Join-Path $LogDir "space-work-server.err.log"
+$serverPort = Get-ServerPort -RepoRoot $repoRoot
 
 Stop-ManagedProcess -PidPath $PidFile
+Stop-PortListenerProcess -Port $serverPort
 Stop-MatchingProcesses -ProcessName "node.exe" -Patterns @($repoRoot, "server.mjs")
 Stop-MatchingProcesses -ProcessName "powershell.exe" -Patterns @($repoRoot, "deploy\start-server.ps1")
 Stop-MatchingProcesses -ProcessName "cmd.exe" -Patterns @($repoRoot, "deploy\start-server.ps1")
