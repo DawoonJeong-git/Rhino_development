@@ -3192,6 +3192,27 @@ async function retryUpstreamOperation(operation, options = {}) {
   throw lastError || new Error(`${label} request failed.`);
 }
 
+function buildVWorldDomainCandidates(config) {
+  const configuredDomain = String(config?.vworldApiDomain || "").trim();
+  const localhostDomain = `http://localhost:${Math.max(
+    1,
+    Number(config?.port) || 3000
+  )}`;
+  const candidates = [];
+
+  for (const candidate of [configuredDomain, localhostDomain]) {
+    const normalized = String(candidate || "").trim();
+
+    if (!normalized || candidates.includes(normalized)) {
+      continue;
+    }
+
+    candidates.push(normalized);
+  }
+
+  return candidates;
+}
+
 async function fetchVWorldFeatureCollection(
   dataLayer,
   geomFilter,
@@ -3200,47 +3221,63 @@ async function fetchVWorldFeatureCollection(
   size = 50,
   page = 1
 ) {
-  return retryUpstreamOperation(
-    async () => {
-      const params = new URLSearchParams({
-        key: config.vworldApiKey,
-        service: "data",
-        request: "GetFeature",
-        version: "2.0",
-        data: dataLayer,
-        geomFilter,
-        buffer: String(buffer),
-        geometry: "true",
-        size: String(size),
-        page: String(page),
-        format: "json",
-        crs: "EPSG:4326",
-      });
+  const domainCandidates = buildVWorldDomainCandidates(config);
+  let lastError = null;
 
-      if (config.vworldApiDomain) {
-        params.set("domain", config.vworldApiDomain);
-      }
+  for (const domainCandidate of domainCandidates) {
+    try {
+      return await retryUpstreamOperation(
+        async () => {
+          const params = new URLSearchParams({
+            key: config.vworldApiKey,
+            service: "data",
+            request: "GetFeature",
+            version: "2.0",
+            data: dataLayer,
+            geomFilter,
+            buffer: String(buffer),
+            geometry: "true",
+            size: String(size),
+            page: String(page),
+            format: "json",
+            crs: "EPSG:4326",
+            domain: domainCandidate,
+          });
 
-      const response = await fetchWithTimeout(
-        `https://api.vworld.kr/req/data?${params}`,
-        {},
+          const response = await fetchWithTimeout(
+            `https://api.vworld.kr/req/data?${params}`,
+            {},
+            {
+              requestLabel: "VWorld data request",
+            }
+          );
+
+          if (!response.ok) {
+            throw new Error(`VWorld data request failed with ${response.status}`);
+          }
+
+          const payload = await response.json();
+          return parseFeatureCollection(payload);
+        },
         {
-          requestLabel: "VWorld data request",
+          attempts: 2,
+          label: `vworld:${dataLayer}:page${page}:${domainCandidate}`,
         }
       );
+    } catch (error) {
+      lastError = error;
 
-      if (!response.ok) {
-        throw new Error(`VWorld data request failed with ${response.status}`);
+      if (domainCandidate !== domainCandidates[domainCandidates.length - 1]) {
+        console.warn(
+          `[vworld-domain-fallback] layer=${dataLayer} page=${page} domain=${domainCandidate} reason=${
+            error instanceof Error ? error.message : error
+          }`
+        );
       }
-
-      const payload = await response.json();
-      return parseFeatureCollection(payload);
-    },
-    {
-      attempts: 3,
-      label: `vworld:${dataLayer}:page${page}`,
     }
-  );
+  }
+
+  throw lastError || new Error(`VWorld data request failed for ${dataLayer}.`);
 }
 
 async function fetchAllVWorldFeatureCollections(
