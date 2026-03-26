@@ -3343,6 +3343,73 @@ function mapVWorldSearchItems(items, searchType) {
     );
 }
 
+function tokenizeSearchQuery(value) {
+  return [...new Set(
+    String(value || "")
+      .replace(/[()\-\.,]/g, " ")
+      .split(/\s+/)
+      .map((token) => normalizeAddressKey(token))
+      .filter(Boolean)
+  )];
+}
+
+function collectSearchTextTokens(value) {
+  return tokenizeSearchQuery(value).filter((token) => !/^\d+$/.test(token));
+}
+
+function collectSearchItemAddressKeys(item) {
+  return [
+    normalizeAddressKey(item?.parcelAddress),
+    normalizeAddressKey(item?.roadAddress),
+    normalizeAddressKey(item?.label),
+  ].filter(Boolean);
+}
+
+function countSearchItemTokenMatches(item, tokens) {
+  if (!Array.isArray(tokens) || tokens.length === 0) {
+    return 0;
+  }
+
+  const keys = collectSearchItemAddressKeys(item);
+
+  if (!keys.length) {
+    return 0;
+  }
+
+  let count = 0;
+
+  for (const token of tokens) {
+    if (keys.some((key) => key.includes(token))) {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+function filterSearchItemsByBestTokenCoverage(items, tokens, minimumMatches = 1) {
+  if (!Array.isArray(items) || items.length === 0 || !Array.isArray(tokens) || tokens.length === 0) {
+    return items;
+  }
+
+  const ranked = items.map((item) => ({
+    item,
+    matchedTokens: countSearchItemTokenMatches(item, tokens),
+  }));
+  const bestMatchCount = Math.max(
+    0,
+    ...ranked.map((entry) => entry.matchedTokens)
+  );
+
+  if (bestMatchCount < Math.max(1, Number(minimumMatches) || 1)) {
+    return items;
+  }
+
+  return ranked
+    .filter((entry) => entry.matchedTokens === bestMatchCount)
+    .map((entry) => entry.item);
+}
+
 function buildSearchQueryHints(query) {
   const normalizedQuery = normalizeAddressKey(query);
   const parcelReference = parseParcelAddressReference(query);
@@ -3362,6 +3429,8 @@ function buildSearchQueryHints(query) {
     roadAddressQuery,
     areaQuery,
     normalizedAreaQuery: normalizeAddressKey(areaQuery),
+    textTokens: collectSearchTextTokens(query),
+    areaTokens: collectSearchTextTokens(areaQuery),
   };
 }
 
@@ -3399,6 +3468,11 @@ function scoreSearchItemQueryMatch(item, query) {
   const roadAddressKey = normalizeAddressKey(item?.roadAddress);
   const labelKey = normalizeAddressKey(item?.label);
   let score = 0;
+  const areaTokenCount = countSearchItemTokenMatches(item, hints.areaTokens);
+  const textTokenCount = countSearchItemTokenMatches(
+    item,
+    hints.areaTokens.length ? hints.areaTokens : hints.textTokens
+  );
 
   if (hints.normalizedQuery) {
     if (parcelAddressKey && parcelAddressKey === hints.normalizedQuery) {
@@ -3419,6 +3493,24 @@ function scoreSearchItemQueryMatch(item, query) {
       score += 220;
     } else if (labelKey && labelKey.includes(hints.normalizedQuery)) {
       score += 80;
+    }
+  }
+
+  if (hints.areaTokens.length) {
+    if (areaTokenCount === hints.areaTokens.length) {
+      score += 1800;
+    } else if (areaTokenCount > 0) {
+      score += areaTokenCount * 260;
+    } else {
+      score -= 2600;
+    }
+  } else if (hints.textTokens.length >= 2) {
+    if (textTokenCount === hints.textTokens.length) {
+      score += 1100;
+    } else if (textTokenCount > 0) {
+      score += textTokenCount * 220;
+    } else {
+      score -= 900;
     }
   }
 
@@ -3740,6 +3832,19 @@ async function geocodeJusoCandidate(item, config) {
     result = roadResults[0] || parcelResults[0] || null;
   }
 
+  if (!result && item.parcelAddress) {
+    try {
+      const parcelFallbackResults = await geocodeParcelQueryWithDataFallback(
+        item.parcelAddress,
+        [],
+        config
+      );
+      result = parcelFallbackResults[0] || null;
+    } catch {
+      result = null;
+    }
+  }
+
   if (!result && config.useNominatimFallback) {
     const fallbackResults = await geocodeWithNominatim(query);
     result = fallbackResults[0] || null;
@@ -3871,27 +3976,33 @@ function normalizeSearchResultsForQuery(items, query = "") {
     query
   );
   const hints = buildSearchQueryHints(query);
+  const textTokens = hints.areaTokens.length ? hints.areaTokens : hints.textTokens;
+  const tokenFiltered = filterSearchItemsByBestTokenCoverage(
+    sorted,
+    textTokens,
+    hints.areaTokens.length ? 1 : Math.min(2, textTokens.length || 0)
+  );
 
   if (hints.roadAddressQuery) {
-    const roadOnly = sorted.filter((item) => item?.searchType === "road");
-    return roadOnly.length ? roadOnly : sorted;
+    const roadOnly = tokenFiltered.filter((item) => item?.searchType === "road");
+    return roadOnly.length ? roadOnly : tokenFiltered;
   }
 
   if (!hints.parcelReference) {
-    return sorted;
+    return tokenFiltered;
   }
 
-  const explicitParcelCandidates = sorted.filter(
+  const explicitParcelCandidates = tokenFiltered.filter(
     (item) => item?.searchType === "parcel"
   );
   const parcelCandidates = explicitParcelCandidates.length
     ? explicitParcelCandidates
-    : sorted.filter(
+    : tokenFiltered.filter(
         (item) =>
           Boolean(extractSearchItemParcelReference(item)) ||
           Boolean(extractPnuFromValue(item?.pnu))
       );
-  const scopedCandidates = parcelCandidates.length ? parcelCandidates : sorted;
+  const scopedCandidates = parcelCandidates.length ? parcelCandidates : tokenFiltered;
 
   let filtered = scopedCandidates;
   const mainMatches = filtered.filter(
@@ -3989,15 +4100,19 @@ async function geocodeWithPreferredProviders(query, config) {
     }
   }
 
-  if (hints.parcelReference) {
-    if (vworldItems.length) {
-      const hydrated = await hydrateSearchItemsWithReverse(vworldItems, config);
-      return {
-        provider: "vworld",
-        results: await finalizeSearchResults(hydrated, query, config),
-      };
-    }
+  if (config.jusoConfirmKey) {
+    try {
+      jusoItems = await searchJuso(query, config);
+    } catch (error) {
+      providerErrors.push(error);
 
+      if (!config.useNominatimFallback) {
+        throw error;
+      }
+    }
+  }
+
+  if (hints.parcelReference && !vworldItems.length && !jusoItems.length) {
     try {
       const parcelFallbackResults = await geocodeParcelQueryWithDataFallback(
         query,
@@ -4015,18 +4130,6 @@ async function geocodeWithPreferredProviders(query, config) {
       console.warn(
         `[search] direct parcel fallback failed query="${query}" error="${error?.message || error}"`
       );
-    }
-  }
-
-  if (config.jusoConfirmKey && !hints.parcelReference) {
-    try {
-      jusoItems = await searchJuso(query, config);
-    } catch (error) {
-      providerErrors.push(error);
-
-      if (!config.useNominatimFallback) {
-        throw error;
-      }
     }
   }
 
@@ -5567,54 +5670,74 @@ async function fetchEumLandInfoDetails(parcelReference, location, config) {
 }
 
 async function searchVWorldCategory(query, category, config) {
-  const params = new URLSearchParams({
-    key: config.vworldApiKey,
-    service: "search",
-    request: "search",
-    version: "2.0",
-    type: "address",
-    category,
-    crs: "EPSG:4326",
-    size: "10",
-    format: "json",
-    query,
-  });
+  const domainCandidates = buildVWorldDomainCandidates(config);
+  let lastError = null;
 
-  if (config.vworldApiDomain) {
-    params.set("domain", config.vworldApiDomain);
-  }
+  for (const domainCandidate of domainCandidates) {
+    try {
+      return await retryUpstreamOperation(
+        async () => {
+          const params = new URLSearchParams({
+            key: config.vworldApiKey,
+            service: "search",
+            request: "search",
+            version: "2.0",
+            type: "address",
+            category,
+            crs: "EPSG:4326",
+            size: "10",
+            format: "json",
+            query,
+            domain: domainCandidate,
+          });
+          const response = await fetchWithTimeout(
+            `https://api.vworld.kr/req/search?${params}`,
+            {},
+            {
+              requestLabel: `VWorld ${category} geocode request`,
+            }
+          );
 
-  const response = await fetchWithTimeout(
-    `https://api.vworld.kr/req/search?${params}`,
-    {},
-    {
-      requestLabel: `VWorld ${category} geocode request`,
+          if (!response.ok) {
+            throw new Error(`VWorld ${category} geocode failed with ${response.status}`);
+          }
+
+          const payload = await response.json();
+          const status = getVWorldResponseStatus(payload);
+          const errorText = getVWorldResponseErrorText(payload);
+
+          if (status && status !== "OK") {
+            if (isVWorldNoResultStatus(status, errorText)) {
+              return [];
+            }
+
+            throw new Error(
+              errorText ||
+                `VWorld ${category} geocode returned ${status}`
+            );
+          }
+
+          return mapVWorldSearchItems(
+            payload?.response?.result?.items,
+            category === "road" ? "road" : "parcel"
+          );
+        },
+        {
+          attempts: 2,
+          label: `vworld-search:${category}:${domainCandidate}`,
+        }
+      );
+    } catch (error) {
+      lastError = error;
+      console.warn(
+        `[vworld-domain-fallback] search=${category} domain=${domainCandidate} reason=${
+          error instanceof Error ? error.message : error
+        }`
+      );
     }
-  );
-
-  if (!response.ok) {
-    throw new Error(`VWorld ${category} geocode failed with ${response.status}`);
   }
 
-  const payload = await response.json();
-  const status = getVWorldResponseStatus(payload);
-  const errorText = getVWorldResponseErrorText(payload);
-
-  if (status && status !== "OK") {
-    if (isVWorldNoResultStatus(status, errorText)) {
-      return [];
-    }
-
-    throw new Error(
-      errorText ||
-        `VWorld ${category} geocode returned ${status}`
-    );
-  }
-
-  return mapVWorldSearchItems(
-    payload?.response?.result?.items,
-    category === "road" ? "road" : "parcel"
-  );
+  throw lastError || new Error(`VWorld ${category} geocode request failed.`);
 }
 
 async function geocodeWithVWorld(query, config) {
@@ -6021,13 +6144,11 @@ function buildClipBoundary(location, options, parcelFeature, customBounds = null
   if (normalizedBounds) {
     return polygonFeature(
       [
-        [
-          [normalizedBounds.minLng, normalizedBounds.minLat],
-          [normalizedBounds.maxLng, normalizedBounds.minLat],
-          [normalizedBounds.maxLng, normalizedBounds.maxLat],
-          [normalizedBounds.minLng, normalizedBounds.maxLat],
-          [normalizedBounds.minLng, normalizedBounds.minLat],
-        ],
+        [normalizedBounds.minLng, normalizedBounds.minLat],
+        [normalizedBounds.maxLng, normalizedBounds.minLat],
+        [normalizedBounds.maxLng, normalizedBounds.maxLat],
+        [normalizedBounds.minLng, normalizedBounds.maxLat],
+        [normalizedBounds.minLng, normalizedBounds.minLat],
       ],
       {
         shape: "rectangle",
@@ -17224,6 +17345,7 @@ export {
   addRhinoTerrainMesh,
   buildingBaseElevationForRing,
   build3dmFromSiteContext,
+  buildClipBoundary,
   buildCumulativeContourBandGroups,
   buildContourBandGroups,
   buildDxfFromSiteContext,
@@ -17242,6 +17364,7 @@ export {
   isPathInsideDirectory,
   localMetersFromLngLat,
   normalizePublicError,
+  normalizeSearchResultsForQuery,
   prepareSiteContextForExport,
   resolveRawTerrainHeightAtLocalPoint,
   siteHeightAtLocalPoint,

@@ -6,12 +6,14 @@ import {
   createApp,
   prepareSiteContextForExport,
   build3dmFromSiteContext,
+  buildClipBoundary,
   buildSketchUpPayloadFromSiteContext,
   buildObjFromSiteContext,
   buildSkpFromSiteContextWithRetry,
   fetchWithTimeout,
   isPathInsideDirectory,
   normalizePublicError,
+  normalizeSearchResultsForQuery,
 } from "./server.mjs";
 
 const BASE_URL = process.env.SITE_CONTEXT_BASE_URL || "http://127.0.0.1:3000";
@@ -731,6 +733,102 @@ async function runBaselineVerification() {
       "Custom parcel group names should survive preview/export preparation in order."
     );
 
+    const manualRangeClipBoundary = buildClipBoundary(
+      { lat: 37.567664, lng: 126.965384 },
+      { radius: 80 },
+      null,
+      {
+        minLat: 37.56715,
+        maxLat: 37.56815,
+        minLng: 126.96475,
+        maxLng: 126.96605,
+      }
+    );
+    assert.equal(
+      manualRangeClipBoundary?.geometry?.type,
+      "Polygon",
+      "Manual range clip boundary should stay polygonal."
+    );
+    assert.ok(
+      Number.isFinite(manualRangeClipBoundary?.geometry?.coordinates?.[0]?.[0]?.[0]),
+      "Manual range clip boundary should contain numeric lng/lat points."
+    );
+    assert.equal(
+      manualRangeClipBoundary?.geometry?.coordinates?.[0]?.length,
+      5,
+      "Manual range clip boundary should preserve the rectangle ring."
+    );
+
+    const rankedRoadResults = normalizeSearchResultsForQuery(
+      [
+        {
+          id: "wrong-road-candidate",
+          label: "강원특별자치도 강릉시 강동면 모전리 110-10",
+          roadAddress: "",
+          parcelAddress: "강원특별자치도 강릉시 강동면 모전리 110-10",
+          lat: 37.71715,
+          lng: 128.98031,
+          provider: "vworld",
+          searchType: "parcel",
+        },
+        {
+          id: "city-hall",
+          label: "서울특별시 중구 세종대로 110",
+          roadAddress: "서울특별시 중구 세종대로 110",
+          parcelAddress: "서울특별시 중구 태평로1가 31",
+          lat: 37.5662952,
+          lng: 126.9779451,
+          provider: "juso+vworld",
+          searchType: "road",
+          pnu: "1114010100100310000",
+          juso: {
+            admCd: "1114010100",
+            mtYn: "0",
+            lnbrMnnm: "0031",
+            lnbrSlno: "0000",
+          },
+        },
+      ],
+      "서울 중구 세종대로 110"
+    );
+    assert.equal(
+      rankedRoadResults?.[0]?.roadAddress,
+      "서울특별시 중구 세종대로 110",
+      "Road-address ranking should keep the Seoul match ahead of unrelated parcel hits."
+    );
+
+    const rankedParcelResults = normalizeSearchResultsForQuery(
+      [
+        {
+          id: "wrong-parcel-candidate",
+          label: "강원특별자치도 강릉시 강동면 모전리 산 18-1",
+          roadAddress: "",
+          parcelAddress: "강원특별자치도 강릉시 강동면 모전리 산 18-1",
+          lat: 37.7145604,
+          lng: 128.991841,
+          provider: "vworld",
+          searchType: "parcel",
+        },
+        {
+          id: "seoul-parcel",
+          label: "서울특별시 종로구 관훈동 18-1",
+          roadAddress: "",
+          parcelAddress: "서울특별시 종로구 관훈동 18-1",
+          lat: 37.574,
+          lng: 126.984,
+          provider: "vworld-data",
+          searchType: "parcel",
+          pnu: "1111013700100180001",
+        },
+      ],
+      "서울 종로구 관훈동 18-1"
+    );
+    assert.equal(
+      rankedParcelResults?.[0]?.parcelAddress,
+      "서울특별시 종로구 관훈동 18-1",
+      "Parcel-address ranking should favor the matching Seoul parcel over distant lookalikes."
+    );
+
     const syntheticContourSiteContext = {
       location: { lat: 37.56647, lng: 126.97819 },
       clipBoundary: {
@@ -936,6 +1034,8 @@ async function runBaselineVerification() {
             "site-radius-limit",
             "multi-parcel-preview",
             "multi-parcel-custom-groups",
+            "manual-range-clip-boundary",
+            "search-ranking-tokens",
             "skp-terrain-refine",
             "skp-contour-curves",
             "export-cache-hit",
