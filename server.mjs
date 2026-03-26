@@ -14116,6 +14116,16 @@ function normalizeDxfPolylinePoints(
   return normalized;
 }
 
+function appendArrayItems(target, items, chunkSize = 4096) {
+  if (!Array.isArray(target) || !Array.isArray(items) || !items.length) {
+    return;
+  }
+
+  for (let index = 0; index < items.length; index += chunkSize) {
+    target.push(...items.slice(index, index + chunkSize));
+  }
+}
+
 function resolvePositiveInteger(value, fallback) {
   const normalized = Number(value);
 
@@ -14678,7 +14688,7 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
   appendDxfBlocksSection(lines, state);
   appendDxfPair(lines, 0, "SECTION");
   appendDxfPair(lines, 2, "ENTITIES");
-  lines.push(...entityLines);
+  appendArrayItems(lines, entityLines);
   progress(94, "DXF ?뚯씪??留덈Т由ы븯??以묒엯?덈떎.");
   appendDxfPair(lines, 0, "ENDSEC");
   appendDxfPair(lines, 0, "EOF");
