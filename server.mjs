@@ -3459,6 +3459,37 @@ function extractSearchItemParcelReference(item) {
   return parseParcelAddressReference(item?.parcelAddress || "");
 }
 
+function hasExactParcelAddressMatch(item, hints) {
+  if (!hints?.parcelReference || !hints?.mainNumber) {
+    return false;
+  }
+
+  const text = String(item?.parcelAddress || item?.label || "").trim();
+  const match = text.match(/(?:^|\s)(\uC0B0)?\s*(\d+)(?:-(\d+))?\s*$/u);
+
+  if (!match) {
+    return false;
+  }
+
+  const itemMtYn = match[1] ? "1" : "0";
+  const itemMainNumber = normalizeDigits(match[2]);
+  const itemSubNumber = normalizeDigits(match[3]);
+  const querySubNumber = normalizeDigits(hints.subNumber);
+
+  if (
+    itemMtYn !== hints.mtYn ||
+    itemMainNumber !== hints.mainNumber ||
+    itemSubNumber !== querySubNumber
+  ) {
+    return false;
+  }
+
+  return (
+    !hints.areaTokens.length ||
+    countSearchItemTokenMatches(item, hints.areaTokens) === hints.areaTokens.length
+  );
+}
+
 function scoreSearchItemQueryMatch(item, query) {
   const hints =
     query && typeof query === "object" ? query : buildSearchQueryHints(query || "");
@@ -4008,6 +4039,14 @@ function normalizeSearchResultsForQuery(items, query = "") {
   const scopedCandidates = parcelCandidates.length ? parcelCandidates : tokenFiltered;
 
   let filtered = scopedCandidates;
+  const exactParcelMatches = filtered.filter((item) =>
+    hasExactParcelAddressMatch(item, hints)
+  );
+
+  if (exactParcelMatches.length) {
+    filtered = exactParcelMatches;
+  }
+
   const mainMatches = filtered.filter(
     (item) =>
       normalizeDigits(extractSearchItemParcelReference(item)?.bun) ===

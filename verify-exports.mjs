@@ -829,6 +829,39 @@ async function runBaselineVerification() {
       "Parcel-address ranking should favor the matching Seoul parcel over distant lookalikes."
     );
 
+    const rankedExactParcelResults = normalizeSearchResultsForQuery(
+      [
+        {
+          id: "wrong-pnu-priority",
+          label: "서울특별시 종로구 교남동 53-2",
+          roadAddress: "",
+          parcelAddress: "서울특별시 종로구 교남동 53-2",
+          lat: 37.569,
+          lng: 126.968,
+          provider: "vworld-data",
+          searchType: "parcel",
+          pnu: "1111017600100530002",
+        },
+        {
+          id: "exact-without-pnu",
+          label: "서울특별시 종로구 교남동 18-1",
+          roadAddress: "",
+          parcelAddress: "서울특별시 종로구 교남동 18-1",
+          lat: 37.567703,
+          lng: 126.965239,
+          provider: "vworld",
+          searchType: "parcel",
+          pnu: "",
+        },
+      ],
+      "서울 종로구 교남동 18-1"
+    );
+    assert.equal(
+      rankedExactParcelResults?.[0]?.parcelAddress,
+      "서울특별시 종로구 교남동 18-1",
+      "Exact parcel text matches should outrank nearby PNU-backed alternatives."
+    );
+
     const syntheticContourSiteContext = {
       location: { lat: 37.56647, lng: 126.97819 },
       clipBoundary: {
