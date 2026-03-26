@@ -6520,6 +6520,33 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
       sampleFallbackGrid?.step || 0
     )} rows=${Number(sampleFallbackGrid?.elevations?.length || 0)}`
   );
+  const shouldSuppressSyntheticContourFallback = Boolean(
+    options.includeContours !== false &&
+      config?.terrainContourPath &&
+      !contourSource?.collection?.features?.length
+  );
+  const buildContourCollectionForTerrainGrid = (terrainGrid) => {
+    if (options.includeContours === false) {
+      return featureCollection([]);
+    }
+
+    if (contourSource?.collection?.features?.length) {
+      return contourSource.collection;
+    }
+
+    if (shouldSuppressSyntheticContourFallback) {
+      return featureCollection([]);
+    }
+
+    return createContourLinesFromTerrainGrid(location, terrainGrid, options);
+  };
+
+  if (shouldSuppressSyntheticContourFallback && contourSource) {
+    contourSource = {
+      ...contourSource,
+      note: `${contourSource.note} Synthetic contour fallback was suppressed to avoid showing grid-derived contours in preview/export.`,
+    };
+  }
 
   if (contourSource?.collection?.features?.length) {
     try {
@@ -6614,11 +6641,7 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
       provider,
       mode: "live",
       note,
-      contourCollection:
-        options.includeContours === false
-          ? featureCollection([])
-          : contourSource?.collection ||
-            createContourLinesFromTerrainGrid(location, terrainGrid, options),
+      contourCollection: buildContourCollectionForTerrainGrid(terrainGrid),
       contourSource,
       contourInterval: requestedContourInterval,
       sourceContourInterval,
@@ -6630,11 +6653,9 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
         error instanceof Error ? error.message : "unknown"
       }`
     );
-    const contourCollection =
-      options.includeContours === false
-        ? featureCollection([])
-        : contourSource?.collection ||
-          createContourLinesFromTerrainGrid(location, sampleFallbackGrid, options);
+    const contourCollection = buildContourCollectionForTerrainGrid(
+      sampleFallbackGrid
+    );
 
     return {
       provider: "synthetic",
