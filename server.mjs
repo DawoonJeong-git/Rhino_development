@@ -141,7 +141,7 @@ process.on("uncaughtExceptionMonitor", (error, origin) => {
 async function loadLocalConfig() {
   try {
     const raw = await readFile(configPath, "utf8");
-    return JSON.parse(raw);
+    return JSON.parse(raw.replace(/^\uFEFF/, ""));
   } catch {
     return {};
   }
