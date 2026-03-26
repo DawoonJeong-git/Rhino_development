@@ -155,6 +155,17 @@ async function loadLocalConfig() {
 
 function normalizeConfigString(value) {
   const normalized = String(value || "").trim();
+  const normalizedMatch = normalized.match(
+    /(?:^|\s)(\uC0B0)?\s*(\d+)(?:-(\d+))?\s*$/u
+  );
+
+  if (normalizedMatch) {
+    return {
+      mtYn: normalizedMatch[1] ? "1" : "0",
+      bun: normalizedMatch[2],
+      ji: normalizedMatch[3] || "",
+    };
+  }
 
   if (!normalized) {
     return "";
@@ -3414,6 +3425,9 @@ function buildSearchQueryHints(query) {
   const normalizedQuery = normalizeAddressKey(query);
   const parcelReference = parseParcelAddressReference(query);
   const roadAddressQuery = /(?:로|길|대로)\d/u.test(String(query || "").replace(/\s+/g, ""));
+  const normalizedRoadAddressQuery = /(?:\uB300\uB85C|\uB85C|\uAE38)\d/u.test(
+    String(query || "").replace(/\s+/g, "")
+  );
   const areaQuery = parcelReference
     ? String(query || "")
         .replace(/(?:^|\s)(\uC0B0)?\s*\d+(?:-\d+)?\s*$/u, "")
@@ -3426,7 +3440,7 @@ function buildSearchQueryHints(query) {
     mainNumber: normalizeDigits(parcelReference?.bun),
     subNumber: normalizeDigits(parcelReference?.ji),
     mtYn: parcelReference?.mtYn || "0",
-    roadAddressQuery,
+    roadAddressQuery: normalizedRoadAddressQuery,
     areaQuery,
     normalizedAreaQuery: normalizeAddressKey(areaQuery),
     textTokens: collectSearchTextTokens(query),
@@ -4043,6 +4057,16 @@ function normalizeSearchResultsForQuery(items, query = "") {
 
     if (textualMtMatches.length) {
       filtered = textualMtMatches;
+    } else {
+      const normalizedTextualMtMatches = filtered.filter((item) =>
+        normalizeAddressKey(item?.parcelAddress || item?.label || "").includes(
+          "\uC0B0"
+        )
+      );
+
+      if (normalizedTextualMtMatches.length) {
+        filtered = normalizedTextualMtMatches;
+      }
     }
   }
 
