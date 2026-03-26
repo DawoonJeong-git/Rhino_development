@@ -583,7 +583,17 @@ async function runBaselineVerification() {
     const missingTokenResponse = await fetch(
       `${baseUrl}/api/request-progress?token=progress-does-not-exist`
     );
-    assert.equal(missingTokenResponse.status, 404, "Unknown progress token should not leak state.");
+    assert.equal(
+      missingTokenResponse.status,
+      200,
+      "Unknown progress token should resolve to an idle progress state."
+    );
+    const missingTokenPayload = await missingTokenResponse.json();
+    assert.equal(
+      missingTokenPayload?.state,
+      "idle",
+      "Unknown progress token should report idle state."
+    );
 
     const modelSpecResponse = await fetch(`${baseUrl}/api/model-spec`, {
       method: "POST",

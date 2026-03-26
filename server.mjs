@@ -16602,7 +16602,22 @@ async function createApp() {
         const entry = requestProgressStore.get(token);
         const clientIp = getClientIp(request);
 
-        if (!entry || (entry.clientIp && entry.clientIp !== clientIp)) {
+        if (!entry) {
+          sendJson(response, 200, {
+            token,
+            operation: "request",
+            state: "idle",
+            percent: 0,
+            message: "",
+            startedAt: null,
+            updatedAt: null,
+            completedAt: null,
+            error: "",
+          });
+          return;
+        }
+
+        if (entry.clientIp && entry.clientIp !== clientIp) {
           sendJson(response, 404, { error: "진행 상태를 찾을 수 없습니다." });
           return;
         }
