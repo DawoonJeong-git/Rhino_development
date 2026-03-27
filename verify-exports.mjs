@@ -7,6 +7,7 @@ import {
   prepareSiteContextForExport,
   build3dmFromSiteContext,
   buildClipBoundary,
+  buildRoadSurfaceFeatureCollection,
   buildSketchUpPayloadFromSiteContext,
   buildObjFromSiteContext,
   buildSkpFromSiteContextWithRetry,
@@ -759,6 +760,45 @@ async function runBaselineVerification() {
       "Manual range clip boundary should preserve the rectangle ring."
     );
 
+    const mergedRoadSurfaces = buildRoadSurfaceFeatureCollection(
+      [
+        {
+          type: "Feature",
+          properties: { sourceLayer: "raw-road-a" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [[
+              [126.9780, 37.56640],
+              [126.9782, 37.56640],
+              [126.9782, 37.56652],
+              [126.9780, 37.56652],
+              [126.9780, 37.56640],
+            ]],
+          },
+        },
+        {
+          type: "Feature",
+          properties: { sourceLayer: "raw-road-b" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [[
+              [126.9782, 37.56640],
+              [126.9784, 37.56640],
+              [126.9784, 37.56652],
+              [126.9782, 37.56652],
+              [126.9782, 37.56640],
+            ]],
+          },
+        },
+      ],
+      { lat: 37.56646, lng: 126.97820 }
+    );
+    assert.equal(
+      mergedRoadSurfaces?.features?.length,
+      1,
+      "Adjacent road polygons should be merged into one preview surface."
+    );
+
     const rankedRoadResults = normalizeSearchResultsForQuery(
       [
         {
@@ -1068,6 +1108,7 @@ async function runBaselineVerification() {
             "multi-parcel-preview",
             "multi-parcel-custom-groups",
             "manual-range-clip-boundary",
+            "road-surface-merge",
             "search-ranking-tokens",
             "skp-terrain-refine",
             "skp-contour-curves",

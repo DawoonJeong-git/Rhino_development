@@ -7785,17 +7785,20 @@ function buildRoadContextResult(
   note,
   isFallback = false
 ) {
-  if (geometryType !== "polygon") {
-    const surfaceCollection = buildRoadSurfaceFeatureCollection(features, location);
+  const surfaceCollection = buildRoadSurfaceFeatureCollection(features, location);
 
-    if (surfaceCollection.features.length) {
-      return {
-        collection: surfaceCollection,
-        provider,
-        isFallback,
-        note: `Loaded ${surfaceCollection.features.length} road surface polygon(s) from ${provider} line data.`,
-      };
-    }
+  if (surfaceCollection.features.length) {
+    const rawFeatureLabel = geometryType === "polygon" ? "polygon" : "line";
+    const rawFeatureCount = Array.isArray(features) ? features.length : 0;
+    return {
+      collection: surfaceCollection,
+      provider,
+      isFallback,
+      note:
+        rawFeatureCount > 0
+          ? `Loaded ${rawFeatureCount} road ${rawFeatureLabel} feature(s) from ${provider}; merged them into ${surfaceCollection.features.length} road surface polygon(s).`
+          : note,
+    };
   }
 
   return {
