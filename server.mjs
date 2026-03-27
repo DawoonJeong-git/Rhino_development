@@ -46,6 +46,8 @@ const SKETCHUP_EXPORT_EXIT_GRACE_MS = 15_000;
 const CHILD_PROCESS_FORCE_KILL_GRACE_MS = 5_000;
 const DEFAULT_ROAD_WIDTH_METERS = 6;
 const ROAD_SURFACE_MAX_SEGMENT_METERS = 3;
+const ROAD_SURFACE_NEAR_MERGE_GAP_METERS = 1;
+const ROAD_SURFACE_NEAR_MERGE_BRIDGE_WIDTH_METERS = 1.2;
 const CONTOUR_BAND_UNION_MAX_SLICES = 12000;
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024;
 const DEFAULT_MAX_EXPORT_REQUEST_BODY_BYTES = 12 * 1024 * 1024;
@@ -11814,12 +11816,17 @@ function sampleRoadSegmentLocalPoints(startPoint, endPoint, siteContext, widthMe
   return points;
 }
 
-function buildRoadSegmentLocalQuad(startPoint, endPoint, widthMeters) {
+function buildRoadSegmentLocalQuad(
+  startPoint,
+  endPoint,
+  widthMeters,
+  minimumLengthMeters = 0.5
+) {
   const dx = endPoint[0] - startPoint[0];
   const dy = endPoint[1] - startPoint[1];
   const length = Math.hypot(dx, dy);
 
-  if (!Number.isFinite(length) || length < 0.5) {
+  if (!Number.isFinite(length) || length < minimumLengthMeters) {
     return null;
   }
 
@@ -11880,6 +11887,155 @@ function buildRoadFeatureFootprintMultiPolygon(feature, center) {
   return multiPolygon;
 }
 
+function findClosestPolygonVertexPair(leftPolygon, rightPolygon, maxGapMeters) {
+  const leftRing = Array.isArray(leftPolygon?.[0]) ? leftPolygon[0] : [];
+  const rightRing = Array.isArray(rightPolygon?.[0]) ? rightPolygon[0] : [];
+
+  if (!leftRing.length || !rightRing.length) {
+    return null;
+  }
+
+  const maxGapSquared =
+    Number.isFinite(maxGapMeters) && maxGapMeters > 0
+      ? maxGapMeters * maxGapMeters
+      : Number.POSITIVE_INFINITY;
+  let best = null;
+
+  for (const leftPoint of leftRing) {
+    const leftX = Number(leftPoint?.[0]);
+    const leftY = Number(leftPoint?.[1]);
+
+    if (!Number.isFinite(leftX) || !Number.isFinite(leftY)) {
+      continue;
+    }
+
+    for (const rightPoint of rightRing) {
+      const rightX = Number(rightPoint?.[0]);
+      const rightY = Number(rightPoint?.[1]);
+
+      if (!Number.isFinite(rightX) || !Number.isFinite(rightY)) {
+        continue;
+      }
+
+      const distanceSquared =
+        (leftX - rightX) * (leftX - rightX) +
+        (leftY - rightY) * (leftY - rightY);
+
+      if (distanceSquared > maxGapSquared) {
+        continue;
+      }
+
+      if (!best || distanceSquared < best.distanceSquared) {
+        best = {
+          leftPoint: [leftX, leftY],
+          rightPoint: [rightX, rightY],
+          distanceSquared,
+        };
+      }
+    }
+  }
+
+  return best
+    ? {
+        ...best,
+        distance: Math.sqrt(best.distanceSquared),
+      }
+    : null;
+}
+
+function mergeNearbyRoadSurfacePolygons(
+  multiPolygon,
+  gapMeters = ROAD_SURFACE_NEAR_MERGE_GAP_METERS
+) {
+  const polygons = (multiPolygon || []).filter(
+    (polygon) => Array.isArray(polygon?.[0]) && polygon[0].length >= 4
+  );
+
+  if (polygons.length < 2 || !(gapMeters > 0)) {
+    return polygons;
+  }
+
+  let mergedPolygons = [...polygons];
+  let didMerge = true;
+  let iterationCount = 0;
+
+  while (didMerge && mergedPolygons.length > 1 && iterationCount < 16) {
+    didMerge = false;
+    iterationCount += 1;
+
+    for (let leftIndex = 0; leftIndex < mergedPolygons.length; leftIndex += 1) {
+      const leftPolygon = mergedPolygons[leftIndex];
+      const leftBounds = computeLocalPolygonBounds(leftPolygon?.[0] || []);
+
+      if (!leftBounds) {
+        continue;
+      }
+
+      for (
+        let rightIndex = leftIndex + 1;
+        rightIndex < mergedPolygons.length;
+        rightIndex += 1
+      ) {
+        const rightPolygon = mergedPolygons[rightIndex];
+        const rightBounds = computeLocalPolygonBounds(rightPolygon?.[0] || []);
+
+        if (!rightBounds || !boundsOverlap(leftBounds, rightBounds, gapMeters)) {
+          continue;
+        }
+
+        const closestPair = findClosestPolygonVertexPair(
+          leftPolygon,
+          rightPolygon,
+          gapMeters
+        );
+
+        if (!closestPair || !(closestPair.distance > 0)) {
+          continue;
+        }
+
+        const bridgeQuad = buildRoadSegmentLocalQuad(
+          closestPair.leftPoint,
+          closestPair.rightPoint,
+          Math.max(
+            ROAD_SURFACE_NEAR_MERGE_BRIDGE_WIDTH_METERS,
+            closestPair.distance + 0.2
+          ),
+          0.01
+        );
+        const bridgeRing = buildPolygonClippingRing(
+          orientLocalPolygonCounterClockwise(bridgeQuad || [])
+        );
+
+        if (!bridgeRing) {
+          continue;
+        }
+
+        try {
+          const unionResult =
+            polygonClipping.union([leftPolygon], [rightPolygon], [[bridgeRing]]) || [];
+
+          if (unionResult.length === 1) {
+            mergedPolygons[leftIndex] = unionResult[0];
+            mergedPolygons.splice(rightIndex, 1);
+            didMerge = true;
+            break;
+          }
+        } catch (error) {
+          console.warn(
+            `[roads] near-merge fallback error=${formatErrorForLog(error)} gap=${closestPair.distance.toFixed(3)}`
+          );
+        }
+      }
+
+      if (didMerge) {
+        break;
+      }
+    }
+  }
+
+  return mergedPolygons;
+}
+
 function buildRoadFootprintMultiPolygonFromFeatures(features, center) {
   const footprintPolygons = [];
 
@@ -11892,7 +12048,8 @@ function buildRoadFootprintMultiPolygonFromFeatures(features, center) {
   }
 
   try {
-    return polygonClipping.union(footprintPolygons) || [];
+    const unionResult = polygonClipping.union(footprintPolygons) || [];
+    return mergeNearbyRoadSurfacePolygons(unionResult);
   } catch (error) {
     console.warn(
       `[roads] footprint union fallback error=${formatErrorForLog(error)}`
