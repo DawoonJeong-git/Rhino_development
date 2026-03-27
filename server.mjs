@@ -14259,6 +14259,11 @@ function createLegacyDxfState(layers = []) {
 
 function appendLegacyDxfHeaderSection(lines, state) {
   const bounds = getDxfDocumentBounds(state);
+  const width = Math.max(1, bounds.maxX - bounds.minX);
+  const height = Math.max(1, bounds.maxY - bounds.minY);
+  const centerX = Number(((bounds.minX + bounds.maxX) / 2).toFixed(3));
+  const centerY = Number(((bounds.minY + bounds.maxY) / 2).toFixed(3));
+  const viewSize = Number((Math.max(width, height) * 1.2).toFixed(3));
   appendDxfPair(lines, 0, "SECTION");
   appendDxfPair(lines, 2, "HEADER");
   appendDxfPair(lines, 9, "$ACADVER");
@@ -14275,6 +14280,17 @@ function appendLegacyDxfHeaderSection(lines, state) {
   appendDxfPair(lines, 10, formatDxfCoordinateValue(bounds.maxX));
   appendDxfPair(lines, 20, formatDxfCoordinateValue(bounds.maxY));
   appendDxfPair(lines, 30, formatDxfCoordinateValue(bounds.maxZ));
+  appendDxfPair(lines, 9, "$LIMMIN");
+  appendDxfPair(lines, 10, formatDxfCoordinateValue(bounds.minX));
+  appendDxfPair(lines, 20, formatDxfCoordinateValue(bounds.minY));
+  appendDxfPair(lines, 9, "$LIMMAX");
+  appendDxfPair(lines, 10, formatDxfCoordinateValue(bounds.maxX));
+  appendDxfPair(lines, 20, formatDxfCoordinateValue(bounds.maxY));
+  appendDxfPair(lines, 9, "$VIEWCTR");
+  appendDxfPair(lines, 10, formatDxfCoordinateValue(centerX));
+  appendDxfPair(lines, 20, formatDxfCoordinateValue(centerY));
+  appendDxfPair(lines, 9, "$VIEWSIZE");
+  appendDxfPair(lines, 40, formatDxfCoordinateValue(viewSize));
   appendDxfPair(lines, 0, "ENDSEC");
 }
 
@@ -14317,6 +14333,11 @@ function appendLegacyDxfTablesSection(lines, state) {
 }
 
 function appendDxfEntityCommon(state, lines, layerName, entityHandle) {
+  if (!state?.handles) {
+    appendDxfPair(lines, 8, layerName);
+    return;
+  }
+
   appendDxfPair(lines, 5, entityHandle);
   appendDxfPair(lines, 330, state.handles.blockRecords.modelSpace);
   appendDxfPair(lines, 100, "AcDbEntity");
@@ -14339,10 +14360,14 @@ function appendDxfLineEntity(
   const zElevation = Number.isFinite(Number(elevation))
     ? Number(elevation)
     : 0;
-  const entityHandle = allocateDxfHandle(state);
+  const entityHandle = state?.handles ? allocateDxfHandle(state) : null;
   appendDxfPair(lines, 0, "LINE");
   appendDxfEntityCommon(state, lines, layerName, entityHandle);
-  appendDxfPair(lines, 100, "AcDbLine");
+
+  if (state?.handles) {
+    appendDxfPair(lines, 100, "AcDbLine");
+  }
+
   appendDxfPair(lines, 10, formatDxfCoordinateValue(startPoint[0]));
   appendDxfPair(lines, 20, formatDxfCoordinateValue(startPoint[1]));
   appendDxfPair(lines, 30, formatDxfCoordinateValue(zElevation));
@@ -14895,7 +14920,7 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
     { name: "TARGET_BUILDING", color: 10 },
     { name: "ROADS", color: 5 },
   ];
-  const state = createDxfDocumentState(layers);
+  const state = createLegacyDxfState(layers);
   const entityLines = [];
   const lines = [];
 
@@ -15012,9 +15037,8 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
     }
   }
 
-  appendDxfHeaderSection(lines, state);
-  appendDxfTablesSection(lines, state);
-  appendDxfBlocksSection(lines, state);
+  appendLegacyDxfHeaderSection(lines, state);
+  appendLegacyDxfTablesSection(lines, state);
   appendDxfPair(lines, 0, "SECTION");
   appendDxfPair(lines, 2, "ENTITIES");
   appendArrayItems(lines, entityLines);

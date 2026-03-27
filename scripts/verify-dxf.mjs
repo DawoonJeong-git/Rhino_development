@@ -361,46 +361,36 @@ const entities = collectLineEntities(dxf);
 const layerCounts = countByLayer(entities);
 const headerVariables = collectHeaderVariables(dxf);
 const sectionNames = collectSectionNames(dxf);
-const blockRecordHandles = collectBlockRecordHandles(dxf);
-const modelSpaceHandle = blockRecordHandles.get("*Model_Space");
 
 assert.ok(dxf.includes("\r\n"), "DXF should use CRLF line endings.");
 assert.ok(
   sectionNames.includes("HEADER") &&
     sectionNames.includes("TABLES") &&
-    sectionNames.includes("BLOCKS") &&
     sectionNames.includes("ENTITIES"),
-  "DXF should include HEADER, TABLES, BLOCKS, and ENTITIES sections."
+  "DXF should include HEADER, TABLES, and ENTITIES sections."
 );
 assert.ok(
   dxf.includes("2\r\nLTYPE\r\n"),
   "DXF should define a linetype table for CAD compatibility."
 );
 assert.ok(
-  dxf.includes("2\r\nBLOCK_RECORD\r\n"),
-  "DXF should define block records for model-space ownership."
-);
-assert.ok(
-  modelSpaceHandle,
-  "DXF should define a block-record handle for model space."
-);
-assert.ok(
   headerVariables.get("$ACADVER")?.some(
-    ([code, value]) => code === "1" && value === "AC1015"
+    ([code, value]) => code === "1" && value === "AC1009"
   ),
-  "DXF should target the AC1015 flavor when emitting block records and entity handles."
+  "DXF should target the AC1009 legacy flavor for broad CAD compatibility."
 );
 assert.ok(
-  headerVariables.has("$EXTMIN") && headerVariables.has("$EXTMAX"),
-  "DXF header should include extents for zoom-to-fit importers."
+  headerVariables.has("$EXTMIN") &&
+    headerVariables.has("$EXTMAX") &&
+    headerVariables.has("$LIMMIN") &&
+    headerVariables.has("$LIMMAX") &&
+    headerVariables.has("$VIEWCTR") &&
+    headerVariables.has("$VIEWSIZE"),
+  "DXF header should include extents, limits, and view defaults for CAD importers."
 );
 assert.ok(
   dxf.includes("\r\n0\r\nLINE\r\n"),
   "DXF should emit visible line entities."
-);
-assert.ok(
-  dxf.includes("\r\n0\r\nBLOCK\r\n") && dxf.includes("\r\n0\r\nENDBLK\r\n"),
-  "DXF should define model/paper-space block sections."
 );
 assert.ok(
   !dxf.includes("\r\n0\r\nLWPOLYLINE\r\n"),
@@ -436,22 +426,7 @@ assert.equal(contourEntity.startZ, 0, "Contour start elevation should be flatten
 assert.equal(contourEntity.endZ, 0, "Contour end elevation should be flattened to z=0.");
 
 for (const entity of entities) {
-  assert.ok(entity.handle, `Layer ${entity.layer} should have a DXF handle.`);
-  assert.equal(
-    entity.owner,
-    modelSpaceHandle,
-    `Layer ${entity.layer} should belong to the model-space block record.`
-  );
-  assert.equal(
-    entity.layout,
-    "Model",
-    `Layer ${entity.layer} should target the model layout.`
-  );
-  assert.ok(
-    entity.subclasses.includes("AcDbEntity") &&
-      entity.subclasses.includes("AcDbLine"),
-    `Layer ${entity.layer} should declare AcDbEntity and AcDbLine subclasses.`
-  );
+  assert.ok(entity.layer, "DXF line entities should declare a layer.");
   assert.ok(
     Number.isFinite(entity.startX) &&
       Number.isFinite(entity.startY) &&
