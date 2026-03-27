@@ -432,8 +432,8 @@ assert.equal(layerCounts.CONTOURS, 1, "Contour lines should export as line segme
 
 const contourEntity = entities.find((entity) => entity.layer === "CONTOURS");
 assert.ok(contourEntity, "Contour entity should exist.");
-assert.equal(contourEntity.startZ, 12, "Contour start elevation should be preserved.");
-assert.equal(contourEntity.endZ, 12, "Contour end elevation should be preserved.");
+assert.equal(contourEntity.startZ, 0, "Contour start elevation should be flattened to z=0.");
+assert.equal(contourEntity.endZ, 0, "Contour end elevation should be flattened to z=0.");
 
 for (const entity of entities) {
   assert.ok(entity.handle, `Layer ${entity.layer} should have a DXF handle.`);

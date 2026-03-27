@@ -39,6 +39,7 @@ const RHINO6_FILE3DM_VERSION = 6;
 const REQUEST_PROGRESS_TTL_MS = 1000 * 60 * 20;
 const ROAD_SURFACE_OFFSET_METERS = 0.01;
 const ROAD_SURFACE_THICKNESS_METERS = 0.01;
+const FLAT_EXPORT_CURVE_ELEVATION = 0;
 const TERRAIN_BAND_OVERLAP_METERS = 0.02;
 const SKETCHUP_METERS_TO_INCHES = 39.37007874015748;
 const SKETCHUP_EXPORT_TIMEOUT_MS = 1000 * 60 * 3;
@@ -12495,8 +12496,7 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
 
         for (const point of ring) {
           const [xMeters, yMeters] = localMetersFromLngLat(point, center);
-          const elevation =
-            siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.15;
+          const elevation = FLAT_EXPORT_CURVE_ELEVATION;
           appendObjVertex(lines, xMeters, yMeters, elevation);
           parcelVertexIndices.push(vertexIndex);
           vertexIndex += 1;
@@ -12529,8 +12529,7 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
 
       for (const point of ring) {
         const [xMeters, yMeters] = localMetersFromLngLat(point, center);
-        const elevation =
-          siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.12;
+        const elevation = FLAT_EXPORT_CURVE_ELEVATION;
         appendObjVertex(lines, xMeters, yMeters, elevation);
         parcelVertexIndices.push(vertexIndex);
         vertexIndex += 1;
@@ -12553,7 +12552,7 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
 
         for (const point of lineString) {
           const [xMeters, yMeters] = localMetersFromLngLat(point, center);
-          const elevation = Number(feature.properties?.elevation || 0);
+          const elevation = FLAT_EXPORT_CURVE_ELEVATION;
           appendObjVertex(lines, xMeters, yMeters, elevation);
           contourIndices.push(vertexIndex);
           vertexIndex += 1;
@@ -12831,7 +12830,7 @@ function buildSketchUpContourPolyline(points, elevation) {
     (points || []).map(([xMeters, yMeters]) => [
       Number(xMeters || 0),
       Number(yMeters || 0),
-      Number(elevation || 0),
+      FLAT_EXPORT_CURVE_ELEVATION,
     ]),
     false,
     { curve: true }
@@ -13077,11 +13076,7 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
           buildSketchUpPolyline(
             ring.map((point) => {
               const [xMeters, yMeters] = localMetersFromLngLat(point, center);
-              return [
-                xMeters,
-                yMeters,
-                siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.15,
-              ];
+              return [xMeters, yMeters, FLAT_EXPORT_CURVE_ELEVATION];
             }),
             true
           )
@@ -14939,8 +14934,6 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
     progress(42, "DXF ?깃퀬??寃쎅퀎瑜??붽??섎뒗 以묒엯?덈떎.");
 
     for (const feature of siteContext.contourLines?.features || []) {
-      const elevation = Number(feature.properties?.elevation || 0);
-
       for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
         appendDxfPathAsLineEntities(
           state,
@@ -14949,7 +14942,7 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
           lineString.map((point) => localMetersFromLngLat(point, center)),
           {
             closed: false,
-            elevation,
+            elevation: FLAT_EXPORT_CURVE_ELEVATION,
           }
         );
       }
@@ -14977,14 +14970,6 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
       const roadSurfaceGroups = buildRoadContourSurfaceGroups(siteContext, center);
 
       for (const group of roadSurfaceGroups) {
-        const topElevation = Number(
-          (
-            group.elevation +
-            ROAD_SURFACE_OFFSET_METERS +
-            ROAD_SURFACE_THICKNESS_METERS
-          ).toFixed(3)
-        );
-
         for (const region of group.regions) {
           appendDxfPathAsLineEntities(
             state,
@@ -14993,7 +14978,7 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
             region.outerPoints,
             {
               closed: true,
-              elevation: topElevation,
+              elevation: FLAT_EXPORT_CURVE_ELEVATION,
             }
           );
 
@@ -15005,7 +14990,7 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
               holePoints,
               {
                 closed: true,
-                elevation: topElevation,
+                elevation: FLAT_EXPORT_CURVE_ELEVATION,
               }
             );
           }
@@ -15138,7 +15123,13 @@ function createRhinoContourDisplayCurve(rhino, points) {
     return null;
   }
 
-  const normalizedPoints = dedupePolylinePoints(points).filter(
+  const normalizedPoints = dedupePolylinePoints(
+    points.map((point) =>
+      Array.isArray(point) && point.length >= 2
+        ? [Number(point[0]), Number(point[1]), FLAT_EXPORT_CURVE_ELEVATION]
+        : point
+    )
+  ).filter(
     (point) =>
       Array.isArray(point) &&
       point.length >= 3 &&
@@ -16050,14 +16041,7 @@ function addRhinoRoadCenterlines(doc, rhino, layerIndex, siteContext, center, se
       }
 
       const points = path.map(([xMeters, yMeters]) => {
-        return [
-          xMeters,
-          yMeters,
-          siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) +
-            ROAD_SURFACE_OFFSET_METERS +
-            ROAD_SURFACE_THICKNESS_METERS +
-            0.02,
-        ];
+        return [xMeters, yMeters, FLAT_EXPORT_CURVE_ELEVATION];
       });
 
       doc.objects().add(
@@ -16330,8 +16314,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
         ? targetParcelFeatures
         : [siteContext.parcelBoundary].filter(Boolean),
       center,
-      (_point, xMeters, yMeters) =>
-        siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.15,
+      () => FLAT_EXPORT_CURVE_ELEVATION,
       {
         objectNamePrefix: "PARCEL_BOUNDARY",
         groupIndicesResolver: (feature) =>
@@ -16349,8 +16332,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
         parcelContextLayer,
         siteContext.parcelContext.features,
         center,
-        (_point, xMeters, yMeters) =>
-          siteHeightAtLocalPoint(siteContext, xMeters, yMeters, seed) + 0.12
+        () => FLAT_EXPORT_CURVE_ELEVATION
       );
     }
   }

@@ -72,6 +72,42 @@ function countDxfLineEntities(text) {
   return (String(text || "").match(/\r?\n0\r?\nLINE\r?\n/g) || []).length;
 }
 
+function collectDxfLineElevations(text) {
+  const values = String(text || "").trim().split(/\r?\n/);
+  const elevations = [];
+
+  for (let index = 0; index < values.length - 1; ) {
+    const code = values[index];
+    const value = values[index + 1];
+
+    if (code === "0" && value === "LINE") {
+      let startZ = 0;
+      let endZ = 0;
+      index += 2;
+
+      while (index < values.length - 1 && values[index] !== "0") {
+        const entityCode = values[index];
+        const entityValue = values[index + 1];
+
+        if (entityCode === "30") {
+          startZ = Number(entityValue);
+        } else if (entityCode === "31") {
+          endZ = Number(entityValue);
+        }
+
+        index += 2;
+      }
+
+      elevations.push(startZ, endZ);
+      continue;
+    }
+
+    index += 2;
+  }
+
+  return elevations.filter(Number.isFinite);
+}
+
 function summarizeGeometryTypes(features) {
   return [...new Set((features || []).map((feature) => feature?.geometry?.type).filter(Boolean))];
 }
@@ -130,12 +166,21 @@ async function verifyCase(baseUrl, testCase) {
     },
   });
   const dxfLineCount = countDxfLineEntities(dxfText);
+  const dxfElevations = collectDxfLineElevations(dxfText);
+  const dxfMaxAbsZ = dxfElevations.reduce(
+    (max, value) => Math.max(max, Math.abs(Number(value || 0))),
+    0
+  );
 
   assert.ok(dxfLineCount > 0, `${testCase.name}: DXF should contain LINE entities.`);
   assert.match(
     dxfText,
     /BUILDINGS|TARGET_BUILDING|ROADS/,
     `${testCase.name}: DXF should contain core layer names.`
+  );
+  assert.ok(
+    dxfMaxAbsZ <= 0.001,
+    `${testCase.name}: DXF linework should stay flattened at z=0, received max |z| ${dxfMaxAbsZ}.`
   );
 
   return {
@@ -147,6 +192,7 @@ async function verifyCase(baseUrl, testCase) {
     buildingGeometryTypes,
     roadGeometryTypes,
     dxfLineCount,
+    dxfMaxAbsZ: Number(dxfMaxAbsZ.toFixed(6)),
   };
 }
 

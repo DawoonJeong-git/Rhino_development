@@ -12,6 +12,7 @@ import {
   buildObjFromSiteContext,
   buildSkpFromSiteContextWithRetry,
   fetchWithTimeout,
+  getRhino3dm,
   isPathInsideDirectory,
   normalizePublicError,
   normalizeSearchResultsForQuery,
@@ -184,6 +185,64 @@ function summarizeExportContext(siteContext, format) {
   };
 }
 
+async function summarize3dmCurveHeights(threeDmBytes) {
+  const rhino = await getRhino3dm();
+  const doc = rhino.File3dm.fromByteArray(threeDmBytes);
+  const objects = doc.objects();
+  let curveCount = 0;
+  let maxAbsZ = 0;
+
+  for (let index = 0; index < objects.count; index += 1) {
+    const geometry = objects.get(index)?.geometry?.();
+
+    if (!(geometry instanceof rhino.Curve)) {
+      continue;
+    }
+
+    curveCount += 1;
+    const pointCount = Number(geometry.pointCount || 0);
+
+    for (let pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
+      const point = geometry.point(pointIndex);
+
+      if (Array.isArray(point) && Number.isFinite(point[2])) {
+        maxAbsZ = Math.max(maxAbsZ, Math.abs(Number(point[2] || 0)));
+      }
+    }
+  }
+
+  return {
+    curveCount,
+    maxAbsZ: Number(maxAbsZ.toFixed(6)),
+  };
+}
+
+function summarizeSketchUpCurveHeights(skpPayload) {
+  let curvePolylineCount = 0;
+  let maxAbsZ = 0;
+
+  for (const group of skpPayload?.groups || []) {
+    for (const polyline of group?.polylines || []) {
+      if (polyline?.curve !== true) {
+        continue;
+      }
+
+      curvePolylineCount += 1;
+
+      for (const point of polyline?.points || []) {
+        if (Array.isArray(point) && Number.isFinite(point[2])) {
+          maxAbsZ = Math.max(maxAbsZ, Math.abs(Number(point[2] || 0)));
+        }
+      }
+    }
+  }
+
+  return {
+    curvePolylineCount,
+    maxAbsZ: Number(maxAbsZ.toFixed(6)),
+  };
+}
+
 function collectFormatFailures(testCase, result) {
   const failures = [];
   const { expect } = testCase;
@@ -206,6 +265,16 @@ function collectFormatFailures(testCase, result) {
     );
   }
 
+  if (result.formats["3dm"].curveCount <= 0) {
+    failures.push(`${testCase.name}/3dm: no curve objects were found in the exported file`);
+  }
+
+  if (result.formats["3dm"].curveMaxAbsZ > 0.001) {
+    failures.push(
+      `${testCase.name}/3dm: curve max |z| ${result.formats["3dm"].curveMaxAbsZ} should stay at 0`
+    );
+  }
+
   if (result.formats.skp.groups < expect.minSkpGroups) {
     failures.push(
       `${testCase.name}/skp: groups ${result.formats.skp.groups} below ${expect.minSkpGroups}`
@@ -220,6 +289,12 @@ function collectFormatFailures(testCase, result) {
 
   if (FULL_SKP_EXPORT && result.formats.skp.bytes < 100_000) {
     failures.push(`${testCase.name}/skp: full export bytes ${result.formats.skp.bytes} look too small`);
+  }
+
+  if (result.formats.skp.curvePolylineMaxAbsZ > 0.001) {
+    failures.push(
+      `${testCase.name}/skp: curve polyline max |z| ${result.formats.skp.curvePolylineMaxAbsZ} should stay at 0`
+    );
   }
 
   return failures;
@@ -241,15 +316,11 @@ async function verifyCase(testCase) {
   const threeDmBytes = await build3dmFromSiteContext(threeDm.exportSiteContext);
   const skpPayload = buildSketchUpPayloadFromSiteContext(skp.exportSiteContext);
   const objText = buildObjFromSiteContext(obj.exportSiteContext);
+  const threeDmCurveSummary = await summarize3dmCurveHeights(threeDmBytes);
+  const skpCurveSummary = summarizeSketchUpCurveHeights(skpPayload);
   const skpBytes = FULL_SKP_EXPORT
     ? (await buildSkpFromSiteContextWithRetry(skp.exportSiteContext)).length
     : 0;
-  const skpCurvePolylineCount = (skpPayload.groups || []).reduce(
-    (sum, group) =>
-      sum +
-      (group?.polylines || []).filter((polyline) => polyline?.curve === true).length,
-    0
-  );
 
   const result = {
     name: testCase.name,
@@ -265,6 +336,8 @@ async function verifyCase(testCase) {
         effective: threeDm.effective,
         contourCount: threeDm.contourCount,
         bytes: threeDmBytes.length,
+        curveCount: threeDmCurveSummary.curveCount,
+        curveMaxAbsZ: threeDmCurveSummary.maxAbsZ,
       },
       skp: {
         requested: skp.requested,
@@ -274,7 +347,8 @@ async function verifyCase(testCase) {
         groups: skpPayload.groups?.length || 0,
         terrainStep: skp.exportSiteContext?.terrainGrid?.step || null,
         refinedTerrainGrid: skp.exportSiteContext?.stats?.skpTerrainGridRefined === true,
-        curvePolylines: skpCurvePolylineCount,
+        curvePolylines: skpCurveSummary.curvePolylineCount,
+        curvePolylineMaxAbsZ: skpCurveSummary.maxAbsZ,
         bytes: skpBytes,
       },
       obj: {
