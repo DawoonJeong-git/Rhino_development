@@ -13,7 +13,7 @@ const CASES = [
     name: "seoul-hillside",
     location: { lat: 37.57705, lng: 126.962095 },
     options: {
-      radiusMeters: 100,
+      radius: 100,
       includeBuildings: true,
       includeParcelBoundary: true,
       includeContours: true,
@@ -27,7 +27,7 @@ const CASES = [
     name: "gyeyang-large",
     location: { lat: 37.545659, lng: 126.716062 },
     options: {
-      radiusMeters: 400,
+      radius: 400,
       includeBuildings: true,
       includeParcelBoundary: true,
       includeContours: true,

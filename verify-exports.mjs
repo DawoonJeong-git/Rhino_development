@@ -45,25 +45,25 @@ const CASES = [
   {
     name: "seoul-hillside",
     location: { lat: 37.57705, lng: 126.962095 },
-    options: { radiusMeters: 100 },
+    options: { radius: 100 },
     expect: { maxEffective: 5, min3dmBytes: 500_000, minSkpGroups: 5, minObjLength: 100_000 },
   },
   {
     name: "gyeyang-large",
     location: { lat: 37.545659, lng: 126.716062 },
-    options: { radiusMeters: 400 },
+    options: { radius: 400 },
     expect: { maxEffective: 5, min3dmBytes: 500_000, minSkpGroups: 5, minObjLength: 100_000 },
   },
   {
     name: "seoul-center",
     location: { lat: 37.571991, lng: 126.980074 },
-    options: { radiusMeters: 100 },
+    options: { radius: 100 },
     expect: { maxEffective: 5, min3dmBytes: 100_000, minSkpGroups: 1, minObjLength: 10_000 },
   },
   {
     name: "chungnam-rural",
     location: { lat: 36.427297, lng: 126.780739 },
-    options: { radiusMeters: 150 },
+    options: { radius: 150 },
     expect: { maxEffective: 5, min3dmBytes: 100_000, minSkpGroups: 1, minObjLength: 50_000 },
   },
 ].filter((testCase) => CASE_FILTER.size === 0 || CASE_FILTER.has(testCase.name));
@@ -291,6 +291,21 @@ function collectFormatFailures(testCase, result) {
     failures.push(`${testCase.name}/skp: full export bytes ${result.formats.skp.bytes} look too small`);
   }
 
+  if (FULL_SKP_EXPORT) {
+    const firstSkpAttempt = result.formats.skp.attemptIntervals?.[0];
+
+    if (!firstSkpAttempt || !(firstSkpAttempt.effective > 0)) {
+      failures.push(`${testCase.name}/skp: missing first-attempt contour interval telemetry`);
+    } else if (
+      Math.abs(Number(firstSkpAttempt.effective || 0) - Number(result.formats.skp.effective || 0)) >
+      0.001
+    ) {
+      failures.push(
+        `${testCase.name}/skp: first attempt effective contour interval ${firstSkpAttempt.effective} diverged from prepared ${result.formats.skp.effective}`
+      );
+    }
+  }
+
   if (result.formats.skp.curvePolylineMaxAbsZ > 0.001) {
     failures.push(
       `${testCase.name}/skp: curve polyline max |z| ${result.formats.skp.curvePolylineMaxAbsZ} should stay at 0`
@@ -318,8 +333,29 @@ async function verifyCase(testCase) {
   const objText = buildObjFromSiteContext(obj.exportSiteContext);
   const threeDmCurveSummary = await summarize3dmCurveHeights(threeDmBytes);
   const skpCurveSummary = summarizeSketchUpCurveHeights(skpPayload);
+  const skpAttemptIntervals = [];
   const skpBytes = FULL_SKP_EXPORT
-    ? (await buildSkpFromSiteContextWithRetry(skp.exportSiteContext)).length
+    ? (await buildSkpFromSiteContextWithRetry(
+        skp.exportSiteContext,
+        null,
+        {
+          onAttemptPrepared: (attemptSiteContext, meta = {}) => {
+            skpAttemptIntervals.push({
+              attempt: Number(meta.attemptIndex || 0),
+              requested: Number(
+                attemptSiteContext?.stats?.requestedContourInterval ||
+                  attemptSiteContext?.options?.contourInterval ||
+                  0
+              ),
+              effective: Number(
+                attemptSiteContext?.stats?.effectiveContourBandInterval ||
+                  attemptSiteContext?.options?.contourInterval ||
+                  0
+              ),
+            });
+          },
+        }
+      )).length
     : 0;
 
   const result = {
@@ -350,6 +386,7 @@ async function verifyCase(testCase) {
         curvePolylines: skpCurveSummary.curvePolylineCount,
         curvePolylineMaxAbsZ: skpCurveSummary.maxAbsZ,
         bytes: skpBytes,
+        attemptIntervals: skpAttemptIntervals,
       },
       obj: {
         requested: obj.requested,

@@ -374,12 +374,15 @@ function hasOfficialContourDisplaySource(siteContext) {
 }
 
 function shouldRefineSketchUpTerrainGrid(siteContext) {
+  const radiusMeters = Math.max(30, Number(siteContext?.options?.radius) || 120);
+
   return Boolean(
     isSketchUpExportFormat(siteContext) &&
       siteContext?.options?.terrainMode === "contour" &&
       siteContext?.terrainGrid?.elevations?.length &&
       siteContext?.clipBoundary &&
-      hasOfficialContourDisplaySource(siteContext)
+      hasOfficialContourDisplaySource(siteContext) &&
+      radiusMeters <= 220
   );
 }
 
@@ -13815,6 +13818,10 @@ async function buildSkpFromSiteContextWithRetry(
   const runtimeConfig = resolveSkpExportRuntimeConfig(exportConfig);
   const standaloneExporterPath = await findStandaloneSkpExporterPath(runtimeConfig);
   const sketchUpExecutable = await findSketchUpExecutablePath(runtimeConfig);
+  const attemptObserver =
+    typeof exportConfig?.onAttemptPrepared === "function"
+      ? exportConfig.onAttemptPrepared
+      : null;
   const resolvedEngine =
     runtimeConfig.engine === "auto"
       ? standaloneExporterPath
@@ -13834,37 +13841,16 @@ async function buildSkpFromSiteContextWithRetry(
   let attemptIndex = 0;
   let lastError = null;
 
-  if (resolvedEngine === "sketchup-desktop") {
-    const sourceInterval = normalizeContourInterval(
-      resolveSourceContourInterval(siteContext)
-    );
-    const safeDesktopInterval = Math.max(currentInterval, sourceInterval);
-
-    if (safeDesktopInterval > currentInterval + 1e-9) {
-      currentSiteContext = prepareSiteContextForExport(
-        siteContext,
-        {
-          ...baseOptions,
-          contourInterval: safeDesktopInterval,
-        },
-        "skp"
-      );
-      currentInterval = normalizeContourInterval(
-        currentSiteContext?.stats?.effectiveContourBandInterval ||
-          safeDesktopInterval
-      );
-      console.warn(
-        `[skp-export] desktop-safe-start requested=${normalizeContourInterval(
-          baseOptions.contourInterval
-        )} source=${sourceInterval} effective=${currentInterval}`
-      );
-    }
-  }
-
   while (attemptIndex < 4) {
     attemptIndex += 1;
 
     try {
+      attemptObserver?.(currentSiteContext, {
+        attemptIndex,
+        engine: resolvedEngine,
+        interval: currentInterval,
+      });
+
       if (attemptIndex > 1) {
         progress(
           Math.min(88, 48 + attemptIndex * 8),
