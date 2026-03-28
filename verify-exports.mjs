@@ -875,6 +875,46 @@ async function runBaselineVerification() {
       5,
       "Manual range clip boundary should preserve the rectangle ring."
     );
+    const oversizedManualRangeResponse = await fetch(`${baseUrl}/api/site-context`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        location: {
+          lat: 37.567664,
+          lng: 126.965384,
+          selectionMode: "range",
+          customBounds: {
+            minLat: 37.558664,
+            maxLat: 37.576664,
+            minLng: 126.951384,
+            maxLng: 126.979384,
+          },
+        },
+        customBounds: {
+          minLat: 37.558664,
+          maxLat: 37.576664,
+          minLng: 126.951384,
+          maxLng: 126.979384,
+        },
+        options: {
+          radius: 1000,
+          includeBuildings: false,
+        },
+      }),
+    });
+    assert.equal(
+      oversizedManualRangeResponse.status,
+      400,
+      "Oversized manual range requests should be rejected before live data loading."
+    );
+    const oversizedManualRangePayload = await readJson(oversizedManualRangeResponse);
+    assert.match(
+      String(oversizedManualRangePayload.error || ""),
+      /吏곸젒 吏??踰붿쐞|가로|세로/,
+      "Manual range rejection should mention the direct range size limit."
+    );
 
     const mergedRoadSurfaces = buildRoadSurfaceFeatureCollection(
       [
@@ -1306,6 +1346,7 @@ async function runBaselineVerification() {
             "multi-parcel-preview",
             "multi-parcel-custom-groups",
             "manual-range-clip-boundary",
+            "manual-range-size-limit",
             "road-surface-merge",
             "search-ranking-tokens",
             "skp-terrain-refine",

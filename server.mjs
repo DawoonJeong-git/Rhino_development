@@ -59,7 +59,7 @@ const LONG_OUTBOUND_FETCH_TIMEOUT_MS = 25_000;
 const OVERPASS_FETCH_TIMEOUT_MS = 35_000;
 const DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS = 1000 * 60 * 8;
 const DEFAULT_MAX_SITE_RADIUS_METERS = 1000;
-const DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS = 1500;
+const DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS = DEFAULT_MAX_SITE_RADIUS_METERS * 2;
 const DEFAULT_MAX_CONCURRENT_EXPORT_JOBS = 2;
 const DEFAULT_CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
@@ -1011,6 +1011,17 @@ function getSiteContextGeometrySignature(siteContext) {
 }
 
 function buildRuntimeConfig(localConfig) {
+  const maxSiteRadiusMeters = resolvePositiveInteger(
+    process.env.MAX_SITE_RADIUS_METERS ||
+      localConfig.MAX_SITE_RADIUS_METERS ||
+      DEFAULT_MAX_SITE_RADIUS_METERS,
+    DEFAULT_MAX_SITE_RADIUS_METERS
+  );
+  const maxManualRangeSideFallback = Math.max(
+    DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS,
+    maxSiteRadiusMeters * 2
+  );
+
   return {
     port: Number(process.env.PORT || localConfig.PORT || 3000),
     bindHost:
@@ -1074,17 +1085,12 @@ function buildRuntimeConfig(localConfig) {
         DEFAULT_MAX_EXPORT_REQUEST_BODY_BYTES,
       DEFAULT_MAX_EXPORT_REQUEST_BODY_BYTES
     ),
-    maxSiteRadiusMeters: resolvePositiveInteger(
-      process.env.MAX_SITE_RADIUS_METERS ||
-        localConfig.MAX_SITE_RADIUS_METERS ||
-        DEFAULT_MAX_SITE_RADIUS_METERS,
-      DEFAULT_MAX_SITE_RADIUS_METERS
-    ),
+    maxSiteRadiusMeters,
     maxManualRangeSideMeters: resolvePositiveInteger(
       process.env.MAX_MANUAL_RANGE_SIDE_METERS ||
         localConfig.MAX_MANUAL_RANGE_SIDE_METERS ||
-        DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS,
-      DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS
+        maxManualRangeSideFallback,
+      maxManualRangeSideFallback
     ),
     maxConcurrentExportJobs: resolvePositiveInteger(
       process.env.MAX_CONCURRENT_EXPORT_JOBS ||
