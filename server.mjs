@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { createHash } from "node:crypto";
 import {
   mkdtemp,
   open,
@@ -104,6 +105,7 @@ const contourRenderableBandGroupCache = new WeakMap();
 const contourTopSurfaceCache = new WeakMap();
 const roadFootprintMultiPolygonCache = new WeakMap();
 const roadContourSurfaceGroupCache = new WeakMap();
+const siteContextGeometrySignatureCache = new WeakMap();
 let rhino3dmInstancePromise = null;
 let activeExportJobs = 0;
 const exportJobWaitQueue = [];
@@ -841,6 +843,171 @@ function isSiteContextCompatibleForExport(
   }
 
   return true;
+}
+
+function normalizeHashNumber(value, digits = 8) {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue)) {
+    return null;
+  }
+
+  return Number(numericValue.toFixed(digits));
+}
+
+function normalizeHashValue(value, digits = 8) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeHashValue(entry, digits));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.keys(value)
+      .sort()
+      .reduce((result, key) => {
+        const normalizedValue = normalizeHashValue(value[key], digits);
+
+        if (normalizedValue !== undefined) {
+          result[key] = normalizedValue;
+        }
+
+        return result;
+      }, {});
+  }
+
+  if (typeof value === "number") {
+    return normalizeHashNumber(value, digits);
+  }
+
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return value;
+}
+
+function buildFeatureHashSnapshot(feature, propertyKeys = [], digits = 8) {
+  if (!feature || typeof feature !== "object") {
+    return null;
+  }
+
+  const pickedProperties =
+    Array.isArray(propertyKeys) && propertyKeys.length > 0
+      ? propertyKeys.reduce((result, key) => {
+          result[key] = feature?.properties?.[key] ?? null;
+          return result;
+        }, {})
+      : null;
+
+  return normalizeHashValue(
+    {
+      id: feature.id ?? null,
+      geometry: feature.geometry ?? null,
+      properties: pickedProperties,
+    },
+    digits
+  );
+}
+
+function buildFeatureCollectionHashSnapshot(collection, propertyKeys = [], digits = 8) {
+  return {
+    features: (collection?.features || []).map((feature) =>
+      buildFeatureHashSnapshot(feature, propertyKeys, digits)
+    ),
+  };
+}
+
+function buildSiteContextGeometryHashInput(siteContext) {
+  return {
+    selectionMode: String(siteContext?.selectionMode || ""),
+    location: normalizeHashValue(
+      {
+        customBounds: normalizeCustomBounds(siteContext?.location?.customBounds),
+        selectedParcels: normalizeSelectedParcelFeatures(
+          siteContext?.location?.selectedParcels || []
+        ).map((feature, index) => ({
+          key: buildParcelSelectionKey(feature, index),
+          groupIndex: Number(feature?.properties?.groupIndex || index + 1),
+          groupName: resolveParcelGroupName(feature, index),
+          groupLabel: buildParcelGroupLabel(feature, index),
+        })),
+      },
+      8
+    ),
+    clipBoundary: buildFeatureHashSnapshot(
+      siteContext?.clipBoundary,
+      ["sourceLayer"],
+      8
+    ),
+    parcelBoundary: buildFeatureHashSnapshot(
+      siteContext?.parcelBoundary,
+      ["groupIndex", "groupName", "groupLabel", "isTarget", "sourceLayer"],
+      8
+    ),
+    targetParcelGroups: buildFeatureCollectionHashSnapshot(
+      siteContext?.targetParcelGroups,
+      ["groupIndex", "groupName", "groupLabel", "isTarget", "sourceLayer"],
+      8
+    ),
+    parcelContext: buildFeatureCollectionHashSnapshot(
+      siteContext?.parcelContext,
+      ["groupIndex", "groupName", "groupLabel", "isTarget", "sourceLayer"],
+      8
+    ),
+    contourLines: buildFeatureCollectionHashSnapshot(
+      siteContext?.contourLines,
+      ["elevation", "provider", "sourceLayer"],
+      8
+    ),
+    buildings: buildFeatureCollectionHashSnapshot(
+      siteContext?.buildings,
+      [
+        "buildingId",
+        "buildingName",
+        "roadAddress",
+        "heightMeters",
+        "aboveGroundFloors",
+        "belowGroundFloors",
+        "isTarget",
+        "sourceLayer",
+      ],
+      8
+    ),
+    roads: buildFeatureCollectionHashSnapshot(
+      siteContext?.roads,
+      ["roadId", "roadName", "widthMeters", "isTarget", "sourceLayer"],
+      8
+    ),
+    terrainGrid: normalizeHashValue(
+      siteContext?.terrainGrid
+        ? {
+            step: siteContext.terrainGrid.step,
+            xValues: siteContext.terrainGrid.xValues,
+            yValues: siteContext.terrainGrid.yValues,
+            elevations: siteContext.terrainGrid.elevations,
+            minElevation: siteContext.terrainGrid.minElevation,
+            maxElevation: siteContext.terrainGrid.maxElevation,
+          }
+        : null,
+      3
+    ),
+  };
+}
+
+function getSiteContextGeometrySignature(siteContext) {
+  if (!siteContext || typeof siteContext !== "object") {
+    return "none";
+  }
+
+  if (siteContextGeometrySignatureCache.has(siteContext)) {
+    return siteContextGeometrySignatureCache.get(siteContext);
+  }
+
+  const signature = createHash("sha1")
+    .update(JSON.stringify(buildSiteContextGeometryHashInput(siteContext)))
+    .digest("hex");
+
+  siteContextGeometrySignatureCache.set(siteContext, signature);
+  return signature;
 }
 
 function buildRuntimeConfig(localConfig) {
@@ -16624,13 +16791,14 @@ function buildExportArtifactCacheKey(siteContext, format) {
   };
 
   return JSON.stringify({
-    version: 2,
+    version: 3,
     format: normalizedFormat,
     request: buildSiteContextCacheKey(
       siteContext?.location || {},
       exportOptions,
       siteContext?.location?.customBounds || null
     ),
+    geometrySignature: getSiteContextGeometrySignature(siteContext),
     stats: {
       targetParcelCount: Number(siteContext?.stats?.targetParcelCount || 0),
       contourCount: Number(
@@ -17285,24 +17453,48 @@ async function createApp() {
             maxBytes: config.maxExportRequestBodyBytes,
           });
           await withExportJobSlot(config, async () => {
-            let siteContext = body.siteContext || null;
-            const requestedOptions = body.options || {};
-            const requestedLocation = body.location || siteContext?.location || {};
+            const clientSuppliedSiteContext = body.siteContext || null;
+            const requestedOptions =
+              body.options || clientSuppliedSiteContext?.options || {};
+            const requestedLocation =
+              body.location || clientSuppliedSiteContext?.location || {};
             const format =
               requestUrl.pathname === "/api/export-obj"
                 ? "obj"
                 : isSkpPayloadRoute
                   ? "skp-payload"
-                  : normalizeExportFormat(body.options?.exportFormat);
+                  : normalizeExportFormat(requestedOptions?.exportFormat);
+            updateRequestProgress(progressToken, {
+              percent: 8,
+              message: "?대낫???吏 而⑦뀓?ㅽ듃瑜?怨꾩궛?섎뒗 以묒엯?덈떎.",
+            });
 
-          if (
+            if (clientSuppliedSiteContext) {
+              console.log(
+                `[export] ignoring client-supplied siteContext format=${format} requestedRoads=${
+                  requestedOptions.includeRoads === true
+                }`
+              );
+            }
+
+            let siteContext = await buildSiteContext(
+              {
+                ...body,
+                location: requestedLocation,
+                options: requestedOptions,
+              },
+              config,
+              createRangedProgressReporter(progressToken, 8, 44)
+            );
+
+          if (false && (
             !siteContext ||
             !isSiteContextCompatibleForExport(
               siteContext,
               requestedLocation,
               requestedOptions
             )
-          ) {
+          )) {
             updateRequestProgress(progressToken, {
               percent: 8,
               message: "내보낼 대지 컨텍스트를 계산하는 중입니다.",
@@ -17667,6 +17859,7 @@ export {
   buildCumulativeContourBandGroups,
   buildContourBandGroups,
   buildDxfFromSiteContext,
+  buildExportArtifactCacheKey,
   buildObjFromSiteContext,
   buildRoadSurfaceFeatureCollection,
   buildSketchUpPayloadFromSiteContext,

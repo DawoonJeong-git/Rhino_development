@@ -3,6 +3,7 @@ import { createServer as createHttpServer } from "node:http";
 import path from "node:path";
 import process from "node:process";
 import {
+  buildExportArtifactCacheKey,
   createApp,
   prepareSiteContextForExport,
   build3dmFromSiteContext,
@@ -164,6 +165,10 @@ async function fetchJson(pathname, payload = null, retryCount = 0) {
 
     throw error;
   }
+}
+
+function cloneJsonValue(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
 function summarizeExportContext(siteContext, format) {
@@ -1142,24 +1147,77 @@ async function runBaselineVerification() {
       syntheticContourSiteContext.contourLines,
       "DXF export should preserve official contour geometries instead of regenerating grid contours."
     );
+    const serverOwnedSiteContext = await fetchJson("/api/site-context", {
+      location: syntheticContourSiteContext.location,
+      options: syntheticContourSiteContext.options,
+    });
+    const serverOwnedPayloadSiteContext = prepareSiteContextForExport(
+      serverOwnedSiteContext,
+      {
+        ...serverOwnedSiteContext.options,
+        exportFormat: "skp-payload",
+      },
+      "skp-payload"
+    );
+    const maliciousSiteContext = cloneJsonValue(serverOwnedSiteContext);
+
+    if (maliciousSiteContext?.contourLines?.features?.[0]?.geometry?.coordinates?.[0]) {
+      maliciousSiteContext.contourLines.features[0].geometry.coordinates[0][0] += 0.01;
+      maliciousSiteContext.contourLines.features[0].geometry.coordinates[1][0] += 0.01;
+    }
+
+    const maliciousPayloadSiteContext = prepareSiteContextForExport(
+      maliciousSiteContext,
+      {
+        ...maliciousSiteContext.options,
+        exportFormat: "skp-payload",
+      },
+      "skp-payload"
+    );
+    assert.notEqual(
+      buildExportArtifactCacheKey(serverOwnedPayloadSiteContext, "skp-payload"),
+      buildExportArtifactCacheKey(maliciousPayloadSiteContext, "skp-payload"),
+      "Export cache keys should change when geometry changes even if request counts stay the same."
+    );
 
     const exportCacheRequestBody = {
-      location: syntheticContourSiteContext.location,
-      siteContext: syntheticContourSiteContext,
+      location: serverOwnedSiteContext.location,
+      siteContext: serverOwnedSiteContext,
       options: {
-        ...syntheticContourSiteContext.options,
+        ...serverOwnedSiteContext.options,
+        buildingPlacement: "embed-lowest",
         exportFormat: "skp-payload",
       },
     };
+    const maliciousExportResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        location: serverOwnedSiteContext.location,
+        siteContext: maliciousSiteContext,
+        options: {
+          ...serverOwnedSiteContext.options,
+          exportFormat: "skp-payload",
+        },
+      }),
+    });
+    const maliciousExportPayload = await readJson(maliciousExportResponse);
+    assert.equal(
+      maliciousExportResponse.status,
+      200,
+      "Export payload request with a fake client siteContext should still respond."
+    );
     const exportWithoutSiteContextResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        location: syntheticContourSiteContext.location,
+        location: serverOwnedSiteContext.location,
         options: {
-          ...syntheticContourSiteContext.options,
+          ...serverOwnedSiteContext.options,
           exportFormat: "skp-payload",
         },
       }),
@@ -1173,6 +1231,11 @@ async function runBaselineVerification() {
     assert.ok(
       Array.isArray(exportWithoutSiteContextPayload?.payload?.groups),
       "Export payload request without a client siteContext should still return payload groups."
+    );
+    assert.deepEqual(
+      maliciousExportPayload?.payload?.groups,
+      exportWithoutSiteContextPayload?.payload?.groups,
+      "Export payload generation should ignore client-supplied siteContext geometry and use the server-owned context."
     );
 
     const firstExportCacheResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
@@ -1247,6 +1310,8 @@ async function runBaselineVerification() {
             "search-ranking-tokens",
             "skp-terrain-refine",
             "skp-contour-curves",
+            "export-cache-key-geometry",
+            "export-ignores-client-site-context",
             "export-without-site-context",
             "export-cache-hit",
           ],
