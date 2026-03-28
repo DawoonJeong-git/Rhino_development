@@ -1151,6 +1151,30 @@ async function runBaselineVerification() {
         exportFormat: "skp-payload",
       },
     };
+    const exportWithoutSiteContextResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        location: syntheticContourSiteContext.location,
+        options: {
+          ...syntheticContourSiteContext.options,
+          exportFormat: "skp-payload",
+        },
+      }),
+    });
+    const exportWithoutSiteContextPayload = await readJson(exportWithoutSiteContextResponse);
+    assert.equal(
+      exportWithoutSiteContextResponse.status,
+      200,
+      "Export payload request without a client siteContext should respond."
+    );
+    assert.ok(
+      Array.isArray(exportWithoutSiteContextPayload?.payload?.groups),
+      "Export payload request without a client siteContext should still return payload groups."
+    );
+
     const firstExportCacheResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
       method: "POST",
       headers: {
@@ -1223,6 +1247,7 @@ async function runBaselineVerification() {
             "search-ranking-tokens",
             "skp-terrain-refine",
             "skp-contour-curves",
+            "export-without-site-context",
             "export-cache-hit",
           ],
         },

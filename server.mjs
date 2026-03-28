@@ -56,7 +56,8 @@ const DEFAULT_BIND_HOST = "127.0.0.1";
 const DEFAULT_OUTBOUND_FETCH_TIMEOUT_MS = 15_000;
 const LONG_OUTBOUND_FETCH_TIMEOUT_MS = 25_000;
 const OVERPASS_FETCH_TIMEOUT_MS = 35_000;
-const DEFAULT_MAX_SITE_RADIUS_METERS = 600;
+const DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS = 1000 * 60 * 8;
+const DEFAULT_MAX_SITE_RADIUS_METERS = 1000;
 const DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS = 1500;
 const DEFAULT_MAX_CONCURRENT_EXPORT_JOBS = 2;
 const DEFAULT_CONTENT_SECURITY_POLICY = [
@@ -105,6 +106,7 @@ const roadFootprintMultiPolygonCache = new WeakMap();
 const roadContourSurfaceGroupCache = new WeakMap();
 let rhino3dmInstancePromise = null;
 let activeExportJobs = 0;
+const exportJobWaitQueue = [];
 
 proj4.defs(
   "EPSG:5179",
@@ -922,6 +924,12 @@ function buildRuntimeConfig(localConfig) {
         localConfig.MAX_CONCURRENT_EXPORT_JOBS ||
         DEFAULT_MAX_CONCURRENT_EXPORT_JOBS,
       DEFAULT_MAX_CONCURRENT_EXPORT_JOBS
+    ),
+    exportJobQueueTimeoutMs: resolvePositiveInteger(
+      process.env.EXPORT_JOB_QUEUE_TIMEOUT_MS ||
+        localConfig.EXPORT_JOB_QUEUE_TIMEOUT_MS ||
+        DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS,
+      DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS
     ),
     rateLimits: {
       api: {
@@ -3170,6 +3178,20 @@ function waitForRetryDelay(delayMs) {
   });
 }
 
+function resolveUpstreamRetryDelayMs(error, attempt, label = "upstream") {
+  const message = String(error?.message || error || "");
+  const normalizedLabel = String(label || "").trim().toLowerCase();
+
+  if (/429/i.test(message)) {
+    const isOverpass = normalizedLabel.includes("overpass");
+    const baseDelayMs = isOverpass ? 3000 : 1000;
+    const maxDelayMs = isOverpass ? 12000 : 5000;
+    return Math.min(maxDelayMs, baseDelayMs * Math.max(1, attempt));
+  }
+
+  return Math.min(1800, 300 * Math.max(1, attempt));
+}
+
 async function retryUpstreamOperation(operation, options = {}) {
   const attempts = Math.max(1, Number(options?.attempts) || 1);
   const label = String(options?.label || "upstream").trim();
@@ -3185,7 +3207,7 @@ async function retryUpstreamOperation(operation, options = {}) {
         throw error;
       }
 
-      const delayMs = Math.min(1800, 300 * attempt);
+      const delayMs = resolveUpstreamRetryDelayMs(error, attempt, label);
       console.warn(
         `[upstream-retry] label=${label} attempt=${attempt}/${attempts} delayMs=${delayMs} reason=${
           error instanceof Error ? error.message : error
@@ -4752,7 +4774,7 @@ out geom;`;
       return mapOverpassRoadCollection(payload);
     },
     {
-      attempts: 2,
+      attempts: 4,
       label: "overpass-roads",
     }
   );
@@ -4949,7 +4971,7 @@ out geom;`;
       return mapOverpassBuildingCollection(payload);
     },
     {
-      attempts: 2,
+      attempts: 4,
       label: "overpass-buildings",
     }
   );
@@ -14800,24 +14822,98 @@ function enforceRateLimit(request, response, config, bucket) {
   return true;
 }
 
-async function withExportJobSlot(config, work) {
+function releaseNextQueuedExportJob(maxConcurrentJobs) {
+  while (
+    activeExportJobs < maxConcurrentJobs &&
+    exportJobWaitQueue.length > 0
+  ) {
+    const queuedJob = exportJobWaitQueue.shift();
+
+    if (!queuedJob || queuedJob.released === true) {
+      continue;
+    }
+
+    queuedJob.released = true;
+    clearTimeout(queuedJob.timeoutHandle);
+    activeExportJobs += 1;
+    queuedJob.resolve();
+    return true;
+  }
+
+  return false;
+}
+
+async function withExportJobSlot(config, work, options = {}) {
   const maxConcurrentJobs = Math.max(
     1,
     Number(config?.maxConcurrentExportJobs) || DEFAULT_MAX_CONCURRENT_EXPORT_JOBS
   );
+  const queueTimeoutMs = Math.max(
+    1000,
+    Number(config?.exportJobQueueTimeoutMs) || DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS
+  );
+  let slotClaimed = false;
 
-  if (activeExportJobs >= maxConcurrentJobs) {
-    throw createHttpError(429, "다른 모델 내보내기가 진행 중입니다. 잠시 후 다시 시도해주세요.", {
-      "Retry-After": "15",
+  if (activeExportJobs < maxConcurrentJobs && exportJobWaitQueue.length === 0) {
+    activeExportJobs += 1;
+    slotClaimed = true;
+  } else {
+    const queuePosition = exportJobWaitQueue.length + 1;
+
+    if (typeof options?.onQueued === "function") {
+      options.onQueued({
+        position: queuePosition,
+        activeJobs: activeExportJobs,
+        maxConcurrentJobs,
+        queueTimeoutMs,
+      });
+    }
+
+    await new Promise((resolve, reject) => {
+      const queuedJob = {
+        released: false,
+        timeoutHandle: null,
+        resolve: () => {
+          slotClaimed = true;
+          resolve();
+        },
+        reject,
+      };
+
+      queuedJob.timeoutHandle = setTimeout(() => {
+        if (queuedJob.released) {
+          return;
+        }
+
+        queuedJob.released = true;
+        const index = exportJobWaitQueue.indexOf(queuedJob);
+
+        if (index !== -1) {
+          exportJobWaitQueue.splice(index, 1);
+        }
+
+        reject(
+          createHttpError(
+            429,
+            "모델 내보내기 대기열이 길어져 시간 내에 작업을 시작하지 못했습니다. 잠시 후 다시 시도해주세요.",
+            {
+              "Retry-After": "30",
+            }
+          )
+        );
+      }, queueTimeoutMs);
+
+      exportJobWaitQueue.push(queuedJob);
     });
   }
-
-  activeExportJobs += 1;
 
   try {
     return await work();
   } finally {
-    activeExportJobs = Math.max(0, activeExportJobs - 1);
+    if (slotClaimed) {
+      activeExportJobs = Math.max(0, activeExportJobs - 1);
+      releaseNextQueuedExportJob(maxConcurrentJobs);
+    }
   }
 }
 
@@ -17481,6 +17577,13 @@ async function createApp() {
               exportFilename,
               { "X-Export-Cache": "miss" }
             );
+          }, {
+            onQueued: ({ position }) => {
+              updateRequestProgress(progressToken, {
+                percent: 2,
+                message: `다른 모델 내보내기가 진행 중이라 대기 중입니다. (${position}번째)`,
+              });
+            },
           });
         } catch (error) {
           failRequestProgress(progressToken, error);

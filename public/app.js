@@ -4426,7 +4426,6 @@ async function downloadObj(format = collectModelOptions().exportFormat) {
         },
         body: JSON.stringify({
           location: state.selectedLocation,
-          siteContext: state.siteContext,
           options: currentOptions,
         }),
       },
