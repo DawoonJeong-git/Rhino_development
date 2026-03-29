@@ -46,6 +46,9 @@ const DEFAULT_TERRAIN_CONTOUR_CRS = "EPSG:5179";
 const DEFAULT_TERRAIN_CONTOUR_PATH = path.join(__dirname, "data", "contours");
 const RHINO6_FILE3DM_VERSION = 6;
 const REQUEST_PROGRESS_TTL_MS = 1000 * 60 * 20;
+const TELEMETRY_MAX_ENTRIES = 24;
+const SLOW_API_REQUEST_THRESHOLD_MS = 1500;
+const SLOW_OUTBOUND_FETCH_THRESHOLD_MS = 4000;
 const ROAD_SURFACE_OFFSET_METERS = 0.01;
 const ROAD_SURFACE_THICKNESS_METERS = 0.01;
 const FLAT_EXPORT_CURVE_ELEVATION = 0;
@@ -129,6 +132,8 @@ const sharedContourCumulativeBandGroupCache = new Map();
 const roadFootprintMultiPolygonCache = new WeakMap();
 const roadContourSurfaceGroupCache = new WeakMap();
 const siteContextGeometrySignatureCache = new WeakMap();
+const recentSlowApiRequestEvents = [];
+const recentUpstreamEvents = [];
 let rhino3dmInstancePromise = null;
 let activeExportJobs = 0;
 const exportJobWaitQueue = [];
@@ -166,6 +171,86 @@ function logServerError(context, error) {
   console.error(
     `[${new Date().toISOString()}] ${context}\n${formatErrorForLog(error)}`
   );
+}
+
+function truncateTelemetryText(value, maxLength = 220) {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+
+  if (!normalized) {
+    return "";
+  }
+
+  return normalized.length > maxLength
+    ? `${normalized.slice(0, Math.max(1, maxLength - 1))}…`
+    : normalized;
+}
+
+function pushTelemetryEvent(store, event, maxEntries = TELEMETRY_MAX_ENTRIES) {
+  if (!Array.isArray(store) || !event || typeof event !== "object") {
+    return;
+  }
+
+  store.push({
+    ...event,
+    occurredAt: event.occurredAt || new Date().toISOString(),
+  });
+
+  if (store.length > maxEntries) {
+    store.splice(0, store.length - maxEntries);
+  }
+}
+
+function recordSlowApiRequestTelemetry({ method, path, statusCode, durationMs }) {
+  const normalizedPath = String(path || "").trim();
+
+  if (
+    !normalizedPath.startsWith("/api/") ||
+    normalizedPath === "/api/request-progress" ||
+    normalizedPath === "/api/health" ||
+    normalizedPath === "/api/runtime-stats"
+  ) {
+    return;
+  }
+
+  const normalizedDurationMs = Math.max(0, Math.round(Number(durationMs) || 0));
+  const normalizedStatusCode = Number(statusCode) || 0;
+
+  if (
+    normalizedStatusCode < 400 &&
+    normalizedDurationMs < SLOW_API_REQUEST_THRESHOLD_MS
+  ) {
+    return;
+  }
+
+  pushTelemetryEvent(recentSlowApiRequestEvents, {
+    method: String(method || "GET").toUpperCase(),
+    path: normalizedPath,
+    statusCode: normalizedStatusCode,
+    durationMs: normalizedDurationMs,
+  });
+}
+
+function recordUpstreamTelemetry(event = {}) {
+  const normalizedDurationMs = Math.max(
+    0,
+    Math.round(Number(event?.durationMs) || 0)
+  );
+  const normalizedStatusCode = Number(event?.statusCode) || 0;
+  const outcome = String(event?.outcome || "ok").trim() || "ok";
+
+  if (outcome === "ok" && normalizedDurationMs < SLOW_OUTBOUND_FETCH_THRESHOLD_MS) {
+    return;
+  }
+
+  pushTelemetryEvent(recentUpstreamEvents, {
+    label: truncateTelemetryText(event?.label || "upstream"),
+    host: truncateTelemetryText(event?.host || ""),
+    outcome,
+    statusCode: normalizedStatusCode || null,
+    timeoutMs: Math.max(0, Math.round(Number(event?.timeoutMs) || 0)) || null,
+    durationMs: normalizedDurationMs,
+    error: truncateTelemetryText(event?.error || ""),
+  });
 }
 
 process.on("unhandledRejection", (reason) => {
@@ -15292,6 +15377,14 @@ async function fetchWithTimeout(resource, init = {}, options = {}) {
   const upstreamSignal = init?.signal;
   const abortController = new AbortController();
   let upstreamAbortHandler = null;
+  const startedAt = Date.now();
+  let upstreamHost = "";
+
+  try {
+    upstreamHost = new URL(String(resource || "")).host;
+  } catch {
+    upstreamHost = "";
+  }
 
   if (upstreamSignal && typeof upstreamSignal.addEventListener === "function") {
     if (upstreamSignal.aborted) {
@@ -15314,11 +15407,34 @@ async function fetchWithTimeout(resource, init = {}, options = {}) {
   timeoutHandle.unref?.();
 
   try {
-    return await fetch(resource, {
+    const response = await fetch(resource, {
       ...init,
       signal: abortController.signal,
     });
+    recordUpstreamTelemetry({
+      label: requestLabel,
+      host: upstreamHost,
+      outcome: response.ok ? "ok" : "http-error",
+      statusCode: response.status,
+      timeoutMs,
+      durationMs: Date.now() - startedAt,
+    });
+    return response;
   } catch (error) {
+    const message = String(error?.message || error || "");
+
+    recordUpstreamTelemetry({
+      label: requestLabel,
+      host: upstreamHost,
+      outcome:
+        abortController.signal.aborted && !upstreamSignal?.aborted
+          ? "timeout"
+          : "error",
+      timeoutMs,
+      durationMs: Date.now() - startedAt,
+      error: message,
+    });
+
     if (abortController.signal.aborted && !upstreamSignal?.aborted) {
       throw new Error(
         `${requestLabel} timed out after ${formatFetchTimeout(timeoutMs)}.`
@@ -15487,6 +15603,30 @@ function estimateExportJobDurationMs() {
     1000,
     Math.round(total / Math.max(1, recentExportDurationsMs.length))
   );
+}
+
+function buildRuntimeStatsPayload() {
+  return {
+    ok: true,
+    snapshotAt: new Date().toISOString(),
+    uptimeSeconds: Number(process.uptime().toFixed(1)),
+    exportJobs: {
+      active: activeExportJobs,
+      queued: exportJobWaitQueue.length,
+      estimatedDurationMs: estimateExportJobDurationMs(),
+    },
+    caches: {
+      geocodeEntries: geocodeCache.size,
+      openMeteoEntries: openMeteoElevationCache.size,
+      siteContextEntries: siteContextCache.size,
+      exportArtifactEntries: exportArtifactCache.size,
+      requestProgressEntries: requestProgressStore.size,
+    },
+    telemetry: {
+      recentSlowApiRequests: recentSlowApiRequestEvents.map((entry) => ({ ...entry })),
+      recentUpstreamEvents: recentUpstreamEvents.map((entry) => ({ ...entry })),
+    },
+  };
 }
 
 function incrementActiveExportJobCountForClient(clientIp) {
@@ -17793,6 +17933,16 @@ async function createApp() {
 
   const requestHandler = async (request, response) => {
     const requestUrl = new URL(request.url, `http://${request.headers.host}`);
+    const requestStartedAt = Date.now();
+
+    response.once("finish", () => {
+      recordSlowApiRequestTelemetry({
+        method: request.method,
+        path: requestUrl.pathname,
+        statusCode: response.statusCode,
+        durationMs: Date.now() - requestStartedAt,
+      });
+    });
 
     try {
       if (requestUrl.pathname === "/favicon.ico") {
@@ -17841,6 +17991,23 @@ async function createApp() {
           uptimeSeconds: Number(process.uptime().toFixed(1)),
           timestamp: new Date().toISOString(),
         });
+        return;
+      }
+
+      if (
+        requestUrl.pathname === "/api/runtime-stats" &&
+        request.method === "GET"
+      ) {
+        const clientIp = getClientIp(request);
+
+        if (!isLoopbackIp(clientIp)) {
+          sendJson(response, 403, {
+            error: "Runtime stats are only available from localhost.",
+          });
+          return;
+        }
+
+        sendJson(response, 200, buildRuntimeStatsPayload());
         return;
       }
 

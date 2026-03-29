@@ -479,6 +479,47 @@ async function runBaselineVerification() {
       ["ok", "timestamp", "uptimeSeconds"],
       "Health payload shape changed."
     );
+    const runtimeStatsResponse = await fetch(`${baseUrl}/api/runtime-stats`);
+    const runtimeStatsPayload = await readJson(runtimeStatsResponse);
+    assert.equal(
+      runtimeStatsResponse.status,
+      200,
+      "Runtime stats endpoint should respond for localhost callers."
+    );
+    assert.equal(
+      runtimeStatsPayload.ok,
+      true,
+      "Runtime stats endpoint should return ok=true."
+    );
+    assert.deepEqual(
+      Object.keys(runtimeStatsPayload).sort(),
+      ["caches", "exportJobs", "ok", "snapshotAt", "telemetry", "uptimeSeconds"],
+      "Runtime stats payload shape changed."
+    );
+    assert.deepEqual(
+      Object.keys(runtimeStatsPayload.exportJobs || {}).sort(),
+      ["active", "estimatedDurationMs", "queued"],
+      "Runtime stats exportJobs payload shape changed."
+    );
+    assert.deepEqual(
+      Object.keys(runtimeStatsPayload.caches || {}).sort(),
+      [
+        "exportArtifactEntries",
+        "geocodeEntries",
+        "openMeteoEntries",
+        "requestProgressEntries",
+        "siteContextEntries",
+      ],
+      "Runtime stats caches payload shape changed."
+    );
+    assert.ok(
+      Array.isArray(runtimeStatsPayload?.telemetry?.recentSlowApiRequests),
+      "Runtime stats should expose a recent slow API request list."
+    );
+    assert.ok(
+      Array.isArray(runtimeStatsPayload?.telemetry?.recentUpstreamEvents),
+      "Runtime stats should expose a recent upstream event list."
+    );
 
     const configResponse = await fetch(`${baseUrl}/api/config`);
     const configPayload = await readJson(configResponse);
@@ -1787,6 +1828,7 @@ async function runBaselineVerification() {
             "heritage-route",
             "max-mass-route",
             "health-shape",
+            "runtime-stats-shape",
             "config-shape",
             "terrain-contour-path-fallback",
             "site-context-cache-export-format",
