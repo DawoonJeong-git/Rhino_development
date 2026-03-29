@@ -26,6 +26,7 @@ const state = {
   suppressNextAutoFit: false,
   searchRequestId: 0,
   searchDebounceId: null,
+  isExportDownloadInFlight: false,
   modelProgressTimer: null,
   modelProgressPollTimer: null,
   modelProgressValue: 0,
@@ -4043,6 +4044,18 @@ function updateDownloadButtonLabel() {
   }
 }
 
+function setExportActionBusy(isBusy, format = collectModelOptions().exportFormat) {
+  if (!downloadObjButton) {
+    return;
+  }
+
+  downloadObjButton.disabled = Boolean(isBusy);
+  downloadObjButton.setAttribute("aria-busy", isBusy ? "true" : "false");
+  downloadObjButton.textContent = isBusy
+    ? `${describeExportFormat(format)} 준비 중...`
+    : "모델 파일 다운로드";
+}
+
 function ensureStatusChip(id, labelElement) {
   if (!labelElement || document.querySelector(`#${id}`)) {
     return;
@@ -4392,6 +4405,11 @@ async function downloadObj(format = collectModelOptions().exportFormat) {
   }
 
   const normalizedFormat = normalizeExportFormat(format);
+
+  if (state.isExportDownloadInFlight) {
+    throw new Error("이미 모델 파일을 준비하고 있습니다. 현재 작업이 끝날 때까지 잠시 기다려주세요.");
+  }
+
   const currentOptions = {
     ...collectModelOptions(),
     exportFormat: normalizedFormat,
@@ -4407,6 +4425,8 @@ async function downloadObj(format = collectModelOptions().exportFormat) {
       maxValue: 96,
     }
   );
+  state.isExportDownloadInFlight = true;
+  setExportActionBusy(true, normalizedFormat);
 
   try {
     if (needsRefresh) {
@@ -4458,6 +4478,9 @@ async function downloadObj(format = collectModelOptions().exportFormat) {
         : `${describeExportFormat(normalizedFormat)} 파일 다운로드에 실패했습니다.`;
     failModelProgress(message);
     throw error;
+  } finally {
+    state.isExportDownloadInFlight = false;
+    setExportActionBusy(false, normalizedFormat);
   }
 }
 

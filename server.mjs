@@ -63,6 +63,9 @@ const DEFAULT_OUTBOUND_FETCH_TIMEOUT_MS = 15_000;
 const LONG_OUTBOUND_FETCH_TIMEOUT_MS = 25_000;
 const OVERPASS_FETCH_TIMEOUT_MS = 35_000;
 const DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS = 1000 * 60 * 8;
+const DEFAULT_MAX_PENDING_EXPORT_JOBS_PER_CLIENT = 2;
+const DEFAULT_EXPORT_JOB_DURATION_ESTIMATE_MS = 1000 * 45;
+const EXPORT_JOB_DURATION_HISTORY_LIMIT = 8;
 const DEFAULT_MAX_SITE_RADIUS_METERS = 1000;
 const DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS = DEFAULT_MAX_SITE_RADIUS_METERS * 2;
 const DEFAULT_MAX_CONCURRENT_EXPORT_JOBS = 2;
@@ -116,6 +119,8 @@ const siteContextGeometrySignatureCache = new WeakMap();
 let rhino3dmInstancePromise = null;
 let activeExportJobs = 0;
 const exportJobWaitQueue = [];
+const activeExportJobsByClient = new Map();
+const recentExportDurationsMs = [];
 
 proj4.defs(
   "EPSG:5179",
@@ -1182,6 +1187,12 @@ function buildRuntimeConfig(localConfig) {
         localConfig.EXPORT_JOB_QUEUE_TIMEOUT_MS ||
         DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS,
       DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS
+    ),
+    maxPendingExportJobsPerClient: resolvePositiveInteger(
+      process.env.MAX_PENDING_EXPORT_JOBS_PER_CLIENT ||
+        localConfig.MAX_PENDING_EXPORT_JOBS_PER_CLIENT ||
+        DEFAULT_MAX_PENDING_EXPORT_JOBS_PER_CLIENT,
+      DEFAULT_MAX_PENDING_EXPORT_JOBS_PER_CLIENT
     ),
     rateLimits: {
       api: {
@@ -15088,7 +15099,7 @@ function resolveRateLimitBucket(pathname, method) {
       pathname === "/api/export-skp-payload") &&
     method === "POST"
   ) {
-    return "export";
+    return null;
   }
 
   if (
@@ -15152,6 +15163,151 @@ function enforceRateLimit(request, response, config, bucket) {
   return true;
 }
 
+function formatDurationLabel(milliseconds) {
+  const normalized = Math.max(0, Number(milliseconds) || 0);
+  const totalSeconds = Math.max(1, Math.round(normalized / 1000));
+
+  if (totalSeconds < 60) {
+    return `${totalSeconds}초`;
+  }
+
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  if (seconds === 0) {
+    return `${minutes}분`;
+  }
+
+  return `${minutes}분 ${seconds}초`;
+}
+
+function recordCompletedExportDuration(durationMs) {
+  const normalized = Number(durationMs);
+
+  if (!Number.isFinite(normalized) || normalized <= 0) {
+    return;
+  }
+
+  recentExportDurationsMs.push(normalized);
+
+  if (recentExportDurationsMs.length > EXPORT_JOB_DURATION_HISTORY_LIMIT) {
+    recentExportDurationsMs.splice(
+      0,
+      recentExportDurationsMs.length - EXPORT_JOB_DURATION_HISTORY_LIMIT
+    );
+  }
+}
+
+function estimateExportJobDurationMs() {
+  if (recentExportDurationsMs.length === 0) {
+    return DEFAULT_EXPORT_JOB_DURATION_ESTIMATE_MS;
+  }
+
+  const total = recentExportDurationsMs.reduce(
+    (sum, value) => sum + Number(value || 0),
+    0
+  );
+  return Math.max(
+    1000,
+    Math.round(total / Math.max(1, recentExportDurationsMs.length))
+  );
+}
+
+function incrementActiveExportJobCountForClient(clientIp) {
+  const normalizedClientIp = normalizeIpAddress(clientIp);
+
+  if (!normalizedClientIp) {
+    return;
+  }
+
+  activeExportJobsByClient.set(
+    normalizedClientIp,
+    (activeExportJobsByClient.get(normalizedClientIp) || 0) + 1
+  );
+}
+
+function decrementActiveExportJobCountForClient(clientIp) {
+  const normalizedClientIp = normalizeIpAddress(clientIp);
+
+  if (!normalizedClientIp) {
+    return;
+  }
+
+  const nextCount = Math.max(
+    0,
+    Number(activeExportJobsByClient.get(normalizedClientIp) || 0) - 1
+  );
+
+  if (nextCount > 0) {
+    activeExportJobsByClient.set(normalizedClientIp, nextCount);
+    return;
+  }
+
+  activeExportJobsByClient.delete(normalizedClientIp);
+}
+
+function countPendingExportJobsForClient(clientIp) {
+  const normalizedClientIp = normalizeIpAddress(clientIp);
+
+  if (!normalizedClientIp) {
+    return 0;
+  }
+
+  const activeCount = Number(activeExportJobsByClient.get(normalizedClientIp) || 0);
+  const queuedCount = exportJobWaitQueue.reduce((count, queuedJob) => {
+    if (!queuedJob || queuedJob.released === true) {
+      return count;
+    }
+
+    return normalizeIpAddress(queuedJob.clientIp) === normalizedClientIp
+      ? count + 1
+      : count;
+  }, 0);
+
+  return activeCount + queuedCount;
+}
+
+function buildQueuedExportJobSnapshot(queuePosition, maxConcurrentJobs, queueTimeoutMs, waitedMs = 0) {
+  const normalizedPosition = Math.max(1, Number(queuePosition) || 1);
+  const estimatedDurationMs = estimateExportJobDurationMs();
+  const batchesAhead = Math.max(
+    1,
+    Math.ceil(normalizedPosition / Math.max(1, Number(maxConcurrentJobs) || 1))
+  );
+  const estimatedWaitMs = estimatedDurationMs * batchesAhead;
+
+  return {
+    position: normalizedPosition,
+    queuedJobs: exportJobWaitQueue.length,
+    activeJobs: activeExportJobs,
+    maxConcurrentJobs: Math.max(1, Number(maxConcurrentJobs) || 1),
+    queueTimeoutMs: Math.max(1000, Number(queueTimeoutMs) || DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS),
+    waitedMs: Math.max(0, Number(waitedMs) || 0),
+    estimatedWaitMs,
+    remainingWaitMs: Math.max(0, estimatedWaitMs - (Number(waitedMs) || 0)),
+  };
+}
+
+function notifyQueuedExportJobs(maxConcurrentJobs) {
+  const now = Date.now();
+
+  exportJobWaitQueue.forEach((queuedJob, index) => {
+    if (!queuedJob || queuedJob.released === true || typeof queuedJob.onQueued !== "function") {
+      return;
+    }
+
+    const waitedMs = Math.max(0, now - Number(queuedJob.enqueuedAt || now));
+    queuedJob.onQueued(
+      buildQueuedExportJobSnapshot(
+        index + 1,
+        maxConcurrentJobs,
+        queuedJob.queueTimeoutMs,
+        waitedMs
+      )
+    );
+  });
+}
+
 function releaseNextQueuedExportJob(maxConcurrentJobs) {
   while (
     activeExportJobs < maxConcurrentJobs &&
@@ -15166,7 +15322,9 @@ function releaseNextQueuedExportJob(maxConcurrentJobs) {
     queuedJob.released = true;
     clearTimeout(queuedJob.timeoutHandle);
     activeExportJobs += 1;
+    incrementActiveExportJobCountForClient(queuedJob.clientIp);
     queuedJob.resolve();
+    notifyQueuedExportJobs(maxConcurrentJobs);
     return true;
   }
 
@@ -15182,29 +15340,44 @@ async function withExportJobSlot(config, work, options = {}) {
     1000,
     Number(config?.exportJobQueueTimeoutMs) || DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS
   );
+  const maxPendingJobsPerClient = Math.max(
+    1,
+    Number(config?.maxPendingExportJobsPerClient) ||
+      DEFAULT_MAX_PENDING_EXPORT_JOBS_PER_CLIENT
+  );
+  const clientIp = normalizeIpAddress(options?.clientIp);
   let slotClaimed = false;
+  let jobStartedAt = 0;
+
+  if (clientIp && countPendingExportJobsForClient(clientIp) >= maxPendingJobsPerClient) {
+    throw createHttpError(
+      429,
+      "같은 브라우저에서 진행 중이거나 대기 중인 모델 파일 작업이 너무 많습니다. 현재 작업이 끝난 뒤 다시 시도해주세요.",
+      {
+        "Retry-After": String(
+          Math.max(5, Math.ceil(estimateExportJobDurationMs() / 1000))
+        ),
+      }
+    );
+  }
 
   if (activeExportJobs < maxConcurrentJobs && exportJobWaitQueue.length === 0) {
     activeExportJobs += 1;
+    incrementActiveExportJobCountForClient(clientIp);
     slotClaimed = true;
+    jobStartedAt = Date.now();
   } else {
-    const queuePosition = exportJobWaitQueue.length + 1;
-
-    if (typeof options?.onQueued === "function") {
-      options.onQueued({
-        position: queuePosition,
-        activeJobs: activeExportJobs,
-        maxConcurrentJobs,
-        queueTimeoutMs,
-      });
-    }
-
     await new Promise((resolve, reject) => {
       const queuedJob = {
+        clientIp,
+        enqueuedAt: Date.now(),
+        onQueued: typeof options?.onQueued === "function" ? options.onQueued : null,
+        queueTimeoutMs,
         released: false,
         timeoutHandle: null,
         resolve: () => {
           slotClaimed = true;
+          jobStartedAt = Date.now();
           resolve();
         },
         reject,
@@ -15222,6 +15395,7 @@ async function withExportJobSlot(config, work, options = {}) {
           exportJobWaitQueue.splice(index, 1);
         }
 
+        notifyQueuedExportJobs(maxConcurrentJobs);
         reject(
           createHttpError(
             429,
@@ -15234,6 +15408,7 @@ async function withExportJobSlot(config, work, options = {}) {
       }, queueTimeoutMs);
 
       exportJobWaitQueue.push(queuedJob);
+      notifyQueuedExportJobs(maxConcurrentJobs);
     });
   }
 
@@ -15241,7 +15416,9 @@ async function withExportJobSlot(config, work, options = {}) {
     return await work();
   } finally {
     if (slotClaimed) {
+      recordCompletedExportDuration(Date.now() - jobStartedAt);
       activeExportJobs = Math.max(0, activeExportJobs - 1);
+      decrementActiveExportJobCountForClient(clientIp);
       releaseNextQueuedExportJob(maxConcurrentJobs);
     }
   }
@@ -17949,10 +18126,22 @@ async function createApp() {
               { "X-Export-Cache": "miss" }
             );
           }, {
-            onQueued: ({ position }) => {
+            clientIp,
+            onQueued: ({
+              position,
+              estimatedWaitMs,
+              queuedJobs,
+              activeJobs,
+              maxConcurrentJobs,
+            }) => {
+              const queueSummary =
+                queuedJobs > 1
+                  ? `대기 ${position}번 / 전체 ${queuedJobs}건`
+                  : `대기 ${position}번`;
+              const capacitySummary = `동시 처리 ${activeJobs}/${maxConcurrentJobs}`;
               updateRequestProgress(progressToken, {
                 percent: 2,
-                message: `다른 모델 내보내기가 진행 중이라 대기 중입니다. (${position}번째)`,
+                message: `다른 모델 파일 작업이 진행 중이라 잠시 대기하고 있습니다. (${queueSummary}, ${capacitySummary}, 예상 ${formatDurationLabel(estimatedWaitMs)})`,
               });
             },
           });
@@ -18046,6 +18235,7 @@ export {
   buildSkpFromSiteContext,
   buildSkpFromSiteContextWithRetry,
   createRhinoObjectAttributes,
+  withExportJobSlot,
   createApp,
   centroidOfRing,
   collectBuildingFootprintElevationSamples,
@@ -18057,6 +18247,7 @@ export {
   normalizePublicError,
   normalizeSearchResultsForQuery,
   prepareSiteContextForExport,
+  resolveRateLimitBucket,
   resolveRawTerrainHeightAtLocalPoint,
   resolveEffectiveContourBandInterval,
   resolveTerrainContourPath,

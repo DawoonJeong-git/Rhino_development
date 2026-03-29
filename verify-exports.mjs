@@ -13,12 +13,14 @@ import {
   buildSketchUpPayloadFromSiteContext,
   buildObjFromSiteContext,
   buildSkpFromSiteContextWithRetry,
+  withExportJobSlot,
   fetchWithTimeout,
   getRhino3dm,
   isPathInsideDirectory,
   normalizePublicError,
   normalizeSearchResultsForQuery,
   resolveEffectiveContourBandInterval,
+  resolveRateLimitBucket,
   resolveTerrainContourPath,
 } from "./server.mjs";
 
@@ -1536,6 +1538,127 @@ async function runBaselineVerification() {
       "hit",
       "Repeated export payload response should reuse the export cache."
     );
+    assert.equal(
+      resolveRateLimitBucket("/api/export-model", "POST"),
+      null,
+      "Export requests should rely on the export queue instead of a time-window rate-limit bucket."
+    );
+
+    const queueProbeConfig = {
+      maxConcurrentExportJobs: 1,
+      exportJobQueueTimeoutMs: 5000,
+      maxPendingExportJobsPerClient: 2,
+    };
+    const queueEvents = [];
+    const firstQueuedJob = withExportJobSlot(
+      queueProbeConfig,
+      async () => {
+        await delay(140);
+        return "first";
+      },
+      {
+        clientIp: "198.51.100.10",
+      }
+    );
+
+    await delay(20);
+
+    const secondQueuedJob = withExportJobSlot(
+      queueProbeConfig,
+      async () => {
+        await delay(40);
+        return "second";
+      },
+      {
+        clientIp: "198.51.100.20",
+        onQueued: (details) => {
+          queueEvents.push({
+            job: "second",
+            position: details.position,
+          });
+        },
+      }
+    );
+
+    await delay(20);
+
+    const thirdQueuedJob = withExportJobSlot(
+      queueProbeConfig,
+      async () => "third",
+      {
+        clientIp: "198.51.100.30",
+        onQueued: (details) => {
+          queueEvents.push({
+            job: "third",
+            position: details.position,
+          });
+        },
+      }
+    );
+
+    await Promise.all([firstQueuedJob, secondQueuedJob, thirdQueuedJob]);
+
+    const thirdQueuePositions = queueEvents
+      .filter((entry) => entry.job === "third")
+      .map((entry) => entry.position);
+    assert.equal(
+      thirdQueuePositions[0],
+      2,
+      "A later queued export job should initially receive its queue position."
+    );
+    assert.ok(
+      thirdQueuePositions.includes(1),
+      "Queued export jobs should be notified when their queue position improves."
+    );
+
+    const perClientPendingProbe = withExportJobSlot(
+      queueProbeConfig,
+      async () => {
+        await delay(120);
+        return "hold";
+      },
+      {
+        clientIp: "203.0.113.55",
+      }
+    );
+    await delay(20);
+
+    const sameClientQueuedProbe = withExportJobSlot(
+      queueProbeConfig,
+      async () => "queued",
+      {
+        clientIp: "203.0.113.55",
+      }
+    );
+    await delay(20);
+
+    let repeatedClientError = null;
+
+    try {
+      await withExportJobSlot(
+        queueProbeConfig,
+        async () => "blocked",
+        {
+          clientIp: "203.0.113.55",
+        }
+      );
+    } catch (error) {
+      repeatedClientError = error;
+    }
+
+    const normalizedRepeatedClientError = normalizePublicError(repeatedClientError);
+    assert.equal(
+      normalizedRepeatedClientError?.statusCode,
+      429,
+      "A single client should not be able to pile up unlimited queued exports."
+    );
+    assert.match(
+      String(normalizedRepeatedClientError?.message || ""),
+      /진행 중이거나 대기 중인 모델 파일 작업/i,
+      "Per-client export queue rejection should explain that an export is already pending."
+    );
+
+    await Promise.all([perClientPendingProbe, sameClientQueuedProbe]);
 
     console.log(
       JSON.stringify(
@@ -1578,6 +1701,8 @@ async function runBaselineVerification() {
             "export-ignores-top-level-geometry-keys",
             "export-without-site-context",
             "export-cache-hit",
+            "export-queue-progress-updates",
+            "export-pending-per-client-limit",
           ],
         },
         null,
