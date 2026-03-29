@@ -276,6 +276,8 @@ That update script now does four things in order:
 3. restarts the managed production server
 4. runs `node scripts/verify-release.mjs --base-url http://127.0.0.1:3000`
 
+Each run now leaves a timestamped report and `latest.json` in `C:\SpaceWork_deploy\logs\verify-release`, so you can trace which commit passed or failed after each update.
+
 Treat `C:\SpaceWork_deploy` as a read-only release clone. Edit only in `C:\SpaceWork_develop`, push to Git, then update the deploy clone through the script above so the running app, Git revision, and smoke result stay aligned.
 
 ## Step 12. Know When to Upgrade

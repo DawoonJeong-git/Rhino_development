@@ -58,6 +58,7 @@ The release bundle covers:
 - `verify:baseline`
 - `verify-live-site-context`
 - extended browser UI smoke for address + DXF, multi-parcel, manual range + 3DM, and `1km` + SKP
+- timestamped JSON reports in `logs/verify-release` for deployment traceability
 
 Then run any additional live browser QA you still want beyond the automated bundle:
 

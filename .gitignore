@@ -4,6 +4,7 @@ config.local.json
 .env.production.local
 tmp_*
 *.log
+logs/verify-release/
 *.obj
 *.3dm
 data/contours/

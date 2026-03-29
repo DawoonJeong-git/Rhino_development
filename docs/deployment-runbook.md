@@ -13,6 +13,7 @@ Use this exact sequence right before release:
 7. Build and start the container with `docker compose --env-file .env.production up -d --build`.
 8. Verify `GET /api/health` and `GET /api/config`.
 9. Run `npm run verify:release -- --base-url http://127.0.0.1:3000`.
+   The bundle writes a timestamped JSON report plus `latest.json` into `logs/verify-release`.
 10. Keep the previous image tag and one known-good parcel for rollback.
 
 ## Recommended Shape
