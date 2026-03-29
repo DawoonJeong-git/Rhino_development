@@ -17688,6 +17688,14 @@ function cloneSerializableValue(value) {
     return undefined;
   }
 
+  if (typeof globalThis.structuredClone === "function") {
+    try {
+      return globalThis.structuredClone(value);
+    } catch {
+      // Fall back to JSON cloning for plain export payloads.
+    }
+  }
+
   return JSON.parse(JSON.stringify(value));
 }
 
@@ -17696,21 +17704,31 @@ function cloneSiteContextForExport(siteContext) {
     return siteContext;
   }
 
-  return {
-    ...siteContext,
-    location: cloneSerializableValue(siteContext.location),
-    options: cloneSerializableValue(siteContext.options) || {},
-    stats: cloneSerializableValue(siteContext.stats) || {},
-    dataSources: cloneSerializableValue(siteContext.dataSources) || {},
-    parcelBoundary: cloneSerializableValue(siteContext.parcelBoundary),
-    targetParcelGroups: cloneSerializableValue(siteContext.targetParcelGroups),
-    parcelContext: cloneSerializableValue(siteContext.parcelContext),
-    clipBoundary: cloneSerializableValue(siteContext.clipBoundary),
-    contourLines: cloneSerializableValue(siteContext.contourLines),
-    terrainGrid: cloneSerializableValue(siteContext.terrainGrid),
-    buildings: cloneSerializableValue(siteContext.buildings),
-    roads: cloneSerializableValue(siteContext.roads),
-  };
+  const clonedSiteContext = cloneSerializableValue(siteContext);
+
+  if (!clonedSiteContext || typeof clonedSiteContext !== "object") {
+    return {
+      options: {},
+      stats: {},
+      dataSources: {},
+    };
+  }
+
+  clonedSiteContext.options =
+    clonedSiteContext.options && typeof clonedSiteContext.options === "object"
+      ? clonedSiteContext.options
+      : {};
+  clonedSiteContext.stats =
+    clonedSiteContext.stats && typeof clonedSiteContext.stats === "object"
+      ? clonedSiteContext.stats
+      : {};
+  clonedSiteContext.dataSources =
+    clonedSiteContext.dataSources &&
+    typeof clonedSiteContext.dataSources === "object"
+      ? clonedSiteContext.dataSources
+      : {};
+
+  return clonedSiteContext;
 }
 
 function pruneExportArtifactCache(now = Date.now()) {

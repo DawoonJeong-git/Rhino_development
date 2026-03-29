@@ -1528,6 +1528,11 @@ async function runBaselineVerification() {
         ...syntheticContourSiteContext.options,
         includeBuildings: true,
       },
+      debugBundle: {
+        nested: {
+          stage: "source",
+        },
+      },
       buildings: {
         type: "FeatureCollection",
         features: [
@@ -1567,6 +1572,17 @@ async function runBaselineVerification() {
       exportMutationSourceSiteContext?.buildings?.features?.[0]?.properties?.buildingPlacementDebug,
       undefined,
       "prepareSiteContextForExport should not write building placement debug info back onto the source siteContext."
+    );
+    assert.notStrictEqual(
+      exportMutationPreparedSiteContext?.debugBundle?.nested,
+      exportMutationSourceSiteContext?.debugBundle?.nested,
+      "prepareSiteContextForExport should deep-clone unknown nested top-level fields as well."
+    );
+    exportMutationPreparedSiteContext.debugBundle.nested.stage = "prepared";
+    assert.equal(
+      exportMutationSourceSiteContext?.debugBundle?.nested?.stage,
+      "source",
+      "prepareSiteContextForExport should keep custom nested fields detached from the source siteContext."
     );
     assert.notEqual(
       exportMutationPreparedSiteContext?.buildings?.features?.[0]?.properties?.buildingPlacementDebug,
