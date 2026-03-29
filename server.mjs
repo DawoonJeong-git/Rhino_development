@@ -26,12 +26,15 @@ const publicDir = path.join(__dirname, "public");
 const configPath = path.join(__dirname, "config.local.json");
 const METERS_PER_DEGREE_LAT = 111_320;
 const OPEN_METEO_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
+const OPEN_METEO_CACHE_MAX_ENTRIES = 256;
 const OPEN_METEO_MAX_POINTS_PER_REQUEST = 100;
 const OPEN_METEO_MAX_CONCURRENT_REQUESTS = 3;
 const OPEN_TOPO_DATA_MAX_POINTS_PER_REQUEST = 80;
 const OPEN_TOPO_DATA_MAX_CONCURRENT_REQUESTS = 2;
 const SITE_CONTEXT_CACHE_TTL_MS = 1000 * 60 * 10;
+const SITE_CONTEXT_CACHE_MAX_ENTRIES = 12;
 const GEOCODE_CACHE_TTL_MS = 1000 * 60 * 10;
+const GEOCODE_CACHE_MAX_ENTRIES = 256;
 const EXPORT_ARTIFACT_CACHE_TTL_MS = 1000 * 60 * 5;
 const EXPORT_ARTIFACT_CACHE_MAX_ENTRIES = 8;
 const EXPORT_ARTIFACT_CACHE_MAX_TOTAL_BYTES = 96 * 1024 * 1024;
@@ -1656,6 +1659,61 @@ function buildSystemAddress(location) {
   );
 }
 
+function readCacheEntryTouchTimestamp(entry) {
+  return Number(entry?.lastAccessedAt || entry?.cachedAt || entry?.expiresAt || 0);
+}
+
+function pruneCacheEntries(
+  cacheStore,
+  { now = Date.now(), maxEntries = 0, isExpired = null } = {}
+) {
+  if (!(cacheStore instanceof Map)) {
+    return;
+  }
+
+  const survivors = [];
+
+  for (const [cacheKey, entry] of cacheStore.entries()) {
+    if (!entry || typeof entry !== "object") {
+      cacheStore.delete(cacheKey);
+      continue;
+    }
+
+    if (typeof isExpired === "function" && isExpired(entry, now)) {
+      cacheStore.delete(cacheKey);
+      continue;
+    }
+
+    survivors.push([cacheKey, entry]);
+  }
+
+  if (maxEntries > 0 && survivors.length > maxEntries) {
+    survivors.sort(
+      (left, right) =>
+        readCacheEntryTouchTimestamp(left[1]) - readCacheEntryTouchTimestamp(right[1])
+    );
+
+    while (survivors.length > maxEntries) {
+      const [cacheKey] = survivors.shift() || [];
+
+      if (!cacheKey) {
+        break;
+      }
+
+      cacheStore.delete(cacheKey);
+    }
+  }
+}
+
+function touchCacheEntry(entry, now = Date.now()) {
+  if (!entry || typeof entry !== "object") {
+    return entry;
+  }
+
+  entry.lastAccessedAt = now;
+  return entry;
+}
+
 function buildGeocodeCacheKey(query) {
   return String(query || "")
     .trim()
@@ -1665,25 +1723,40 @@ function buildGeocodeCacheKey(query) {
 
 function readGeocodeCache(query) {
   const cacheKey = buildGeocodeCacheKey(query);
+  const now = Date.now();
+  pruneCacheEntries(geocodeCache, {
+    now,
+    maxEntries: GEOCODE_CACHE_MAX_ENTRIES,
+    isExpired: (entry, timestamp) => Number(entry?.expiresAt || 0) <= timestamp,
+  });
   const cachedEntry = geocodeCache.get(cacheKey);
 
   if (!cachedEntry) {
     return null;
   }
 
-  if (cachedEntry.expiresAt <= Date.now()) {
+  if (cachedEntry.expiresAt <= now) {
     geocodeCache.delete(cacheKey);
     return null;
   }
 
+  touchCacheEntry(cachedEntry, now);
   return cachedEntry.payload;
 }
 
 function writeGeocodeCache(query, payload) {
   const cacheKey = buildGeocodeCacheKey(query);
+  const now = Date.now();
   geocodeCache.set(cacheKey, {
+    cachedAt: now,
+    lastAccessedAt: now,
     payload,
-    expiresAt: Date.now() + GEOCODE_CACHE_TTL_MS,
+    expiresAt: now + GEOCODE_CACHE_TTL_MS,
+  });
+  pruneCacheEntries(geocodeCache, {
+    now,
+    maxEntries: GEOCODE_CACHE_MAX_ENTRIES,
+    isExpired: (entry, timestamp) => Number(entry?.expiresAt || 0) <= timestamp,
   });
 }
 
@@ -6708,9 +6781,17 @@ async function fetchOpenMeteoElevationChunk(points) {
   const cacheKey = points
     .map((point) => `${point.lat.toFixed(6)},${point.lng.toFixed(6)}`)
     .join("|");
+  const now = Date.now();
+  pruneCacheEntries(openMeteoElevationCache, {
+    now,
+    maxEntries: OPEN_METEO_CACHE_MAX_ENTRIES,
+    isExpired: (entry, timestamp) =>
+      timestamp - Number(entry?.cachedAt || 0) >= OPEN_METEO_CACHE_TTL_MS,
+  });
   const cached = openMeteoElevationCache.get(cacheKey);
 
-  if (cached && Date.now() - cached.cachedAt < OPEN_METEO_CACHE_TTL_MS) {
+  if (cached && now - cached.cachedAt < OPEN_METEO_CACHE_TTL_MS) {
+    touchCacheEntry(cached, now);
     return cached.values;
   }
 
@@ -6747,9 +6828,17 @@ async function fetchOpenMeteoElevationChunk(points) {
         throw new Error("Open-Meteo elevation response did not match the request.");
       }
 
+      const cachedAt = Date.now();
       openMeteoElevationCache.set(cacheKey, {
-        cachedAt: Date.now(),
+        cachedAt,
+        lastAccessedAt: cachedAt,
         values,
+      });
+      pruneCacheEntries(openMeteoElevationCache, {
+        now: cachedAt,
+        maxEntries: OPEN_METEO_CACHE_MAX_ENTRIES,
+        isExpired: (entry, timestamp) =>
+          timestamp - Number(entry?.cachedAt || 0) >= OPEN_METEO_CACHE_TTL_MS,
       });
       return values;
     } catch (error) {
@@ -6766,9 +6855,17 @@ async function fetchOpenMeteoElevationChunk(points) {
     const rightValues = await fetchOpenMeteoElevationChunk(points.slice(midpoint));
     const values = [...leftValues, ...rightValues];
 
+    const cachedAt = Date.now();
     openMeteoElevationCache.set(cacheKey, {
-      cachedAt: Date.now(),
+      cachedAt,
+      lastAccessedAt: cachedAt,
       values,
+    });
+    pruneCacheEntries(openMeteoElevationCache, {
+      now: cachedAt,
+      maxEntries: OPEN_METEO_CACHE_MAX_ENTRIES,
+      isExpired: (entry, timestamp) =>
+        timestamp - Number(entry?.cachedAt || 0) >= OPEN_METEO_CACHE_TTL_MS,
     });
     return values;
   }
@@ -8597,11 +8694,18 @@ async function buildSiteContext(body, config, reportProgress = null) {
     !isManualRange && targetParcelGroupFeatures.length > 1;
   assertSiteRequestWithinLimits(normalizedLocation, options, customBounds, config);
   const cacheKey = buildSiteContextCacheKey(normalizedLocation, options, customBounds);
+  const now = Date.now();
+  pruneCacheEntries(siteContextCache, {
+    now,
+    maxEntries: SITE_CONTEXT_CACHE_MAX_ENTRIES,
+    isExpired: (entry, timestamp) =>
+      timestamp - Number(entry?.cachedAt || 0) >= SITE_CONTEXT_CACHE_TTL_MS,
+  });
   const cachedSiteContext = siteContextCache.get(cacheKey);
 
   if (
     cachedSiteContext &&
-    Date.now() - cachedSiteContext.cachedAt < SITE_CONTEXT_CACHE_TTL_MS
+    now - cachedSiteContext.cachedAt < SITE_CONTEXT_CACHE_TTL_MS
   ) {
     progress(100, "저장된 대지 컨텍스트를 불러왔습니다.");
     return cachedSiteContext.value;
@@ -8889,9 +8993,17 @@ async function buildSiteContext(body, config, reportProgress = null) {
       : relaxationNote;
   }
 
+  const cachedAt = Date.now();
   siteContextCache.set(cacheKey, {
-    cachedAt: Date.now(),
+    cachedAt,
+    lastAccessedAt: cachedAt,
     value: siteContext,
+  });
+  pruneCacheEntries(siteContextCache, {
+    now: cachedAt,
+    maxEntries: SITE_CONTEXT_CACHE_MAX_ENTRIES,
+    isExpired: (entry, timestamp) =>
+      timestamp - Number(entry?.cachedAt || 0) >= SITE_CONTEXT_CACHE_TTL_MS,
   });
 
   progress(100, "대지 컨텍스트 준비가 완료되었습니다.");
@@ -18247,6 +18359,7 @@ export {
   normalizePublicError,
   normalizeSearchResultsForQuery,
   prepareSiteContextForExport,
+  pruneCacheEntries,
   resolveRateLimitBucket,
   resolveRawTerrainHeightAtLocalPoint,
   resolveEffectiveContourBandInterval,

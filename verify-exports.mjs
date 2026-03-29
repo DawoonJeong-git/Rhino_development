@@ -19,6 +19,7 @@ import {
   isPathInsideDirectory,
   normalizePublicError,
   normalizeSearchResultsForQuery,
+  pruneCacheEntries,
   resolveEffectiveContourBandInterval,
   resolveRateLimitBucket,
   resolveTerrainContourPath,
@@ -609,6 +610,51 @@ async function runBaselineVerification() {
       resolveEffectiveContourBandInterval(syntheticThreeDmBudgetSiteContext),
       2,
       "3DM-sized contour budget should preserve more detail for the same wide synthetic case."
+    );
+    const boundedCacheStore = new Map([
+      [
+        "expired",
+        {
+          cachedAt: 10,
+          lastAccessedAt: 10,
+          expiresAt: 20,
+          value: "expired",
+        },
+      ],
+      [
+        "older",
+        {
+          cachedAt: 30,
+          lastAccessedAt: 30,
+          value: "older",
+        },
+      ],
+      [
+        "recent",
+        {
+          cachedAt: 40,
+          lastAccessedAt: 90,
+          value: "recent",
+        },
+      ],
+      [
+        "newest",
+        {
+          cachedAt: 50,
+          lastAccessedAt: 120,
+          value: "newest",
+        },
+      ],
+    ]);
+    pruneCacheEntries(boundedCacheStore, {
+      now: 100,
+      maxEntries: 2,
+      isExpired: (entry, timestamp) => Number(entry?.expiresAt || Infinity) <= timestamp,
+    });
+    assert.deepEqual(
+      [...boundedCacheStore.keys()],
+      ["recent", "newest"],
+      "Bounded cache pruning should drop expired entries first and then evict the stalest survivors."
     );
 
     const hubResponse = await fetch(`${baseUrl}/`);
@@ -1676,6 +1722,7 @@ async function runBaselineVerification() {
             "config-shape",
             "terrain-contour-path-fallback",
             "site-context-cache-export-format",
+            "bounded-cache-pruning",
             "security-headers",
             "csp-no-inline-default",
             "self-hosted-frontend-assets",
