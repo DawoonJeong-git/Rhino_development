@@ -50,6 +50,12 @@ function formatDuration(ms) {
   return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
 }
 
+function wait(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, Number(ms) || 0));
+  });
+}
+
 function tailText(text, maxLength = 4000) {
   const normalized = String(text || "").trim();
 
@@ -72,6 +78,17 @@ function extractTrailingJson(text) {
   }
 
   return null;
+}
+
+function summarizeRetryFailure(stepResult, error) {
+  return {
+    status: stepResult?.status || "failed",
+    durationMs: Number(stepResult?.durationMs || 0),
+    durationText: formatDuration(stepResult?.durationMs || 0),
+    stdoutTail: tailText(stepResult?.stdoutTail || ""),
+    stderrTail: tailText(stepResult?.stderrTail || ""),
+    message: error instanceof Error ? error.message : String(error || "Unknown error"),
+  };
 }
 
 function getGitMetadata(repoRoot) {
@@ -222,6 +239,54 @@ async function runNodeStep(name, scriptRelativePath, args = []) {
   });
 }
 
+async function runNodeStepWithRetry(
+  name,
+  scriptRelativePath,
+  args = [],
+  options = {}
+) {
+  const maxAttempts = Math.max(1, Number(options.maxAttempts) || 1);
+  const retryDelayMs = Math.max(0, Number(options.retryDelayMs) || 0);
+  const retryFailures = [];
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const step = await runNodeStep(name, scriptRelativePath, args);
+      return {
+        ...step,
+        attempts: attempt,
+        retryCount: attempt - 1,
+        retryFailures,
+      };
+    } catch (error) {
+      if (error?.stepResult) {
+        retryFailures.push(summarizeRetryFailure(error.stepResult, error));
+      }
+
+      if (attempt >= maxAttempts) {
+        if (error?.stepResult) {
+          error.stepResult = {
+            ...error.stepResult,
+            attempts: attempt,
+            retryCount: attempt - 1,
+            retryFailures: retryFailures.slice(0, Math.max(0, retryFailures.length - 1)),
+            lastFailure: retryFailures[retryFailures.length - 1] || null,
+          };
+        }
+
+        throw error;
+      }
+
+      console.warn(
+        `[verify-release] ${name}: retry ${attempt + 1}/${maxAttempts} in ${retryDelayMs}ms`
+      );
+      await wait(retryDelayMs);
+    }
+  }
+
+  throw new Error(`[verify-release] ${name} exhausted retry attempts unexpectedly.`);
+}
+
 async function main() {
   const baseUrl = readArgValue("--base-url") || DEFAULT_BASE_URL;
   const uiSuite = normalizeUiSuite(readArgValue("--ui-suite") || DEFAULT_UI_SUITE);
@@ -248,27 +313,35 @@ async function main() {
   try {
     if (!skipBaseline) {
       steps.push(
-        await runNodeStep("baseline", "verify-exports.mjs", ["--baseline"])
+        await runNodeStepWithRetry("baseline", "verify-exports.mjs", ["--baseline"])
       );
     }
 
     if (!skipLive) {
       steps.push(
-        await runNodeStep("live-site-context", "scripts/verify-live-site-context.mjs", [
-          "--base-url",
-          baseUrl,
-        ])
+        await runNodeStepWithRetry(
+          "live-site-context",
+          "scripts/verify-live-site-context.mjs",
+          ["--base-url", baseUrl],
+          {
+            maxAttempts: 2,
+            retryDelayMs: 1000,
+          }
+        )
       );
     }
 
     if (!skipUi) {
       steps.push(
-        await runNodeStep("ui-suite", "scripts/verify-ui-flow.mjs", [
-          "--suite",
-          uiSuite,
-          "--base-url",
-          baseUrl,
-        ])
+        await runNodeStepWithRetry(
+          "ui-suite",
+          "scripts/verify-ui-flow.mjs",
+          ["--suite", uiSuite, "--base-url", baseUrl],
+          {
+            maxAttempts: 2,
+            retryDelayMs: 1500,
+          }
+        )
       );
     }
 
