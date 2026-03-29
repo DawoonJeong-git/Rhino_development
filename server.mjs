@@ -108,6 +108,8 @@ const contourBandGroupCache = new WeakMap();
 const contourCumulativeBandGroupCache = new WeakMap();
 const contourRenderableBandGroupCache = new WeakMap();
 const contourTopSurfaceCache = new WeakMap();
+const sharedContourBandGroupCache = new Map();
+const sharedContourCumulativeBandGroupCache = new Map();
 const roadFootprintMultiPolygonCache = new WeakMap();
 const roadContourSurfaceGroupCache = new WeakMap();
 const siteContextGeometrySignatureCache = new WeakMap();
@@ -630,6 +632,45 @@ function getOrCreateWeakMapEntry(cacheStore, owner) {
   }
 
   return entry;
+}
+
+function readSharedDerivedCache(cacheStore, cacheKey) {
+  if (!(cacheStore instanceof Map) || !cacheKey) {
+    return null;
+  }
+
+  const cachedEntry = cacheStore.get(cacheKey);
+
+  if (!cachedEntry) {
+    return null;
+  }
+
+  cachedEntry.lastAccessedAt = Date.now();
+  return cachedEntry.value;
+}
+
+function writeSharedDerivedCache(cacheStore, cacheKey, value, maxEntries = 6) {
+  if (!(cacheStore instanceof Map) || !cacheKey) {
+    return;
+  }
+
+  cacheStore.set(cacheKey, {
+    value,
+    lastAccessedAt: Date.now(),
+  });
+
+  while (cacheStore.size > maxEntries) {
+    const oldestEntry = [...cacheStore.entries()].sort(
+      (left, right) =>
+        Number(left?.[1]?.lastAccessedAt || 0) - Number(right?.[1]?.lastAccessedAt || 0)
+    )[0];
+
+    if (!oldestEntry) {
+      break;
+    }
+
+    cacheStore.delete(oldestEntry[0]);
+  }
 }
 
 function resolveTerrainSampleStep(widthMeters, heightMeters, options = {}) {
@@ -10535,6 +10576,15 @@ function getCachedContourBandGroups(siteContext) {
   }
 
   const cacheKey = getContourBandCacheKey(siteContext);
+  const sharedCachedBandGroups = readSharedDerivedCache(
+    sharedContourBandGroupCache,
+    cacheKey
+  );
+
+  if (sharedCachedBandGroups) {
+    return sharedCachedBandGroups;
+  }
+
   const owner = resolveContourCacheOwner(siteContext);
   const entry = getOrCreateWeakMapEntry(contourBandGroupCache, owner);
 
@@ -10551,6 +10601,7 @@ function getCachedContourBandGroups(siteContext) {
   if (entry instanceof Map) {
     entry.set(cacheKey, bandGroups);
   }
+  writeSharedDerivedCache(sharedContourBandGroupCache, cacheKey, bandGroups);
 
   return bandGroups;
 }
@@ -10621,6 +10672,15 @@ function getCachedCumulativeContourBandGroups(siteContext) {
   }
 
   const cacheKey = getContourBandCacheKey(siteContext);
+  const sharedCachedBandGroups = readSharedDerivedCache(
+    sharedContourCumulativeBandGroupCache,
+    cacheKey
+  );
+
+  if (sharedCachedBandGroups) {
+    return sharedCachedBandGroups;
+  }
+
   const owner = resolveContourCacheOwner(siteContext);
   const entry = getOrCreateWeakMapEntry(contourCumulativeBandGroupCache, owner);
 
@@ -10637,6 +10697,11 @@ function getCachedCumulativeContourBandGroups(siteContext) {
   if (entry instanceof Map) {
     entry.set(cacheKey, bandGroups);
   }
+  writeSharedDerivedCache(
+    sharedContourCumulativeBandGroupCache,
+    cacheKey,
+    bandGroups
+  );
 
   return bandGroups;
 }
