@@ -161,17 +161,33 @@ async function waitForUiVerificationApi(page, timeoutMs = 30000) {
   );
 }
 
-async function searchAndConfirmSelection(page, searchQuery, timeoutMs = 30000) {
+async function searchAndConfirmSelection(
+  page,
+  searchQuery,
+  timeoutMs = 30000,
+  retryCount = 0
+) {
   await page.locator("#searchInput").fill(searchQuery);
   await page.locator('#searchForm button[type="submit"]').click();
 
   const confirmButton = page
     .locator('#searchResults .result-item [data-action="confirm"]')
     .first();
-  await confirmButton.waitFor({
-    state: "visible",
-    timeout: timeoutMs,
-  });
+
+  try {
+    await confirmButton.waitFor({
+      state: "visible",
+      timeout: timeoutMs,
+    });
+  } catch (error) {
+    if (retryCount < 1) {
+      await page.waitForTimeout(750);
+      return searchAndConfirmSelection(page, searchQuery, timeoutMs, retryCount + 1);
+    }
+
+    throw error;
+  }
+
   await confirmButton.click();
 
   return waitForStableText(page, "#selectionMeta", ["선택 전"], timeoutMs);
@@ -206,7 +222,10 @@ async function runSiteContextPreview(page, timeoutMs = 120000) {
   const specSummary = await waitForStableText(
     page,
     "#specPreview",
-    ["모델 미리보기를 누르면"],
+    [
+      "모델 미리보기를 누르면",
+      "설정이 바뀌었습니다. 미리보기 또는 다운로드를 누르면",
+    ],
     timeoutMs
   );
   const siteContextChip = await waitForChipText(
