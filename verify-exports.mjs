@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import path from "node:path";
 import process from "node:process";
@@ -826,6 +827,30 @@ async function runBaselineVerification() {
       }),
       ["https://app.spaceswork.net", "http://localhost:3012"],
       "VWorld requests should keep the configured domain first but also retain localhost as a fallback candidate."
+    );
+    const appSource = await readFile(
+      path.join(process.cwd(), "public", "app.js"),
+      "utf8"
+    );
+    assert.match(
+      appSource,
+      /function buildParcelLookupRequestPayload\s*\(/,
+      "Frontend should centralize parcel lookup payload building."
+    );
+    assert.doesNotMatch(
+      appSource,
+      /async function loadBuildingRegisterCore[\s\S]*?siteContext[\s\S]*?async function printBuildingRegister/s,
+      "Building-register requests should not post the full siteContext payload."
+    );
+    assert.doesNotMatch(
+      appSource,
+      /async function loadLandInfo[\s\S]*?siteContext[\s\S]*?async function ensureLandInfoLoaded/s,
+      "Land-info requests should not post the full siteContext payload."
+    );
+    assert.doesNotMatch(
+      appSource,
+      /async function loadLandInfoDetails[\s\S]*?siteContext[\s\S]*?async function ensureLandInfoDetailsLoaded/s,
+      "Land-info detail requests should not post the full siteContext payload."
     );
 
     const hubResponse = await fetch(`${baseUrl}/`);
@@ -1914,6 +1939,7 @@ async function runBaselineVerification() {
             "property-data-cache-dedupe",
             "provider-timeout-config",
             "vworld-domain-candidates",
+            "parcel-lookup-lite-client",
             "security-headers",
             "csp-no-inline-default",
             "self-hosted-frontend-assets",

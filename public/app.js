@@ -3410,6 +3410,68 @@ function selectionHasParcelReference(location = state.selectedLocation) {
   );
 }
 
+function resolveLookupParcelPnu(
+  location = state.selectedLocation,
+  fallbackPnu = ""
+) {
+  const selectedParcels = Array.isArray(location?.selectedParcels)
+    ? location.selectedParcels
+    : [];
+  const firstSelectedParcel = selectedParcels[0];
+
+  for (const candidate of [
+    location?.pnu,
+    fallbackPnu,
+    firstSelectedParcel?.properties?.pnu,
+    firstSelectedParcel?.properties?.PNU,
+    state.siteContext?.parcelBoundary?.properties?.pnu,
+    state.siteContext?.parcelBoundary?.properties?.PNU,
+  ]) {
+    const normalized = String(candidate || "").trim();
+
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return "";
+}
+
+function hasParcelLookupReference(
+  location = state.selectedLocation,
+  fallbackPnu = ""
+) {
+  return Boolean(
+    resolveLookupParcelPnu(location, fallbackPnu) || location?.juso?.admCd
+  );
+}
+
+function buildParcelLookupRequestPayload(
+  location = state.selectedLocation,
+  fallbackPnu = ""
+) {
+  const normalizedLocation =
+    location && typeof location === "object" ? location : {};
+  const { selectedParcels: _selectedParcels, ...compactLocation } =
+    normalizedLocation;
+  const pnu = resolveLookupParcelPnu(normalizedLocation, fallbackPnu);
+  const payloadLocation = pnu
+    ? {
+        ...compactLocation,
+        pnu,
+      }
+    : compactLocation;
+
+  return pnu
+    ? {
+        location: payloadLocation,
+        pnu,
+      }
+    : {
+        location: payloadLocation,
+      };
+}
+
 function hasSelectionPreviewForCurrentSelection(selectionKey = state.activeSelectionKey) {
   return Boolean(
     isSelectionRequestCurrent(selectionKey) &&
@@ -3581,34 +3643,28 @@ async function loadBuildingRegisterCore(
   }
 
   const location = { ...state.selectedLocation };
-  let siteContext = state.siteContext;
+  let requestPayload = buildParcelLookupRequestPayload(location);
 
   let response = await fetch("/api/building-register", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      location,
-      siteContext,
-    }),
+    body: JSON.stringify(requestPayload),
   });
 
   let payload = await response.json();
 
-  if (!response.ok && !selectionHasParcelReference(location)) {
+  if (!response.ok && !hasParcelLookupReference(location)) {
     await loadSiteContext(selectionKey);
-    siteContext = state.siteContext;
+    requestPayload = buildParcelLookupRequestPayload(state.selectedLocation);
 
     response = await fetch("/api/building-register", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        location: state.selectedLocation,
-        siteContext,
-      }),
+      body: JSON.stringify(requestPayload),
     });
     payload = await response.json();
   }
@@ -3619,6 +3675,13 @@ async function loadBuildingRegisterCore(
 
   if (!isSelectionRequestCurrent(selectionKey)) {
     return payload;
+  }
+
+  if (payload?.parcelReference?.pnu) {
+    state.selectedLocation = {
+      ...state.selectedLocation,
+      pnu: state.selectedLocation?.pnu || payload.parcelReference.pnu,
+    };
   }
 
   state.buildingRegister = payload;
@@ -3728,32 +3791,26 @@ async function loadLandInfo(
   }
 
   try {
-    let siteContext = state.siteContext;
+    let requestPayload = buildParcelLookupRequestPayload(location);
     let response = await fetch("/api/land-info", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        location,
-        siteContext,
-      }),
+      body: JSON.stringify(requestPayload),
     });
     let payload = await response.json();
 
-    if (!response.ok && !selectionHasParcelReference(location) && !siteContext) {
+    if (!response.ok && !hasParcelLookupReference(location)) {
       await loadSiteContext(selectionKey);
-      siteContext = state.siteContext;
+      requestPayload = buildParcelLookupRequestPayload(state.selectedLocation);
 
       response = await fetch("/api/land-info", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          location,
-          siteContext,
-        }),
+        body: JSON.stringify(requestPayload),
       });
       payload = await response.json();
     }
@@ -3822,24 +3879,17 @@ async function loadLandInfoDetails(
     await loadLandInfo(selectionKey);
   }
 
-  const location = {
-    ...state.selectedLocation,
-    pnu:
-      state.selectedLocation?.pnu ||
-      state.landInfo?.parcelReference?.pnu ||
-      "",
-  };
+  const location = { ...state.selectedLocation };
+  const fallbackPnu = String(state.landInfo?.parcelReference?.pnu || "").trim();
 
   try {
+    const requestPayload = buildParcelLookupRequestPayload(location, fallbackPnu);
     const response = await fetch("/api/land-info-details", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        location,
-        siteContext: state.siteContext,
-      }),
+      body: JSON.stringify(requestPayload),
     });
     const payload = await response.json();
 
@@ -3868,7 +3918,7 @@ async function loadLandInfoDetails(
       retryCount < 1 &&
       isSelectionRequestCurrent(selectionKey) &&
       Boolean(state.selectedLocation) &&
-      !selectionHasParcelReference(location);
+      !hasParcelLookupReference(location, fallbackPnu);
 
     if (canRetry) {
       await loadLandInfo(selectionKey);
