@@ -275,6 +275,7 @@ That update script now does four things in order:
 2. refreshes `node_modules`
 3. restarts the managed production server
 4. runs `node scripts/verify-release.mjs --base-url http://127.0.0.1:3000`
+5. if `config.local.json` has an HTTPS `VWORLD_API_DOMAIN`, also runs a public smoke against that real share origin
 
 Each run now leaves a timestamped report and `latest.json` in `C:\SpaceWork_deploy\logs\verify-release`, so you can trace which commit passed or failed after each update.
 

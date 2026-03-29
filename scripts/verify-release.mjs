@@ -8,6 +8,10 @@ const DEFAULT_BASE_URL =
   process.env.VERIFY_RELEASE_BASE_URL || "http://127.0.0.1:3000";
 const DEFAULT_UI_SUITE =
   process.env.VERIFY_RELEASE_UI_SUITE || "extended";
+const DEFAULT_PUBLIC_BASE_URL =
+  process.env.VERIFY_RELEASE_PUBLIC_BASE_URL || "";
+const DEFAULT_PUBLIC_UI_SUITE =
+  process.env.VERIFY_RELEASE_PUBLIC_UI_SUITE || "smoke";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,6 +34,10 @@ function readArgValue(flag) {
 
 function hasFlag(flag) {
   return process.argv.includes(flag);
+}
+
+function normalizeBaseUrl(value) {
+  return String(value || "").trim().replace(/\/+$/u, "");
 }
 
 function normalizeUiSuite(value) {
@@ -288,13 +296,20 @@ async function runNodeStepWithRetry(
 }
 
 async function main() {
-  const baseUrl = readArgValue("--base-url") || DEFAULT_BASE_URL;
+  const baseUrl = normalizeBaseUrl(readArgValue("--base-url") || DEFAULT_BASE_URL);
   const uiSuite = normalizeUiSuite(readArgValue("--ui-suite") || DEFAULT_UI_SUITE);
+  const publicBaseUrl = normalizeBaseUrl(
+    readArgValue("--public-base-url") || DEFAULT_PUBLIC_BASE_URL
+  );
+  const publicUiSuite = normalizeUiSuite(
+    readArgValue("--public-ui-suite") || DEFAULT_PUBLIC_UI_SUITE
+  );
   const outputDir = readArgValue("--output-dir") || DEFAULT_OUTPUT_DIR;
   const shouldWriteLog = !hasFlag("--no-write-log");
   const skipBaseline = hasFlag("--skip-baseline");
   const skipLive = hasFlag("--skip-live");
   const skipUi = hasFlag("--skip-ui");
+  const skipPublic = hasFlag("--skip-public");
   const steps = [];
   const startedAt = Date.now();
   const git = getGitMetadata(REPO_ROOT);
@@ -305,6 +320,8 @@ async function main() {
     verifiedAt: "",
     baseUrl,
     uiSuite,
+    publicBaseUrl,
+    publicUiSuite,
     git,
     steps,
   };
@@ -343,6 +360,26 @@ async function main() {
           }
         )
       );
+    }
+
+    if (!skipPublic && publicBaseUrl && publicBaseUrl !== baseUrl) {
+      steps.push(
+        await runNodeStepWithRetry(
+          "public-ui-smoke",
+          "scripts/verify-ui-flow.mjs",
+          ["--suite", publicUiSuite, "--base-url", publicBaseUrl],
+          {
+            maxAttempts: 2,
+            retryDelayMs: 3000,
+          }
+        )
+      );
+    } else {
+      report.publicSmokeSkippedReason = skipPublic
+        ? "skip-public-flag"
+        : publicBaseUrl
+          ? "same-base-url"
+          : "no-public-base-url";
     }
 
     report.ok = true;

@@ -48,6 +48,7 @@ Run these first from the repo root:
 - `npm run verify:baseline`
 - `npm run verify:dxf`
 - `npm run verify:release -- --base-url http://127.0.0.1:3000`
+- when the public share origin is live, also run `npm run verify:release -- --base-url http://127.0.0.1:3000 --public-base-url https://your-domain.example`
 
 The baseline script verifies the local hub route, feature route, health/config shape, security headers, progress-token guard, body-size limit, and radius limit without depending on live external APIs.
 
@@ -59,6 +60,7 @@ The release bundle covers:
 - `verify-live-site-context`
 - extended browser UI smoke for address + DXF, multi-parcel, manual range + 3DM, and `1km` + SKP
 - timestamped JSON reports in `logs/verify-release` for deployment traceability
+- optional public-domain browser smoke when `--public-base-url` is provided
 
 Then run any additional live browser QA you still want beyond the automated bundle:
 

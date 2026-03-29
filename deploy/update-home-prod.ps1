@@ -2,7 +2,8 @@ param(
   [string]$ProdRoot = "C:\SpaceWork_deploy",
   [string]$Branch = "main",
   [switch]$SkipRestart,
-  [switch]$SkipSmoke
+  [switch]$SkipSmoke,
+  [switch]$SkipPublicSmoke
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,6 +32,35 @@ function Get-ServerPort {
   }
 
   return $defaultPort
+}
+
+function Get-PublicBaseUrl {
+  param(
+    [string]$RepoRoot
+  )
+
+  $overrideUrl = [string]$env:VERIFY_RELEASE_PUBLIC_BASE_URL
+  if ($overrideUrl -match '^https://') {
+    return $overrideUrl.TrimEnd('/')
+  }
+
+  $configPath = Join-Path $RepoRoot "config.local.json"
+  if (-not (Test-Path $configPath)) {
+    return ""
+  }
+
+  try {
+    $config = Get-Content $configPath -Raw | ConvertFrom-Json
+    $resolvedUrl = [string]$config.VWORLD_API_DOMAIN
+
+    if ($resolvedUrl -match '^https://') {
+      return $resolvedUrl.TrimEnd('/')
+    }
+  } catch {
+    return ""
+  }
+
+  return ""
 }
 
 if (-not (Test-Path $ProdRoot)) {
@@ -64,8 +94,27 @@ if (-not $SkipSmoke) {
   $verifyScript = Join-Path $ProdRoot "scripts\verify-release.mjs"
 
   if (Test-Path $verifyScript) {
-    Write-Host "Running post-deploy verification bundle on http://127.0.0.1:$serverPort"
-    node $verifyScript --base-url "http://127.0.0.1:$serverPort"
+    $verifyArgs = @(
+      $verifyScript,
+      "--base-url",
+      "http://127.0.0.1:$serverPort"
+    )
+
+    if ($SkipPublicSmoke) {
+      $verifyArgs += "--skip-public"
+      Write-Host "Running post-deploy verification bundle on http://127.0.0.1:$serverPort (public smoke skipped)"
+    } else {
+      $publicBaseUrl = Get-PublicBaseUrl -RepoRoot $ProdRoot
+
+      if ($publicBaseUrl) {
+        $verifyArgs += @("--public-base-url", $publicBaseUrl)
+        Write-Host "Running post-deploy verification bundle on http://127.0.0.1:$serverPort and $publicBaseUrl"
+      } else {
+        Write-Host "Running post-deploy verification bundle on http://127.0.0.1:$serverPort (no HTTPS public origin configured)"
+      }
+    }
+
+    & node @verifyArgs
   } else {
     Write-Warning "Smoke check script not found: $verifyScript"
   }
