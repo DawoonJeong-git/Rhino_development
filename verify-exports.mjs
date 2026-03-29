@@ -4,6 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import {
   buildProviderTimeoutConfig,
+  buildParcelDataCacheKey,
   buildExportArtifactCacheKey,
   buildSiteContextCacheKey,
   buildVWorldDomainCandidates,
@@ -22,6 +23,7 @@ import {
   normalizePublicError,
   normalizeSearchResultsForQuery,
   pruneCacheEntries,
+  readOrLoadResponseCache,
   resolveEffectiveContourBandInterval,
   resolveRateLimitBucket,
   resolveTerrainContourPath,
@@ -504,6 +506,10 @@ async function runBaselineVerification() {
     assert.deepEqual(
       Object.keys(runtimeStatsPayload.caches || {}).sort(),
       [
+        "buildingFloorEntries",
+        "buildingRegisterEntries",
+        "eumLandDetailsEntries",
+        "eumLandPageEntries",
         "exportArtifactEntries",
         "geocodeEntries",
         "openMeteoEntries",
@@ -698,6 +704,62 @@ async function runBaselineVerification() {
       [...boundedCacheStore.keys()],
       ["recent", "newest"],
       "Bounded cache pruning should drop expired entries first and then evict the stalest survivors."
+    );
+    assert.equal(
+      buildParcelDataCacheKey({ pnu: "1111010100100010000" }, "eum-land-page"),
+      "eum-land-page:1111010100100010000",
+      "Parcel data cache keys should be scoped by the parcel PNU."
+    );
+    const responseCacheStore = new Map();
+    const responseCacheInFlight = new Map();
+    let responseCacheLoaderCalls = 0;
+    const loadCachedParcelValue = () =>
+      readOrLoadResponseCache(
+        responseCacheStore,
+        responseCacheInFlight,
+        "eum-land-page:1111010100100010000",
+        async () => {
+          responseCacheLoaderCalls += 1;
+          await delay(20);
+          return {
+            calls: responseCacheLoaderCalls,
+            generatedAt: "test",
+          };
+        },
+        {
+          ttlMs: 1000,
+          maxEntries: 4,
+        }
+      );
+    const [cachedParcelValueA, cachedParcelValueB] = await Promise.all([
+      loadCachedParcelValue(),
+      loadCachedParcelValue(),
+    ]);
+    assert.equal(
+      responseCacheLoaderCalls,
+      1,
+      "Concurrent property-data cache lookups should share a single in-flight loader."
+    );
+    assert.deepEqual(
+      cachedParcelValueA,
+      cachedParcelValueB,
+      "Concurrent property-data cache lookups should resolve to the same payload."
+    );
+    const cachedParcelValueC = await loadCachedParcelValue();
+    assert.equal(
+      responseCacheLoaderCalls,
+      1,
+      "Fresh property-data cache hits should not re-run the loader."
+    );
+    assert.deepEqual(
+      cachedParcelValueC,
+      cachedParcelValueA,
+      "Fresh property-data cache hits should return the cached payload."
+    );
+    assert.equal(
+      responseCacheInFlight.size,
+      0,
+      "Property-data cache should clear in-flight promises once the loader resolves."
     );
     const providerTimeoutEnvKeys = [
       "VWORLD_FETCH_TIMEOUT_MS",
@@ -1833,6 +1895,7 @@ async function runBaselineVerification() {
             "terrain-contour-path-fallback",
             "site-context-cache-export-format",
             "bounded-cache-pruning",
+            "property-data-cache-dedupe",
             "provider-timeout-config",
             "vworld-domain-candidates",
             "security-headers",

@@ -35,6 +35,8 @@ const SITE_CONTEXT_CACHE_TTL_MS = 1000 * 60 * 10;
 const SITE_CONTEXT_CACHE_MAX_ENTRIES = 12;
 const GEOCODE_CACHE_TTL_MS = 1000 * 60 * 10;
 const GEOCODE_CACHE_MAX_ENTRIES = 256;
+const PROPERTY_DATA_CACHE_TTL_MS = 1000 * 60 * 10;
+const PROPERTY_DATA_CACHE_MAX_ENTRIES = 64;
 const EXPORT_ARTIFACT_CACHE_TTL_MS = 1000 * 60 * 5;
 const EXPORT_ARTIFACT_CACHE_MAX_ENTRIES = 8;
 const EXPORT_ARTIFACT_CACHE_MAX_TOTAL_BYTES = 96 * 1024 * 1024;
@@ -117,6 +119,10 @@ const ROAD_LAYER_CANDIDATES = [
 const openMeteoElevationCache = new Map();
 const geocodeCache = new Map();
 const siteContextCache = new Map();
+const eumLandPageCache = new Map();
+const eumLandRelationDetailsCache = new Map();
+const buildingRegisterSummaryCache = new Map();
+const buildingFloorOutlineCache = new Map();
 const exportArtifactCache = new Map();
 const terrainContourCatalogCache = new Map();
 const terrainContourDatasetCache = new Map();
@@ -134,6 +140,10 @@ const roadContourSurfaceGroupCache = new WeakMap();
 const siteContextGeometrySignatureCache = new WeakMap();
 const recentSlowApiRequestEvents = [];
 const recentUpstreamEvents = [];
+const eumLandPageInFlight = new Map();
+const eumLandRelationDetailsInFlight = new Map();
+const buildingRegisterSummaryInFlight = new Map();
+const buildingFloorOutlineInFlight = new Map();
 let rhino3dmInstancePromise = null;
 let activeExportJobs = 0;
 const exportJobWaitQueue = [];
@@ -1861,6 +1871,109 @@ function touchCacheEntry(entry, now = Date.now()) {
 
   entry.lastAccessedAt = now;
   return entry;
+}
+
+function buildParcelDataCacheKey(parcelReference, scope = "") {
+  const normalizedParcelReference = decomposePnu(parcelReference?.pnu) || parcelReference;
+  const pnu = String(normalizedParcelReference?.pnu || "").trim();
+  const normalizedScope = String(scope || "").trim();
+
+  if (!pnu) {
+    return normalizedScope;
+  }
+
+  return normalizedScope ? `${normalizedScope}:${pnu}` : pnu;
+}
+
+function readTimedCachePayload(
+  cacheStore,
+  cacheKey,
+  { now = Date.now(), ttlMs = PROPERTY_DATA_CACHE_TTL_MS, maxEntries = PROPERTY_DATA_CACHE_MAX_ENTRIES } = {}
+) {
+  pruneCacheEntries(cacheStore, {
+    now,
+    maxEntries,
+    isExpired: (entry, timestamp) => Number(entry?.expiresAt || 0) <= timestamp,
+  });
+  const cachedEntry = cacheStore.get(cacheKey);
+
+  if (!cachedEntry) {
+    return { hit: false, payload: null };
+  }
+
+  if (Number(cachedEntry.expiresAt || 0) <= now) {
+    cacheStore.delete(cacheKey);
+    return { hit: false, payload: null };
+  }
+
+  touchCacheEntry(cachedEntry, now);
+  return {
+    hit: true,
+    payload: cachedEntry.payload,
+  };
+}
+
+function writeTimedCachePayload(
+  cacheStore,
+  cacheKey,
+  payload,
+  { now = Date.now(), ttlMs = PROPERTY_DATA_CACHE_TTL_MS, maxEntries = PROPERTY_DATA_CACHE_MAX_ENTRIES } = {}
+) {
+  cacheStore.set(cacheKey, {
+    cachedAt: now,
+    lastAccessedAt: now,
+    expiresAt: now + ttlMs,
+    payload,
+  });
+  pruneCacheEntries(cacheStore, {
+    now,
+    maxEntries,
+    isExpired: (entry, timestamp) => Number(entry?.expiresAt || 0) <= timestamp,
+  });
+}
+
+async function readOrLoadResponseCache(
+  cacheStore,
+  inFlightStore,
+  cacheKey,
+  loadPayload,
+  options = {}
+) {
+  const now = Date.now();
+  const cached = readTimedCachePayload(cacheStore, cacheKey, {
+    now,
+    ttlMs: options?.ttlMs,
+    maxEntries: options?.maxEntries,
+  });
+
+  if (cached.hit) {
+    return cached.payload;
+  }
+
+  const existingPromise = inFlightStore.get(cacheKey);
+
+  if (existingPromise) {
+    return existingPromise;
+  }
+
+  const pendingPromise = (async () => {
+    const payload = await loadPayload();
+    writeTimedCachePayload(cacheStore, cacheKey, payload, {
+      ttlMs: options?.ttlMs,
+      maxEntries: options?.maxEntries,
+    });
+    return payload;
+  })();
+
+  inFlightStore.set(cacheKey, pendingPromise);
+
+  try {
+    return await pendingPromise;
+  } finally {
+    if (inFlightStore.get(cacheKey) === pendingPromise) {
+      inFlightStore.delete(cacheKey);
+    }
+  }
 }
 
 function buildGeocodeCacheKey(query) {
@@ -5668,150 +5781,182 @@ function normalizeOpenApiItems(payload) {
 }
 
 async function fetchBuildingRegisterSummary(parcelReference, config, numOfRows = 100) {
-  const params = new URLSearchParams({
-    serviceKey: config.buildingHubServiceKey,
-    sigunguCd: parcelReference.sigunguCd,
-    bjdongCd: parcelReference.bjdongCd,
-    platGbCd: parcelReference.platGbCd,
-    bun: parcelReference.bun,
-    ji: parcelReference.ji,
-    numOfRows: String(numOfRows),
-    pageNo: "1",
-    _type: "json",
-  });
+  const cacheKey = `${buildParcelDataCacheKey(
+    parcelReference,
+    "building-register-summary"
+  )}:rows=${Number(numOfRows) || 100}`;
 
-  const payload = await retryUpstreamOperation(
+  return readOrLoadResponseCache(
+    buildingRegisterSummaryCache,
+    buildingRegisterSummaryInFlight,
+    cacheKey,
     async () => {
-      const response = await fetchWithTimeout(
-        `https://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo?${params}`,
-        {},
+      const params = new URLSearchParams({
+        serviceKey: config.buildingHubServiceKey,
+        sigunguCd: parcelReference.sigunguCd,
+        bjdongCd: parcelReference.bjdongCd,
+        platGbCd: parcelReference.platGbCd,
+        bun: parcelReference.bun,
+        ji: parcelReference.ji,
+        numOfRows: String(numOfRows),
+        pageNo: "1",
+        _type: "json",
+      });
+
+      const payload = await retryUpstreamOperation(
+        async () => {
+          const response = await fetchWithTimeout(
+            `https://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo?${params}`,
+            {},
+            {
+              requestLabel: "Building HUB request",
+              timeoutMs: config?.providerTimeouts?.buildingHub,
+            }
+          );
+
+          if (!response.ok) {
+            throw new Error(`Building HUB request failed with ${response.status}`);
+          }
+
+          return response.json();
+        },
         {
-          requestLabel: "Building HUB request",
-          timeoutMs: config?.providerTimeouts?.buildingHub,
+          attempts: 2,
+          label: "building-hub-summary",
         }
       );
+      const resultCode = payload?.response?.header?.resultCode;
 
-      if (!response.ok) {
-        throw new Error(`Building HUB request failed with ${response.status}`);
+      if (resultCode && resultCode !== "00") {
+        throw new Error(
+          payload?.response?.header?.resultMsg || "건축물대장 조회에 실패했습니다."
+        );
       }
 
-      return response.json();
+      const items = normalizeOpenApiItems(payload);
+
+      return items
+        .map((item) => ({
+          id: String(item.mgmBldrgstPk || item.rnum || ""),
+          buildingName: String(item.bldNm || "").trim(),
+          dongName: String(item.dongNm || "").trim(),
+          roadAddress: String(item.newPlatPlc || "").trim(),
+          parcelAddress: String(item.platPlc || "").trim(),
+          mainPurpose: String(item.mainPurpsCdNm || "").trim(),
+          etcPurpose: String(item.etcPurps || "").trim(),
+          structureName: String(item.strctCdNm || "").trim(),
+          roofName: String(item.roofCdNm || "").trim(),
+          landAreaSqm: Number(item.platArea || 0),
+          buildingAreaSqm: Number(item.archArea || 0),
+          totalAreaSqm: Number(item.totArea || 0),
+          coverageRatio: Number(item.bcRat || 0),
+          floorAreaRatio: Number(item.vlRat || 0),
+          heightMeters: Number(item.heit || 0),
+          aboveGroundFloors: Number(item.grndFlrCnt || 0),
+          belowGroundFloors: Number(item.ugrndFlrCnt || 0),
+          approvalDate: String(item.useAprDay || "").trim(),
+          registerKind: String(item.regstrKindCdNm || "").trim(),
+          registerKindCode: String(item.regstrKindCd || "").trim(),
+          mainAttachmentType: String(item.mainAtchGbCdNm || "").trim(),
+          mainAttachmentTypeCode: String(item.mainAtchGbCd || "").trim(),
+          parkingCount:
+            Number(item.indrAutoUtcnt || 0) + Number(item.oudrAutoUtcnt || 0),
+          sourceFields: extractOpenApiSourceFields(item),
+        }))
+        .sort((left, right) => right.totalAreaSqm - left.totalAreaSqm);
     },
     {
-      attempts: 2,
-      label: "building-hub-summary",
+      ttlMs: PROPERTY_DATA_CACHE_TTL_MS,
+      maxEntries: PROPERTY_DATA_CACHE_MAX_ENTRIES,
     }
   );
-  const resultCode = payload?.response?.header?.resultCode;
-
-  if (resultCode && resultCode !== "00") {
-    throw new Error(
-      payload?.response?.header?.resultMsg || "건축물대장 조회에 실패했습니다."
-    );
-  }
-
-  const items = normalizeOpenApiItems(payload);
-
-  return items
-    .map((item) => ({
-      id: String(item.mgmBldrgstPk || item.rnum || ""),
-      buildingName: String(item.bldNm || "").trim(),
-      dongName: String(item.dongNm || "").trim(),
-      roadAddress: String(item.newPlatPlc || "").trim(),
-      parcelAddress: String(item.platPlc || "").trim(),
-      mainPurpose: String(item.mainPurpsCdNm || "").trim(),
-      etcPurpose: String(item.etcPurps || "").trim(),
-      structureName: String(item.strctCdNm || "").trim(),
-      roofName: String(item.roofCdNm || "").trim(),
-      landAreaSqm: Number(item.platArea || 0),
-      buildingAreaSqm: Number(item.archArea || 0),
-      totalAreaSqm: Number(item.totArea || 0),
-      coverageRatio: Number(item.bcRat || 0),
-      floorAreaRatio: Number(item.vlRat || 0),
-      heightMeters: Number(item.heit || 0),
-      aboveGroundFloors: Number(item.grndFlrCnt || 0),
-      belowGroundFloors: Number(item.ugrndFlrCnt || 0),
-      approvalDate: String(item.useAprDay || "").trim(),
-      registerKind: String(item.regstrKindCdNm || "").trim(),
-      registerKindCode: String(item.regstrKindCd || "").trim(),
-      mainAttachmentType: String(item.mainAtchGbCdNm || "").trim(),
-      mainAttachmentTypeCode: String(item.mainAtchGbCd || "").trim(),
-      parkingCount:
-        Number(item.indrAutoUtcnt || 0) + Number(item.oudrAutoUtcnt || 0),
-      sourceFields: extractOpenApiSourceFields(item),
-    }))
-    .sort((left, right) => right.totalAreaSqm - left.totalAreaSqm);
 }
 
 async function fetchBuildingFloorOutline(parcelReference, config, numOfRows = 1000) {
-  const params = new URLSearchParams({
-    serviceKey: config.buildingHubServiceKey,
-    sigunguCd: parcelReference.sigunguCd,
-    bjdongCd: parcelReference.bjdongCd,
-    platGbCd: parcelReference.platGbCd,
-    bun: parcelReference.bun,
-    ji: parcelReference.ji,
-    numOfRows: String(numOfRows),
-    pageNo: "1",
-    _type: "json",
-  });
+  const cacheKey = `${buildParcelDataCacheKey(
+    parcelReference,
+    "building-floor-outline"
+  )}:rows=${Number(numOfRows) || 1000}`;
 
-  const payload = await retryUpstreamOperation(
+  return readOrLoadResponseCache(
+    buildingFloorOutlineCache,
+    buildingFloorOutlineInFlight,
+    cacheKey,
     async () => {
-      const response = await fetchWithTimeout(
-        `https://apis.data.go.kr/1613000/BldRgstHubService/getBrFlrOulnInfo?${params}`,
-        {},
+      const params = new URLSearchParams({
+        serviceKey: config.buildingHubServiceKey,
+        sigunguCd: parcelReference.sigunguCd,
+        bjdongCd: parcelReference.bjdongCd,
+        platGbCd: parcelReference.platGbCd,
+        bun: parcelReference.bun,
+        ji: parcelReference.ji,
+        numOfRows: String(numOfRows),
+        pageNo: "1",
+        _type: "json",
+      });
+
+      const payload = await retryUpstreamOperation(
+        async () => {
+          const response = await fetchWithTimeout(
+            `https://apis.data.go.kr/1613000/BldRgstHubService/getBrFlrOulnInfo?${params}`,
+            {},
+            {
+              requestLabel: "Building HUB floor request",
+              timeoutMs: config?.providerTimeouts?.buildingHub,
+            }
+          );
+
+          if (!response.ok) {
+            throw new Error(`Building HUB floor request failed with ${response.status}`);
+          }
+
+          return response.json();
+        },
         {
-          requestLabel: "Building HUB floor request",
-          timeoutMs: config?.providerTimeouts?.buildingHub,
+          attempts: 2,
+          label: "building-hub-floor",
         }
       );
+      const resultCode = payload?.response?.header?.resultCode;
 
-      if (!response.ok) {
-        throw new Error(`Building HUB floor request failed with ${response.status}`);
+      if (resultCode && resultCode !== "00") {
+        throw new Error(
+          payload?.response?.header?.resultMsg || "건축물 층별현황 조회에 실패했습니다."
+        );
       }
 
-      return response.json();
+      const items = normalizeOpenApiItems(payload);
+
+      return items
+        .map((item) => ({
+          dongName: String(item.dongNm || "").trim(),
+          floorTypeCode: String(item.flrGbCd || "").trim(),
+          floorTypeName: String(item.flrGbCdNm || "").trim(),
+          floorNo: String(item.flrNo || "").trim(),
+          floorName: String(item.flrNoNm || "").trim(),
+          structureName: String(item.etcStrct || "").trim(),
+          purpose: String(item.etcPurps || "").trim(),
+          areaSquareMeters: Number(item.area || 0),
+          sourceFields: extractOpenApiSourceFields(item),
+        }))
+        .sort((left, right) => {
+          const leftType = Number(left.floorTypeCode || 0);
+          const rightType = Number(right.floorTypeCode || 0);
+
+          if (leftType !== rightType) {
+            return leftType - rightType;
+          }
+
+          const leftFloor = Number(left.floorNo || 0);
+          const rightFloor = Number(right.floorNo || 0);
+          return leftFloor - rightFloor;
+        });
     },
     {
-      attempts: 2,
-      label: "building-hub-floor",
+      ttlMs: PROPERTY_DATA_CACHE_TTL_MS,
+      maxEntries: PROPERTY_DATA_CACHE_MAX_ENTRIES,
     }
   );
-  const resultCode = payload?.response?.header?.resultCode;
-
-  if (resultCode && resultCode !== "00") {
-    throw new Error(
-      payload?.response?.header?.resultMsg || "건축물 층별현황 조회에 실패했습니다."
-    );
-  }
-
-  const items = normalizeOpenApiItems(payload);
-
-  return items
-    .map((item) => ({
-      dongName: String(item.dongNm || "").trim(),
-      floorTypeCode: String(item.flrGbCd || "").trim(),
-      floorTypeName: String(item.flrGbCdNm || "").trim(),
-      floorNo: String(item.flrNo || "").trim(),
-      floorName: String(item.flrNoNm || "").trim(),
-      structureName: String(item.etcStrct || "").trim(),
-      purpose: String(item.etcPurps || "").trim(),
-      areaSquareMeters: Number(item.area || 0),
-      sourceFields: extractOpenApiSourceFields(item),
-    }))
-    .sort((left, right) => {
-      const leftType = Number(left.floorTypeCode || 0);
-      const rightType = Number(right.floorTypeCode || 0);
-
-      if (leftType !== rightType) {
-        return leftType - rightType;
-      }
-
-      const leftFloor = Number(left.floorNo || 0);
-      const rightFloor = Number(right.floorNo || 0);
-      return leftFloor - rightFloor;
-    });
 }
 
 function escapeRegExp(value) {
@@ -6219,46 +6364,61 @@ function parseEumLandInfoHtml(html, parcelReference, location) {
 }
 
 async function fetchEumLandPage(parcelReference, location, config = null) {
-  const formBody = new URLSearchParams({
-    selGbn: "umd",
-    isNoScr: "script",
-    s_type: "1",
-    mode: "search",
-    sggcd: parcelReference.sigunguCd,
-    pnu: parcelReference.pnu,
-    p_location: buildSystemAddress(location),
-  });
-  const html = await retryUpstreamOperation(
+  const cacheKey = buildParcelDataCacheKey(parcelReference, "eum-land-page");
+  const cachedPage = await readOrLoadResponseCache(
+    eumLandPageCache,
+    eumLandPageInFlight,
+    cacheKey,
     async () => {
-      const response = await fetchWithTimeout(
-        "https://www.eum.go.kr/web/ar/lu/luLandDet.jsp",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-          },
-          body: formBody.toString(),
+      const formBody = new URLSearchParams({
+        selGbn: "umd",
+        isNoScr: "script",
+        s_type: "1",
+        mode: "search",
+        sggcd: parcelReference.sigunguCd,
+        pnu: parcelReference.pnu,
+        p_location: buildSystemAddress(location),
+      });
+      const html = await retryUpstreamOperation(
+        async () => {
+          const response = await fetchWithTimeout(
+            "https://www.eum.go.kr/web/ar/lu/luLandDet.jsp",
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+              },
+              body: formBody.toString(),
+            },
+            {
+              requestLabel: "EUM request",
+              timeoutMs: config?.providerTimeouts?.eum,
+            }
+          );
+
+          if (!response.ok) {
+            throw new Error(`EUM request failed with ${response.status}`);
+          }
+
+          return readEncodedResponseText(response, "euc-kr");
         },
         {
-          requestLabel: "EUM request",
-          timeoutMs: config?.providerTimeouts?.eum,
+          attempts: 2,
+          label: "eum-page",
         }
       );
 
-      if (!response.ok) {
-        throw new Error(`EUM request failed with ${response.status}`);
-      }
-
-      return readEncodedResponseText(response, "euc-kr");
+      return { html };
     },
     {
-      attempts: 2,
-      label: "eum-page",
+      ttlMs: PROPERTY_DATA_CACHE_TTL_MS,
+      maxEntries: PROPERTY_DATA_CACHE_MAX_ENTRIES,
     }
   );
+
   return {
-    html,
-    landInfo: parseEumLandInfoHtml(html, parcelReference, location),
+    html: cachedPage.html,
+    landInfo: parseEumLandInfoHtml(cachedPage.html, parcelReference, location),
   };
 }
 
@@ -6269,10 +6429,24 @@ async function fetchEumLandInfo(parcelReference, location, config = null) {
 
 async function fetchEumLandInfoDetails(parcelReference, location, config) {
   const page = await fetchEumLandPage(parcelReference, location, config);
-  const details = await fetchEumLandRelationDetails(
+  const detailsCacheKey = `${buildParcelDataCacheKey(
     parcelReference,
-    page.html,
-    config
+    "eum-land-details"
+  )}:buildingHub=${config?.buildingHubServiceKey ? "on" : "off"}`;
+  const details = await readOrLoadResponseCache(
+    eumLandRelationDetailsCache,
+    eumLandRelationDetailsInFlight,
+    detailsCacheKey,
+    () =>
+      fetchEumLandRelationDetails(
+        parcelReference,
+        page.html,
+        config
+      ),
+    {
+      ttlMs: PROPERTY_DATA_CACHE_TTL_MS,
+      maxEntries: PROPERTY_DATA_CACHE_MAX_ENTRIES,
+    }
   );
 
   return {
@@ -15619,6 +15793,10 @@ function buildRuntimeStatsPayload() {
       geocodeEntries: geocodeCache.size,
       openMeteoEntries: openMeteoElevationCache.size,
       siteContextEntries: siteContextCache.size,
+      eumLandPageEntries: eumLandPageCache.size,
+      eumLandDetailsEntries: eumLandRelationDetailsCache.size,
+      buildingRegisterEntries: buildingRegisterSummaryCache.size,
+      buildingFloorEntries: buildingFloorOutlineCache.size,
       exportArtifactEntries: exportArtifactCache.size,
       requestProgressEntries: requestProgressStore.size,
     },
@@ -18672,6 +18850,7 @@ export {
   buildProviderTimeoutConfig,
   build3dmFromSiteContext,
   buildClipBoundary,
+  buildParcelDataCacheKey,
   buildSiteContextCacheKey,
   buildVWorldDomainCandidates,
   buildCumulativeContourBandGroups,
@@ -18697,6 +18876,7 @@ export {
   normalizeSearchResultsForQuery,
   prepareSiteContextForExport,
   pruneCacheEntries,
+  readOrLoadResponseCache,
   resolveRateLimitBucket,
   resolveRawTerrainHeightAtLocalPoint,
   resolveEffectiveContourBandInterval,
