@@ -15,6 +15,7 @@ Use this exact sequence right before release:
 9. Run `npm run verify:release -- --base-url http://127.0.0.1:3000`.
    If you also want the real share origin checked, add `--public-base-url https://your-domain.example`.
    The bundle writes a timestamped JSON report plus `latest.json` into `logs/verify-release`.
+   With `--public-base-url`, the bundle now also verifies that the public origin keeps `/api/health` reachable while `/api/runtime-stats` stays blocked with `403`.
 10. Keep the previous image tag and one known-good parcel for rollback.
 
 ## Recommended Shape

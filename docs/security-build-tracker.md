@@ -47,11 +47,11 @@ Complete the security problem-solving build for the current project stage.
 - [x] real deployment clone runtime config aligned with the actual share domain and contour dataset path
 - [x] strict runtime release-gate verification passes on the real deployment clone
 - [x] real deployment clone was restarted after the runtime config change and local health responds
+- [x] real share origin smoke now verifies both allowed browser flow and blocked `runtime-stats` access
 
 ### In Progress
 
-- [ ] run one external allowed-user smoke test through Cloudflare Access
-- [ ] confirm blocked access is denied outside the trusted path
+- [ ] confirm blocked access is denied for a truly blocked identity or blocked remote IP outside the trusted path
 - [ ] review provider-specific timeout values against real parcel flows
 
 ### Not Started
@@ -77,16 +77,16 @@ Complete the security problem-solving build for the current project stage.
 ## Active Risks
 
 - controlled sharing still depends on Cloudflare Access or an equivalent allowlist being configured correctly at deploy time
-- the external Access policy has not yet been re-smoke-tested from an allowed identity and a blocked path after the latest restart
+- the external Access policy has not yet been re-smoke-tested from a truly blocked identity or blocked remote IP after the latest restart
 - some provider-specific timeouts may still need tuning based on real usage
 
 ## Next 5 Tasks
 
-1. run an allowed-user browser smoke through `https://app.spaceswork.net`
-2. verify a blocked path still fails outside Cloudflare Access or the allowlist
-3. review provider-specific timeout values against real parcel flows
-4. expand security verification coverage beyond the current baseline
-5. decide whether an operator-only smoke checklist is still needed after the current release gates
+1. verify a truly blocked identity or blocked remote IP still fails outside Cloudflare Access or the allowlist
+2. review provider-specific timeout values against real parcel flows
+3. expand security verification coverage beyond the current baseline
+4. decide whether an operator-only smoke checklist is still needed after the current release gates
+5. keep the real share origin smoke in the deploy routine
 
 ## Resume From Here
 

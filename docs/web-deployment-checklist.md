@@ -60,6 +60,7 @@ The release bundle covers:
 - `verify-live-site-context`
 - extended browser UI smoke for address + DXF, multi-parcel, manual range + 3DM, and `1km` + SKP
 - timestamped JSON reports in `logs/verify-release` for deployment traceability
+- optional public-domain security smoke for `health open + runtime-stats blocked`
 - optional public-domain browser smoke when `--public-base-url` is provided
 
 Then run any additional live browser QA you still want beyond the automated bundle:

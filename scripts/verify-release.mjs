@@ -365,6 +365,17 @@ async function main() {
     if (!skipPublic && publicBaseUrl && publicBaseUrl !== baseUrl) {
       steps.push(
         await runNodeStepWithRetry(
+          "public-security-smoke",
+          "scripts/verify-public-origin.mjs",
+          ["--base-url", publicBaseUrl],
+          {
+            maxAttempts: 2,
+            retryDelayMs: 1000,
+          }
+        )
+      );
+      steps.push(
+        await runNodeStepWithRetry(
           "public-ui-smoke",
           "scripts/verify-ui-flow.mjs",
           ["--suite", publicUiSuite, "--base-url", publicBaseUrl],

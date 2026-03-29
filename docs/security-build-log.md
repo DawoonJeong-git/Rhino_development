@@ -352,3 +352,39 @@ Cleared the real-share runtime blockers in the deployment clone and confirmed th
 - test the actual Access-protected hostname from an allowed identity
 - test the same hostname from a blocked path or blocked identity
 - keep the tracker updated with the Access smoke result
+
+---
+
+## 2026-03-30 Session 1
+
+### Summary
+
+Extended the release verification flow so the real share origin now checks both an allowed public flow and a blocked sensitive path.
+
+### Changes Completed
+
+- added `scripts/verify-public-origin.mjs`
+- added `npm run verify:public-origin`
+- extended `scripts/verify-release.mjs` so `--public-base-url` now runs:
+  - `public-security-smoke`
+  - `public-ui-smoke`
+- kept `deploy/update-home-prod.ps1` wired so the production clone automatically uses the HTTPS share origin from `config.local.json`
+- updated deployment and security docs to document the new public-origin verification step
+- updated the security tracker to reflect that the public origin now has automated allowed-flow plus blocked-sensitive-endpoint coverage
+
+### Verification
+
+- `npm run verify:public-origin -- --base-url https://app.spaceswork.net` passed
+- `npm run verify:release -- --base-url http://127.0.0.1:3000 --public-base-url https://app.spaceswork.net` passed
+- `C:\SpaceWork_deploy\logs\verify-release\latest.json` now records both `public-security-smoke` and `public-ui-smoke`
+
+### Open Items
+
+- confirm a truly blocked identity or blocked remote IP still receives denial outside the trusted path
+- review provider-specific timeout values against more real parcel runs
+- decide whether an operator-only smoke checklist is still needed after the current release gates
+
+### Recommended Next Session
+
+- test the real share hostname from a blocked identity or blocked remote IP
+- keep the tracker updated with that final deny-path confirmation

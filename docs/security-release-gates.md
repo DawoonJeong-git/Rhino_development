@@ -80,6 +80,12 @@ If you want to validate the actual runtime values on the share target more stric
 node scripts/verify-deployment-security.mjs --root C:\SpaceWork_deploy --strict-runtime
 ```
 
+If the public share origin is live, also run:
+
+```bash
+npm run verify:public-origin -- --base-url https://your-domain.example
+```
+
 The strict runtime mode is intended to catch real-share blockers such as:
 
 - `VWORLD_API_DOMAIN` still pointing at `localhost`
@@ -101,6 +107,11 @@ The strict runtime mode is intended to catch real-share blockers such as:
 - allowlist fallback example presence
 - access-layer documentation presence
 - local `.env.production` and `config.local.json` values when those files exist
+
+`verify:public-origin` covers:
+
+- public health reachability on the real share origin
+- public `403` protection for `/api/runtime-stats`
 
 ## Gate 4. Live Smoke Before Sharing
 
