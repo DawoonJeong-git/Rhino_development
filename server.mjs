@@ -65,6 +65,16 @@ const DEFAULT_BIND_HOST = "127.0.0.1";
 const DEFAULT_OUTBOUND_FETCH_TIMEOUT_MS = 15_000;
 const LONG_OUTBOUND_FETCH_TIMEOUT_MS = 25_000;
 const OVERPASS_FETCH_TIMEOUT_MS = 35_000;
+const DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS = Object.freeze({
+  vworld: 20_000,
+  juso: 18_000,
+  buildingHub: 20_000,
+  eum: LONG_OUTBOUND_FETCH_TIMEOUT_MS,
+  nominatim: 10_000,
+  openMeteo: 12_000,
+  openTopoData: 18_000,
+  overpass: OVERPASS_FETCH_TIMEOUT_MS,
+});
 const DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS = 1000 * 60 * 8;
 const DEFAULT_MAX_PENDING_EXPORT_JOBS_PER_CLIENT = 2;
 const DEFAULT_EXPORT_JOB_DURATION_ESTIMATE_MS = 1000 * 45;
@@ -1094,6 +1104,59 @@ function resolveTerrainContourPath(configuredPath = "") {
   };
 }
 
+function buildProviderTimeoutConfig(localConfig = {}) {
+  return {
+    vworld: resolvePositiveInteger(
+      process.env.VWORLD_FETCH_TIMEOUT_MS ||
+        localConfig.VWORLD_FETCH_TIMEOUT_MS ||
+        DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.vworld,
+      DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.vworld
+    ),
+    juso: resolvePositiveInteger(
+      process.env.JUSO_FETCH_TIMEOUT_MS ||
+        localConfig.JUSO_FETCH_TIMEOUT_MS ||
+        DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.juso,
+      DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.juso
+    ),
+    buildingHub: resolvePositiveInteger(
+      process.env.BUILDING_HUB_FETCH_TIMEOUT_MS ||
+        localConfig.BUILDING_HUB_FETCH_TIMEOUT_MS ||
+        DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.buildingHub,
+      DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.buildingHub
+    ),
+    eum: resolvePositiveInteger(
+      process.env.EUM_FETCH_TIMEOUT_MS ||
+        localConfig.EUM_FETCH_TIMEOUT_MS ||
+        DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.eum,
+      DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.eum
+    ),
+    nominatim: resolvePositiveInteger(
+      process.env.NOMINATIM_FETCH_TIMEOUT_MS ||
+        localConfig.NOMINATIM_FETCH_TIMEOUT_MS ||
+        DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.nominatim,
+      DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.nominatim
+    ),
+    openMeteo: resolvePositiveInteger(
+      process.env.OPEN_METEO_FETCH_TIMEOUT_MS ||
+        localConfig.OPEN_METEO_FETCH_TIMEOUT_MS ||
+        DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.openMeteo,
+      DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.openMeteo
+    ),
+    openTopoData: resolvePositiveInteger(
+      process.env.OPEN_TOPO_DATA_FETCH_TIMEOUT_MS ||
+        localConfig.OPEN_TOPO_DATA_FETCH_TIMEOUT_MS ||
+        DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.openTopoData,
+      DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.openTopoData
+    ),
+    overpass: resolvePositiveInteger(
+      process.env.OVERPASS_FETCH_TIMEOUT_MS ||
+        localConfig.OVERPASS_FETCH_TIMEOUT_MS ||
+        DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.overpass,
+      DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS.overpass
+    ),
+  };
+}
+
 function buildRuntimeConfig(localConfig) {
   const maxSiteRadiusMeters = resolvePositiveInteger(
     process.env.MAX_SITE_RADIUS_METERS ||
@@ -1197,6 +1260,7 @@ function buildRuntimeConfig(localConfig) {
         DEFAULT_MAX_PENDING_EXPORT_JOBS_PER_CLIENT,
       DEFAULT_MAX_PENDING_EXPORT_JOBS_PER_CLIENT
     ),
+    providerTimeouts: buildProviderTimeoutConfig(localConfig),
     rateLimits: {
       api: {
         maxRequests: 120,
@@ -3613,6 +3677,7 @@ async function fetchVWorldFeatureCollection(
             {},
             {
               requestLabel: "VWorld data request",
+              timeoutMs: config?.providerTimeouts?.vworld,
             }
           );
 
@@ -4095,19 +4160,28 @@ async function searchJuso(query, config) {
     addInfoYn: "Y",
   });
 
-  const response = await fetchWithTimeout(
-    `https://business.juso.go.kr/addrlink/addrLinkApi.do?${params}`,
-    {},
+  const payload = await retryUpstreamOperation(
+    async () => {
+      const response = await fetchWithTimeout(
+        `https://business.juso.go.kr/addrlink/addrLinkApi.do?${params}`,
+        {},
+        {
+          requestLabel: "Juso search request",
+          timeoutMs: config?.providerTimeouts?.juso,
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Juso search failed with ${response.status}`);
+      }
+
+      return response.json();
+    },
     {
-      requestLabel: "Juso search request",
+      attempts: 2,
+      label: "juso-search",
     }
   );
-
-  if (!response.ok) {
-    throw new Error(`Juso search failed with ${response.status}`);
-  }
-
-  const payload = await response.json();
   const items = Array.isArray(payload?.results?.juso)
     ? payload.results.juso
     : payload?.results?.juso
@@ -4244,7 +4318,7 @@ async function geocodeJusoCandidate(item, config) {
   }
 
   if (!result && config.useNominatimFallback) {
-    const fallbackResults = await geocodeWithNominatim(query);
+    const fallbackResults = await geocodeWithNominatim(query, config);
     result = fallbackResults[0] || null;
   }
 
@@ -4601,7 +4675,7 @@ async function geocodeWithPreferredProviders(query, config) {
     let fallbackResults = [];
 
     try {
-      fallbackResults = await geocodeWithNominatim(query);
+      fallbackResults = await geocodeWithNominatim(query, config);
     } catch (error) {
       providerErrors.push(error);
     }
@@ -5071,7 +5145,7 @@ function mapOverpassRoadCollection(payload) {
   );
 }
 
-async function fetchOverpassRoadCollection(clipFeature) {
+async function fetchOverpassRoadCollection(clipFeature, config = null) {
   const clipRing = getOuterRing(clipFeature);
 
   if (!clipRing?.length) {
@@ -5098,7 +5172,7 @@ out geom;`;
         },
         {
           requestLabel: "Overpass road request",
-          timeoutMs: OVERPASS_FETCH_TIMEOUT_MS,
+          timeoutMs: config?.providerTimeouts?.overpass,
         }
       );
 
@@ -5268,7 +5342,7 @@ function mapOverpassBuildingCollection(payload) {
   );
 }
 
-async function fetchOverpassBuildingCollection(clipFeature) {
+async function fetchOverpassBuildingCollection(clipFeature, config = null) {
   const clipRing = getOuterRing(clipFeature);
 
   if (!clipRing?.length) {
@@ -5295,7 +5369,7 @@ out geom;`;
         },
         {
           requestLabel: "Overpass building request",
-          timeoutMs: OVERPASS_FETCH_TIMEOUT_MS,
+          timeoutMs: config?.providerTimeouts?.overpass,
         }
       );
 
@@ -5521,19 +5595,28 @@ async function fetchBuildingRegisterSummary(parcelReference, config, numOfRows =
     _type: "json",
   });
 
-  const response = await fetchWithTimeout(
-    `https://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo?${params}`,
-    {},
+  const payload = await retryUpstreamOperation(
+    async () => {
+      const response = await fetchWithTimeout(
+        `https://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo?${params}`,
+        {},
+        {
+          requestLabel: "Building HUB request",
+          timeoutMs: config?.providerTimeouts?.buildingHub,
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Building HUB request failed with ${response.status}`);
+      }
+
+      return response.json();
+    },
     {
-      requestLabel: "Building HUB request",
+      attempts: 2,
+      label: "building-hub-summary",
     }
   );
-
-  if (!response.ok) {
-    throw new Error(`Building HUB request failed with ${response.status}`);
-  }
-
-  const payload = await response.json();
   const resultCode = payload?.response?.header?.resultCode;
 
   if (resultCode && resultCode !== "00") {
@@ -5588,19 +5671,28 @@ async function fetchBuildingFloorOutline(parcelReference, config, numOfRows = 10
     _type: "json",
   });
 
-  const response = await fetchWithTimeout(
-    `https://apis.data.go.kr/1613000/BldRgstHubService/getBrFlrOulnInfo?${params}`,
-    {},
+  const payload = await retryUpstreamOperation(
+    async () => {
+      const response = await fetchWithTimeout(
+        `https://apis.data.go.kr/1613000/BldRgstHubService/getBrFlrOulnInfo?${params}`,
+        {},
+        {
+          requestLabel: "Building HUB floor request",
+          timeoutMs: config?.providerTimeouts?.buildingHub,
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Building HUB floor request failed with ${response.status}`);
+      }
+
+      return response.json();
+    },
     {
-      requestLabel: "Building HUB floor request",
+      attempts: 2,
+      label: "building-hub-floor",
     }
   );
-
-  if (!response.ok) {
-    throw new Error(`Building HUB floor request failed with ${response.status}`);
-  }
-
-  const payload = await response.json();
   const resultCode = payload?.response?.header?.resultCode;
 
   if (resultCode && resultCode !== "00") {
@@ -5732,25 +5824,33 @@ function buildEumConnectorUrl(serviceUrl, key, params = {}) {
   return `https://www.eum.go.kr/dataapis/UrlConnector.jsp?url=${segments.join("|")}`;
 }
 
-async function fetchEumConnectorXml(serviceUrl, key, params = {}) {
+async function fetchEumConnectorXml(serviceUrl, key, params = {}, config = null) {
   if (!serviceUrl || !key) {
     return "";
   }
 
-  const response = await fetchWithTimeout(
-    buildEumConnectorUrl(serviceUrl, key, params),
-    {},
+  return retryUpstreamOperation(
+    async () => {
+      const response = await fetchWithTimeout(
+        buildEumConnectorUrl(serviceUrl, key, params),
+        {},
+        {
+          requestLabel: "EUM detail request",
+          timeoutMs: config?.providerTimeouts?.eum,
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`EUM detail request failed with ${response.status}`);
+      }
+
+      return readResponseTextWithCharset(response, "utf-8");
+    },
     {
-      requestLabel: "EUM detail request",
-      timeoutMs: LONG_OUTBOUND_FETCH_TIMEOUT_MS,
+      attempts: 2,
+      label: "eum-detail",
     }
   );
-
-  if (!response.ok) {
-    throw new Error(`EUM detail request failed with ${response.status}`);
-  }
-
-  return readResponseTextWithCharset(response, "utf-8");
 }
 
 function pickLatestRecord(records, primaryKey, secondaryKey = "") {
@@ -5797,7 +5897,8 @@ async function fetchEumLandRelationDetails(parcelReference, html, config) {
         runtimeConfig.landMoveAttrKey,
         {
           pnu: parcelReference.pnu,
-        }
+        },
+        config
       );
 
       details.landOwnership = {
@@ -5824,7 +5925,8 @@ async function fetchEumLandRelationDetails(parcelReference, html, config) {
         {
           pnu: parcelReference.pnu,
           numOfRows: 50,
-        }
+        },
+        config
       );
       const records = parseXmlRecords(xml, "field");
       const latest = pickLatestRecord(records, "lastUpdtDt", "stdrYear");
@@ -5858,7 +5960,8 @@ async function fetchEumLandRelationDetails(parcelReference, html, config) {
           startDt: "19000101",
           endDt: today,
           numOfRows: 30,
-        }
+        },
+        config
       );
       const records = parseXmlRecords(xml, "field");
 
@@ -6030,7 +6133,7 @@ function parseEumLandInfoHtml(html, parcelReference, location) {
   };
 }
 
-async function fetchEumLandPage(parcelReference, location) {
+async function fetchEumLandPage(parcelReference, location, config = null) {
   const formBody = new URLSearchParams({
     selGbn: "umd",
     isNoScr: "script",
@@ -6040,39 +6143,47 @@ async function fetchEumLandPage(parcelReference, location) {
     pnu: parcelReference.pnu,
     p_location: buildSystemAddress(location),
   });
-  const response = await fetchWithTimeout(
-    "https://www.eum.go.kr/web/ar/lu/luLandDet.jsp",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-      },
-      body: formBody.toString(),
+  const html = await retryUpstreamOperation(
+    async () => {
+      const response = await fetchWithTimeout(
+        "https://www.eum.go.kr/web/ar/lu/luLandDet.jsp",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+          },
+          body: formBody.toString(),
+        },
+        {
+          requestLabel: "EUM request",
+          timeoutMs: config?.providerTimeouts?.eum,
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`EUM request failed with ${response.status}`);
+      }
+
+      return readEncodedResponseText(response, "euc-kr");
     },
     {
-      requestLabel: "EUM request",
-      timeoutMs: LONG_OUTBOUND_FETCH_TIMEOUT_MS,
+      attempts: 2,
+      label: "eum-page",
     }
   );
-
-  if (!response.ok) {
-    throw new Error(`EUM request failed with ${response.status}`);
-  }
-
-  const html = await readEncodedResponseText(response, "euc-kr");
   return {
     html,
     landInfo: parseEumLandInfoHtml(html, parcelReference, location),
   };
 }
 
-async function fetchEumLandInfo(parcelReference, location) {
-  const page = await fetchEumLandPage(parcelReference, location);
+async function fetchEumLandInfo(parcelReference, location, config = null) {
+  const page = await fetchEumLandPage(parcelReference, location, config);
   return page.landInfo;
 }
 
 async function fetchEumLandInfoDetails(parcelReference, location, config) {
-  const page = await fetchEumLandPage(parcelReference, location);
+  const page = await fetchEumLandPage(parcelReference, location, config);
   const details = await fetchEumLandRelationDetails(
     parcelReference,
     page.html,
@@ -6111,6 +6222,7 @@ async function searchVWorldCategory(query, category, config) {
             {},
             {
               requestLabel: `VWorld ${category} geocode request`,
+              timeoutMs: config?.providerTimeouts?.vworld,
             }
           );
 
@@ -6188,7 +6300,7 @@ async function geocodeWithVWorld(query, config) {
   return [];
 }
 
-async function geocodeWithNominatim(query) {
+async function geocodeWithNominatim(query, config = null) {
   const params = new URLSearchParams({
     q: query,
     format: "jsonv2",
@@ -6205,6 +6317,7 @@ async function geocodeWithNominatim(query) {
     },
     {
       requestLabel: "Nominatim geocode request",
+      timeoutMs: config?.providerTimeouts?.nominatim,
     }
   );
 
@@ -6447,42 +6560,72 @@ function parseParcelAddressReference(value) {
 }
 
 async function reverseWithVWorld(lat, lng, config) {
-  const params = new URLSearchParams({
-    key: config.vworldApiKey,
-    service: "address",
-    request: "getAddress",
-    version: "2.0",
-    point: `${lng},${lat}`,
-    crs: "EPSG:4326",
-    format: "json",
-    type: "both",
-    simple: "false",
-  });
+  const domainCandidates = buildVWorldDomainCandidates(config);
+  let payload = null;
+  let lastError = null;
 
-  if (config.vworldApiDomain) {
-    params.set("domain", config.vworldApiDomain);
-  }
+  for (const domainCandidate of domainCandidates) {
+    try {
+      payload = await retryUpstreamOperation(
+        async () => {
+          const params = new URLSearchParams({
+            key: config.vworldApiKey,
+            service: "address",
+            request: "getAddress",
+            version: "2.0",
+            point: `${lng},${lat}`,
+            crs: "EPSG:4326",
+            format: "json",
+            type: "both",
+            simple: "false",
+            domain: domainCandidate,
+          });
+          const response = await fetchWithTimeout(
+            `https://api.vworld.kr/req/address?${params}`,
+            {},
+            {
+              requestLabel: "VWorld reverse geocode request",
+              timeoutMs: config?.providerTimeouts?.vworld,
+            }
+          );
 
-  const response = await fetchWithTimeout(
-    `https://api.vworld.kr/req/address?${params}`,
-    {},
-    {
-      requestLabel: "VWorld reverse geocode request",
+          if (!response.ok) {
+            throw new Error(`VWorld reverse geocode failed with ${response.status}`);
+          }
+
+          const nextPayload = await response.json();
+          const status = getVWorldResponseStatus(nextPayload);
+
+          if (status && status !== "OK") {
+            throw new Error(
+              getVWorldResponseErrorText(nextPayload) ||
+                `VWorld reverse geocode returned ${status}`
+            );
+          }
+
+          return nextPayload;
+        },
+        {
+          attempts: 2,
+          label: `vworld-reverse:${domainCandidate}`,
+        }
+      );
+      break;
+    } catch (error) {
+      lastError = error;
+
+      if (domainCandidate !== domainCandidates[domainCandidates.length - 1]) {
+        console.warn(
+          `[vworld-domain-fallback] reverse domain=${domainCandidate} reason=${
+            error instanceof Error ? error.message : error
+          }`
+        );
+      }
     }
-  );
-
-  if (!response.ok) {
-    throw new Error(`VWorld reverse geocode failed with ${response.status}`);
   }
 
-  const payload = await response.json();
-  const status = getVWorldResponseStatus(payload);
-
-  if (status && status !== "OK") {
-    throw new Error(
-      getVWorldResponseErrorText(payload) ||
-        `VWorld reverse geocode returned ${status}`
-    );
+  if (!payload) {
+    throw lastError || new Error("VWorld reverse geocode request failed.");
   }
 
   const results = Array.isArray(payload?.response?.result)
@@ -6529,7 +6672,7 @@ async function reverseWithVWorld(lat, lng, config) {
   };
 }
 
-async function reverseWithNominatim(lat, lng) {
+async function reverseWithNominatim(lat, lng, config = null) {
   const params = new URLSearchParams({
     lat: String(lat),
     lon: String(lng),
@@ -6545,6 +6688,7 @@ async function reverseWithNominatim(lat, lng) {
     },
     {
       requestLabel: "Nominatim reverse geocode request",
+      timeoutMs: config?.providerTimeouts?.nominatim,
     }
   );
 
@@ -6777,7 +6921,7 @@ async function mapItemsWithConcurrency(items, concurrency, mapper) {
   return results;
 }
 
-async function fetchOpenMeteoElevationChunk(points) {
+async function fetchOpenMeteoElevationChunk(points, timeoutMs = undefined) {
   const cacheKey = points
     .map((point) => `${point.lat.toFixed(6)},${point.lng.toFixed(6)}`)
     .join("|");
@@ -6812,6 +6956,7 @@ async function fetchOpenMeteoElevationChunk(points) {
         },
         {
           requestLabel: "Open-Meteo elevation request",
+          timeoutMs,
         }
       );
 
@@ -6851,8 +6996,14 @@ async function fetchOpenMeteoElevationChunk(points) {
 
   if (points.length > 12) {
     const midpoint = Math.ceil(points.length / 2);
-    const leftValues = await fetchOpenMeteoElevationChunk(points.slice(0, midpoint));
-    const rightValues = await fetchOpenMeteoElevationChunk(points.slice(midpoint));
+    const leftValues = await fetchOpenMeteoElevationChunk(
+      points.slice(0, midpoint),
+      timeoutMs
+    );
+    const rightValues = await fetchOpenMeteoElevationChunk(
+      points.slice(midpoint),
+      timeoutMs
+    );
     const values = [...leftValues, ...rightValues];
 
     const cachedAt = Date.now();
@@ -6873,7 +7024,7 @@ async function fetchOpenMeteoElevationChunk(points) {
   throw lastError;
 }
 
-async function fetchOpenMeteoElevations(points) {
+async function fetchOpenMeteoElevations(points, timeoutMs = undefined) {
   const chunks = [];
 
   for (
@@ -6887,13 +7038,13 @@ async function fetchOpenMeteoElevations(points) {
   const elevationChunks = await mapItemsWithConcurrency(
     chunks,
     OPEN_METEO_MAX_CONCURRENT_REQUESTS,
-    (chunk) => fetchOpenMeteoElevationChunk(chunk)
+    (chunk) => fetchOpenMeteoElevationChunk(chunk, timeoutMs)
   );
 
   return elevationChunks.flat();
 }
 
-async function fetchOpenTopoDataElevationChunk(points) {
+async function fetchOpenTopoDataElevationChunk(points, timeoutMs = undefined) {
   let lastError = null;
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -6915,6 +7066,7 @@ async function fetchOpenTopoDataElevationChunk(points) {
         },
         {
           requestLabel: "OpenTopoData elevation request",
+          timeoutMs,
         }
       );
 
@@ -6951,15 +7103,21 @@ async function fetchOpenTopoDataElevationChunk(points) {
 
   if (points.length > 20) {
     const midpoint = Math.ceil(points.length / 2);
-    const leftValues = await fetchOpenTopoDataElevationChunk(points.slice(0, midpoint));
-    const rightValues = await fetchOpenTopoDataElevationChunk(points.slice(midpoint));
+    const leftValues = await fetchOpenTopoDataElevationChunk(
+      points.slice(0, midpoint),
+      timeoutMs
+    );
+    const rightValues = await fetchOpenTopoDataElevationChunk(
+      points.slice(midpoint),
+      timeoutMs
+    );
     return [...leftValues, ...rightValues];
   }
 
   throw lastError;
 }
 
-async function fetchOpenTopoDataElevations(points) {
+async function fetchOpenTopoDataElevations(points, timeoutMs = undefined) {
   const chunks = [];
 
   for (let index = 0; index < points.length; index += OPEN_TOPO_DATA_MAX_POINTS_PER_REQUEST) {
@@ -6969,7 +7127,7 @@ async function fetchOpenTopoDataElevations(points) {
   const elevationChunks = await mapItemsWithConcurrency(
     chunks,
     OPEN_TOPO_DATA_MAX_CONCURRENT_REQUESTS,
-    (chunk) => fetchOpenTopoDataElevationChunk(chunk)
+    (chunk) => fetchOpenTopoDataElevationChunk(chunk, timeoutMs)
   );
 
   return elevationChunks.flat();
@@ -7582,10 +7740,16 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
 
     try {
       console.log(`${terrainDebugPrefix} open-meteo request`);
-      elevations = await fetchOpenMeteoElevations(sampleGrid.points);
+      elevations = await fetchOpenMeteoElevations(
+        sampleGrid.points,
+        config?.providerTimeouts?.openMeteo
+      );
     } catch {
       console.log(`${terrainDebugPrefix} open-meteo failed -> opentopodata`);
-      elevations = await fetchOpenTopoDataElevations(sampleGrid.points);
+      elevations = await fetchOpenTopoDataElevations(
+        sampleGrid.points,
+        config?.providerTimeouts?.openTopoData
+      );
       provider = "opentopodata";
       note = "실제 표고 샘플을 바탕으로 지형 메쉬를 생성했습니다. 보조 표고 소스를 사용했습니다.";
     }
@@ -8406,7 +8570,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
   }
 
   try {
-    const collection = await fetchOverpassRoadCollection(clipFeature);
+    const collection = await fetchOverpassRoadCollection(clipFeature, config);
     const filteredFeatures = (collection.features || [])
       .map((feature) =>
         clipRoadFeatureToClipBoundary(
@@ -8536,7 +8700,7 @@ async function resolveOverpassBuildingContext(
 ) {
   try {
     const clipRing = getOuterRing(clipFeature);
-    const collection = await fetchOverpassBuildingCollection(clipFeature);
+    const collection = await fetchOverpassBuildingCollection(clipFeature, config);
     const filteredFeatures = (collection.features || [])
       .map((feature) => clipFeatureToRing(feature, clipRing, location))
       .filter(Boolean)
@@ -17786,7 +17950,7 @@ async function createApp() {
         }
 
         if (!result && config.useNominatimFallback) {
-          result = await reverseWithNominatim(lat, lng);
+          result = await reverseWithNominatim(lat, lng, config);
           provider = "nominatim";
         }
 
@@ -17857,7 +18021,11 @@ async function createApp() {
           return;
         }
 
-        const landInfo = await fetchEumLandInfo(parcelReference, body.location || {});
+        const landInfo = await fetchEumLandInfo(
+          parcelReference,
+          body.location || {},
+          config
+        );
         sendJson(response, 200, landInfo);
         return;
       }
@@ -18334,9 +18502,11 @@ export {
   addRhinoPrismFromPolygon,
   addRhinoTerrainMesh,
   buildingBaseElevationForRing,
+  buildProviderTimeoutConfig,
   build3dmFromSiteContext,
   buildClipBoundary,
   buildSiteContextCacheKey,
+  buildVWorldDomainCandidates,
   buildCumulativeContourBandGroups,
   buildContourBandGroups,
   buildDxfFromSiteContext,

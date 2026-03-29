@@ -3,8 +3,10 @@ import { createServer as createHttpServer } from "node:http";
 import path from "node:path";
 import process from "node:process";
 import {
+  buildProviderTimeoutConfig,
   buildExportArtifactCacheKey,
   buildSiteContextCacheKey,
+  buildVWorldDomainCandidates,
   createApp,
   prepareSiteContextForExport,
   build3dmFromSiteContext,
@@ -655,6 +657,72 @@ async function runBaselineVerification() {
       [...boundedCacheStore.keys()],
       ["recent", "newest"],
       "Bounded cache pruning should drop expired entries first and then evict the stalest survivors."
+    );
+    const providerTimeoutEnvKeys = [
+      "VWORLD_FETCH_TIMEOUT_MS",
+      "JUSO_FETCH_TIMEOUT_MS",
+      "EUM_FETCH_TIMEOUT_MS",
+    ];
+    const previousProviderTimeoutEnv = Object.fromEntries(
+      providerTimeoutEnvKeys.map((key) => [key, process.env[key]])
+    );
+
+    for (const key of providerTimeoutEnvKeys) {
+      delete process.env[key];
+    }
+
+    const localProviderTimeouts = buildProviderTimeoutConfig({
+      VWORLD_FETCH_TIMEOUT_MS: 21000,
+      JUSO_FETCH_TIMEOUT_MS: 19000,
+    });
+    assert.equal(
+      localProviderTimeouts.vworld,
+      21000,
+      "Provider timeout config should honor local VWorld overrides."
+    );
+    assert.equal(
+      localProviderTimeouts.juso,
+      19000,
+      "Provider timeout config should honor local Juso overrides."
+    );
+    assert.equal(
+      localProviderTimeouts.eum,
+      25000,
+      "Provider timeout config should keep the default EUM timeout when no override is supplied."
+    );
+
+    process.env.VWORLD_FETCH_TIMEOUT_MS = "24000";
+    process.env.EUM_FETCH_TIMEOUT_MS = "28000";
+    const envProviderTimeouts = buildProviderTimeoutConfig({
+      VWORLD_FETCH_TIMEOUT_MS: 21000,
+      EUM_FETCH_TIMEOUT_MS: 26000,
+    });
+    assert.equal(
+      envProviderTimeouts.vworld,
+      24000,
+      "Provider timeout config should prefer environment overrides over local config."
+    );
+    assert.equal(
+      envProviderTimeouts.eum,
+      28000,
+      "Provider timeout config should read the environment override for EUM timeout values."
+    );
+
+    for (const [key, value] of Object.entries(previousProviderTimeoutEnv)) {
+      if (typeof value === "string") {
+        process.env[key] = value;
+      } else {
+        delete process.env[key];
+      }
+    }
+
+    assert.deepEqual(
+      buildVWorldDomainCandidates({
+        vworldApiDomain: "https://app.spaceswork.net",
+        port: 3012,
+      }),
+      ["https://app.spaceswork.net", "http://localhost:3012"],
+      "VWorld requests should keep the configured domain first but also retain localhost as a fallback candidate."
     );
 
     const hubResponse = await fetch(`${baseUrl}/`);
@@ -1723,6 +1791,8 @@ async function runBaselineVerification() {
             "terrain-contour-path-fallback",
             "site-context-cache-export-format",
             "bounded-cache-pruning",
+            "provider-timeout-config",
+            "vworld-domain-candidates",
             "security-headers",
             "csp-no-inline-default",
             "self-hosted-frontend-assets",
