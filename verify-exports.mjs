@@ -1270,10 +1270,36 @@ async function runBaselineVerification() {
       buildExportArtifactCacheKey(maliciousPayloadSiteContext, "skp-payload"),
       "Export cache keys should change when geometry changes even if request counts stay the same."
     );
+    const legacyOnlyExportResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        siteContext: serverOwnedSiteContext,
+      }),
+    });
+    const legacyOnlyExportPayload = await readJson(legacyOnlyExportResponse);
+    assert.equal(
+      legacyOnlyExportResponse.status,
+      400,
+      "Export payload request should no longer accept siteContext-only legacy bodies."
+    );
+    assert.match(
+      String(legacyOnlyExportPayload?.error || ""),
+      /location|coord|좌표/i,
+      "Legacy export body rejection should explain that a direct location payload is required."
+    );
+
+    const rogueTopLevelBounds = {
+      south: 37.4,
+      west: 126.7,
+      north: 37.8,
+      east: 127.1,
+    };
 
     const exportCacheRequestBody = {
       location: serverOwnedSiteContext.location,
-      siteContext: serverOwnedSiteContext,
       options: {
         ...serverOwnedSiteContext.options,
         buildingPlacement: "embed-lowest",
@@ -1299,6 +1325,26 @@ async function runBaselineVerification() {
       maliciousExportResponse.status,
       200,
       "Export payload request with a fake client siteContext should still respond."
+    );
+    const topLevelBoundsResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        location: serverOwnedSiteContext.location,
+        options: {
+          ...serverOwnedSiteContext.options,
+          exportFormat: "skp-payload",
+        },
+        customBounds: rogueTopLevelBounds,
+      }),
+    });
+    const topLevelBoundsPayload = await readJson(topLevelBoundsResponse);
+    assert.equal(
+      topLevelBoundsResponse.status,
+      200,
+      "Export payload request should ignore unsupported top-level geometry keys."
     );
     const exportWithoutSiteContextResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
       method: "POST",
@@ -1327,6 +1373,11 @@ async function runBaselineVerification() {
       maliciousExportPayload?.payload?.groups,
       exportWithoutSiteContextPayload?.payload?.groups,
       "Export payload generation should ignore client-supplied siteContext geometry and use the server-owned context."
+    );
+    assert.deepEqual(
+      topLevelBoundsPayload?.payload?.groups,
+      exportWithoutSiteContextPayload?.payload?.groups,
+      "Export payload generation should ignore unsupported top-level geometry fields and use only location/options."
     );
 
     const firstExportCacheResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
@@ -1404,7 +1455,9 @@ async function runBaselineVerification() {
             "skp-contour-curves",
             "export-prep-no-mutation",
             "export-cache-key-geometry",
+            "export-rejects-legacy-site-context-only",
             "export-ignores-client-site-context",
+            "export-ignores-top-level-geometry-keys",
             "export-without-site-context",
             "export-cache-hit",
           ],

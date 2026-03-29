@@ -799,50 +799,32 @@ function buildSiteContextCacheKey(location = {}, options = {}, customBounds = nu
   });
 }
 
-function isSiteContextCompatibleForExport(
-  siteContext,
-  requestedLocation = {},
-  requestedOptions = {}
-) {
-  if (!siteContext?.location || !siteContext?.options) {
-    return false;
-  }
-
-  const providedKey = buildSiteContextCacheKey(
-    siteContext.location,
-    siteContext.options
+function extractExportRequestPayload(body) {
+  const requestBody =
+    body && typeof body === "object" && !Array.isArray(body) ? body : {};
+  const requestedLocation =
+    requestBody.location &&
+    typeof requestBody.location === "object" &&
+    !Array.isArray(requestBody.location)
+      ? requestBody.location
+      : {};
+  const requestedOptions =
+    requestBody.options &&
+    typeof requestBody.options === "object" &&
+    !Array.isArray(requestBody.options)
+      ? requestBody.options
+      : {};
+  const ignoredKeys = Object.keys(requestBody).filter(
+    (key) => key !== "location" && key !== "options" && key !== "siteContext"
   );
-  const requestedKey = buildSiteContextCacheKey(
-    requestedLocation?.lat || requestedLocation?.lng
-      ? requestedLocation
-      : siteContext.location,
-    requestedOptions
-  );
 
-  if (providedKey !== requestedKey) {
-    return false;
-  }
-
-  if (
-    requestedOptions.includeParcelBoundary !== false &&
-    !siteContext.parcelBoundary
-  ) {
-    return false;
-  }
-
-  if (requestedOptions.includeContours !== false && !siteContext.contourLines) {
-    return false;
-  }
-
-  if (requestedOptions.includeBuildings !== false && !siteContext.buildings) {
-    return false;
-  }
-
-  if (requestedOptions.includeRoads === true && !siteContext.roads) {
-    return false;
-  }
-
-  return true;
+  return {
+    requestedLocation,
+    requestedOptions,
+    ignoredKeys,
+    hasClientSuppliedSiteContext:
+      requestBody.siteContext !== null && requestBody.siteContext !== undefined,
+  };
 }
 
 function normalizeHashNumber(value, digits = 8) {
@@ -17487,11 +17469,12 @@ async function createApp() {
             maxBytes: config.maxExportRequestBodyBytes,
           });
           await withExportJobSlot(config, async () => {
-            const clientSuppliedSiteContext = body.siteContext || null;
-            const requestedOptions =
-              body.options || clientSuppliedSiteContext?.options || {};
-            const requestedLocation =
-              body.location || clientSuppliedSiteContext?.location || {};
+            const {
+              requestedLocation,
+              requestedOptions,
+              ignoredKeys,
+              hasClientSuppliedSiteContext,
+            } = extractExportRequestPayload(body);
             const format =
               requestUrl.pathname === "/api/export-obj"
                 ? "obj"
@@ -17500,10 +17483,16 @@ async function createApp() {
                   : normalizeExportFormat(requestedOptions?.exportFormat);
             updateRequestProgress(progressToken, {
               percent: 8,
-              message: "?대낫???吏 而⑦뀓?ㅽ듃瑜?怨꾩궛?섎뒗 以묒엯?덈떎.",
+              message: "Preparing the export request.",
             });
 
-            if (clientSuppliedSiteContext) {
+            if (ignoredKeys.length > 0) {
+              console.log(
+                `[export] ignoring unsupported request keys format=${format} keys=${ignoredKeys.sort().join(",")}`
+              );
+            }
+
+            if (hasClientSuppliedSiteContext) {
               console.log(
                 `[export] ignoring client-supplied siteContext format=${format} requestedRoads=${
                   requestedOptions.includeRoads === true
@@ -17513,7 +17502,6 @@ async function createApp() {
 
             let siteContext = await buildSiteContext(
               {
-                ...body,
                 location: requestedLocation,
                 options: requestedOptions,
               },
@@ -17521,48 +17509,15 @@ async function createApp() {
               createRangedProgressReporter(progressToken, 8, 44)
             );
 
-          if (false && (
-            !siteContext ||
-            !isSiteContextCompatibleForExport(
-              siteContext,
-              requestedLocation,
-              requestedOptions
-            )
-          )) {
             updateRequestProgress(progressToken, {
               percent: 8,
               message: "내보낼 대지 컨텍스트를 계산하는 중입니다.",
             });
-            if (siteContext) {
-              console.log(
-                `[export] rebuilding siteContext format=${format} requestedRoads=${
-                  requestedOptions.includeRoads === true
-                } providedRoads=${
-                  siteContext.options?.includeRoads === true
-                }`
-              );
-            }
-            siteContext = await buildSiteContext(
-              body,
-              config,
-              createRangedProgressReporter(progressToken, 8, 44)
-            );
-          } else {
             updateRequestProgress(progressToken, {
               percent: 16,
               message: "저장된 대지 컨텍스트를 확인하는 중입니다.",
             });
-          }
-
             assertSiteContextWithinLimits(siteContext, config);
-
-            if (siteContext && siteContext === body.siteContext) {
-              console.log(
-                `[export] reusing siteContext format=${format} roads=${Number(
-                  siteContext.roads?.features?.length || 0
-                )} includeRoads=${siteContext.options?.includeRoads === true}`
-              );
-            }
 
           siteContext = prepareSiteContextForExport(
             siteContext,
