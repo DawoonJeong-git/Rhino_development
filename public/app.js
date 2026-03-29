@@ -5663,6 +5663,100 @@ function setSelectedLocation(location, moveMap = true) {
   void hydrateSelectedLocationParcelReference(state.activeSelectionKey);
 }
 
+function isUiVerificationHost() {
+  return /^(127\.0\.0\.1|localhost)$/i.test(
+    String(window.location.hostname || "")
+  );
+}
+
+async function resolveUiTestSearchLocation(query) {
+  const response = await fetch(
+    `/api/geocode?q=${encodeURIComponent(String(query || "").trim())}`
+  );
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(payload?.error || `주소 검색에 실패했습니다: ${query}`);
+  }
+
+  const firstResult = payload?.results?.[0];
+
+  if (!firstResult) {
+    throw new Error(`검색 결과가 없습니다: ${query}`);
+  }
+
+  return firstResult;
+}
+
+function buildUiTestStateSummary() {
+  return {
+    selectionMode: state.selectedLocation?.selectionMode || state.mapSelectionMode,
+    activeSelectionKey: state.activeSelectionKey,
+    selectedParcelCount: getSelectedParcels(state.selectedLocation).length,
+    selectedLabel: buildSelectionLabel(state.selectedLocation),
+    hasSiteContext: Boolean(state.siteContext),
+    hasLandInfo: Boolean(state.landInfo),
+    hasBuildingRegister: Boolean(state.buildingRegister),
+  };
+}
+
+function exposeUiVerificationApi() {
+  if (!isUiVerificationHost()) {
+    return;
+  }
+
+  window.__SPACEWORK_UI_TEST__ = {
+    setMapSelectionMode(mode) {
+      setMapSelectionMode(mode);
+      return state.mapSelectionMode;
+    },
+    clearSelection() {
+      clearSelectionForSearch({ preserveSearchResults: true });
+      return buildUiTestStateSummary();
+    },
+    getState() {
+      return buildUiTestStateSummary();
+    },
+    async selectRangeFromBounds(bounds) {
+      const normalizedBounds = normalizeRangeBounds(bounds);
+
+      if (!normalizedBounds) {
+        throw new Error("테스트용 범위 bounds를 해석하지 못했습니다.");
+      }
+
+      setMapSelectionMode("range");
+      clearSelectionForSearch({ preserveSearchResults: true });
+      await handleRangeSelectionMapClick({
+        lat: normalizedBounds.minLat,
+        lng: normalizedBounds.minLng,
+      });
+      await handleRangeSelectionMapClick({
+        lat: normalizedBounds.maxLat,
+        lng: normalizedBounds.maxLng,
+      });
+      return buildUiTestStateSummary();
+    },
+    async selectMultiParcelFromQueries(queries = []) {
+      if (!Array.isArray(queries) || queries.length < 2) {
+        throw new Error("다중 필지 테스트에는 두 개 이상의 검색어가 필요합니다.");
+      }
+
+      setMapSelectionMode("multi-parcel");
+      clearSelectionForSearch({ preserveSearchResults: true });
+
+      for (const query of queries) {
+        const location = await resolveUiTestSearchLocation(query);
+        await handleMultiParcelSelectionMapClick({
+          lat: Number(location.lat),
+          lng: Number(location.lng),
+        });
+      }
+
+      return buildUiTestStateSummary();
+    },
+  };
+}
+
 async function hydrateSelectedLocationParcelReference(selectionKey) {
   if (!state.selectedLocation) {
     return;
@@ -5844,6 +5938,7 @@ async function bootstrap() {
   resetModelProgress();
   syncContourIntervalInput();
   syncSelectionModeFormState();
+  exposeUiVerificationApi();
   specPreview.textContent =
     "모델 미리보기를 누르면 현재 반경, 표고, 포함 건물 수를 먼저 확인할 수 있습니다.";
   syncPanelStatusChips();

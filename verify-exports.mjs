@@ -867,6 +867,11 @@ async function runBaselineVerification() {
       /siteContextStatusChip|landInfoStatusChip|buildingRegisterStatusChip/,
       "Frontend should expose visible status chips for key panel requests."
     );
+    assert.match(
+      appSource,
+      /window\.__SPACEWORK_UI_TEST__/,
+      "Frontend should expose the localhost-only UI verification hook for extended browser checks."
+    );
 
     const hubResponse = await fetch(`${baseUrl}/`);
     const hubHtml = await hubResponse.text();
@@ -1956,6 +1961,7 @@ async function runBaselineVerification() {
             "vworld-domain-candidates",
             "parcel-lookup-lite-client",
             "ui-request-status-feedback",
+            "ui-verification-hook",
             "security-headers",
             "csp-no-inline-default",
             "self-hosted-frontend-assets",
