@@ -12,10 +12,8 @@ Use this exact sequence right before release:
 6. Run `npm run verify:deployment-security`.
 7. Build and start the container with `docker compose --env-file .env.production up -d --build`.
 8. Verify `GET /api/health` and `GET /api/config`.
-9. Run `npm run verify:baseline`.
-10. Run `node scripts/verify-live-site-context.mjs --base-url http://127.0.0.1:3000` to confirm building polygons, road polygons, and DXF line entities on the live server.
-11. Run one real parcel smoke test for search, land summary/detail, building summary/detail, `100m` preview, OBJ, and 3DM.
-12. Keep the previous image tag and one known-good parcel for rollback.
+9. Run `npm run verify:release -- --base-url http://127.0.0.1:3000`.
+10. Keep the previous image tag and one known-good parcel for rollback.
 
 ## Recommended Shape
 

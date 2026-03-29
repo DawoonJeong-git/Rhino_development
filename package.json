@@ -11,6 +11,7 @@
     "verify:dxf": "node scripts/verify-dxf.mjs",
     "verify:exports": "node verify-exports.mjs",
     "verify:exports:full": "set VERIFY_EXPORTS_FULL_SKP=1&& node verify-exports.mjs",
+    "verify:release": "node scripts/verify-release.mjs",
     "verify:ui": "node scripts/verify-ui-flow.mjs",
     "verify:ui:extended": "node scripts/verify-ui-flow.mjs --suite extended"
   },

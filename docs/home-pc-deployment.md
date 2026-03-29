@@ -274,7 +274,7 @@ That update script now does four things in order:
 1. pulls the latest Git commit into `C:\SpaceWork_deploy`
 2. refreshes `node_modules`
 3. restarts the managed production server
-4. runs `node scripts/verify-live-site-context.mjs --base-url http://127.0.0.1:3000`
+4. runs `node scripts/verify-release.mjs --base-url http://127.0.0.1:3000`
 
 Treat `C:\SpaceWork_deploy` as a read-only release clone. Edit only in `C:\SpaceWork_develop`, push to Git, then update the deploy clone through the script above so the running app, Git revision, and smoke result stay aligned.
 

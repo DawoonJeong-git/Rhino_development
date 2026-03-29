@@ -61,10 +61,10 @@ if (-not $SkipRestart) {
 
 if (-not $SkipSmoke) {
   $serverPort = Get-ServerPort -RepoRoot $ProdRoot
-  $verifyScript = Join-Path $ProdRoot "scripts\verify-live-site-context.mjs"
+  $verifyScript = Join-Path $ProdRoot "scripts\verify-release.mjs"
 
   if (Test-Path $verifyScript) {
-    Write-Host "Running live smoke checks on http://127.0.0.1:$serverPort"
+    Write-Host "Running post-deploy verification bundle on http://127.0.0.1:$serverPort"
     node $verifyScript --base-url "http://127.0.0.1:$serverPort"
   } else {
     Write-Warning "Smoke check script not found: $verifyScript"

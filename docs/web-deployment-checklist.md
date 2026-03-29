@@ -47,12 +47,19 @@ Run these first from the repo root:
 - `npm run verify:deployment-security`
 - `npm run verify:baseline`
 - `npm run verify:dxf`
+- `npm run verify:release -- --base-url http://127.0.0.1:3000`
 
 The baseline script verifies the local hub route, feature route, health/config shape, security headers, progress-token guard, body-size limit, and radius limit without depending on live external APIs.
 
 The deployment-security script verifies the controlled-sharing defaults for bind settings, Compose exposure, release-gate docs, and local deployment files when they exist.
 
-Then run the live browser QA:
+The release bundle covers:
+
+- `verify:baseline`
+- `verify-live-site-context`
+- extended browser UI smoke for address + DXF, multi-parcel, manual range + 3DM, and `1km` + SKP
+
+Then run any additional live browser QA you still want beyond the automated bundle:
 
 - Address search from the top search bar
 - Map click -> address -> land summary -> land detail popup
