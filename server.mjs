@@ -796,6 +796,7 @@ function buildSiteContextCacheKey(location = {}, options = {}, customBounds = nu
     terrainMode: options.terrainMode === "flat" ? "flat" : "contour",
     buildingPlacement:
       options.buildingPlacement === "embed-lowest" ? "embed-lowest" : "dominant",
+    exportFormat: normalizeExportFormat(options.exportFormat),
     includeContours: options.includeContours !== false,
     includeBuildings: options.includeBuildings !== false,
     includeParcelBoundary: options.includeParcelBoundary !== false,
@@ -17969,6 +17970,7 @@ export {
   buildingBaseElevationForRing,
   build3dmFromSiteContext,
   buildClipBoundary,
+  buildSiteContextCacheKey,
   buildCumulativeContourBandGroups,
   buildContourBandGroups,
   buildDxfFromSiteContext,
@@ -17991,6 +17993,7 @@ export {
   normalizeSearchResultsForQuery,
   prepareSiteContextForExport,
   resolveRawTerrainHeightAtLocalPoint,
+  resolveEffectiveContourBandInterval,
   resolveTerrainContourPath,
   siteHeightAtLocalPoint,
 };

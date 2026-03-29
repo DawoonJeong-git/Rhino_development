@@ -4,6 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import {
   buildExportArtifactCacheKey,
+  buildSiteContextCacheKey,
   createApp,
   prepareSiteContextForExport,
   build3dmFromSiteContext,
@@ -17,6 +18,7 @@ import {
   isPathInsideDirectory,
   normalizePublicError,
   normalizeSearchResultsForQuery,
+  resolveEffectiveContourBandInterval,
   resolveTerrainContourPath,
 } from "./server.mjs";
 
@@ -514,6 +516,97 @@ async function runBaselineVerification() {
       unrelatedContourPath.source,
       "configured-missing",
       "Unrelated missing contour paths should not silently fall back to the workspace dataset."
+    );
+    const syntheticTerrainGrid = {
+      step: 6,
+      xValues: Array.from({ length: 335 }, (_, index) => index * 6),
+      yValues: Array.from({ length: 335 }, (_, index) => index * 6),
+      elevations: Array.from({ length: 335 }, () => Array(335).fill(0)),
+      minElevation: 0,
+      maxElevation: 95,
+    };
+    const syntheticContourBudgetSiteContext = {
+      location: { lat: 37.50746, lng: 126.84247 },
+      options: {
+        radius: 1000,
+        contourInterval: 1,
+        terrainMode: "contour",
+        buildingPlacement: "dominant",
+        includeContours: true,
+        includeBuildings: true,
+        includeParcelBoundary: true,
+        includeRoads: true,
+        exportFormat: "obj",
+      },
+      stats: {
+        requestedContourInterval: 1,
+        sourceContourInterval: 5,
+      },
+      dataSources: {
+        contours: {
+          provider: "official-contours",
+          interval: 5,
+        },
+      },
+      contourLines: {
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            properties: { elevation: 0 },
+            geometry: {
+              type: "LineString",
+              coordinates: [
+                [126.84, 37.50],
+                [126.85, 37.51],
+              ],
+            },
+          },
+          {
+            type: "Feature",
+            properties: { elevation: 5 },
+            geometry: {
+              type: "LineString",
+              coordinates: [
+                [126.84, 37.505],
+                [126.85, 37.515],
+              ],
+            },
+          },
+        ],
+      },
+      terrainGrid: syntheticTerrainGrid,
+    };
+    const syntheticThreeDmBudgetSiteContext = {
+      ...syntheticContourBudgetSiteContext,
+      options: {
+        ...syntheticContourBudgetSiteContext.options,
+        exportFormat: "3dm",
+      },
+      stats: {
+        ...syntheticContourBudgetSiteContext.stats,
+      },
+    };
+    assert.notEqual(
+      buildSiteContextCacheKey(
+        syntheticContourBudgetSiteContext.location,
+        syntheticContourBudgetSiteContext.options
+      ),
+      buildSiteContextCacheKey(
+        syntheticThreeDmBudgetSiteContext.location,
+        syntheticThreeDmBudgetSiteContext.options
+      ),
+      "Site-context cache keys should separate export formats when contour budgets differ."
+    );
+    assert.equal(
+      resolveEffectiveContourBandInterval(syntheticContourBudgetSiteContext),
+      5,
+      "OBJ-sized contour budget should relax the wide synthetic case to 5m."
+    );
+    assert.equal(
+      resolveEffectiveContourBandInterval(syntheticThreeDmBudgetSiteContext),
+      2,
+      "3DM-sized contour budget should preserve more detail for the same wide synthetic case."
     );
 
     const hubResponse = await fetch(`${baseUrl}/`);
@@ -1459,6 +1552,7 @@ async function runBaselineVerification() {
             "health-shape",
             "config-shape",
             "terrain-contour-path-fallback",
+            "site-context-cache-export-format",
             "security-headers",
             "csp-no-inline-default",
             "self-hosted-frontend-assets",
