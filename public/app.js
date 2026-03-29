@@ -5700,6 +5700,30 @@ function buildUiTestStateSummary() {
   };
 }
 
+function buildUiTestMockParcelFeature(pnu, address, centerLat, centerLng, size = 0.00006) {
+  const halfSize = Number(size) / 2;
+
+  return {
+    type: "Feature",
+    properties: {
+      pnu,
+      addr: address,
+      centroidLat: Number(centerLat),
+      centroidLng: Number(centerLng),
+    },
+    geometry: {
+      type: "Polygon",
+      coordinates: [[
+        [Number(centerLng) - halfSize, Number(centerLat) - halfSize],
+        [Number(centerLng) + halfSize, Number(centerLat) - halfSize],
+        [Number(centerLng) + halfSize, Number(centerLat) + halfSize],
+        [Number(centerLng) - halfSize, Number(centerLat) + halfSize],
+        [Number(centerLng) - halfSize, Number(centerLat) - halfSize],
+      ]],
+    },
+  };
+}
+
 function exposeUiVerificationApi() {
   if (!isUiVerificationHost()) {
     return;
@@ -5715,6 +5739,29 @@ function exposeUiVerificationApi() {
       return buildUiTestStateSummary();
     },
     getState() {
+      return buildUiTestStateSummary();
+    },
+    selectMockMultiParcel() {
+      setMapSelectionMode("multi-parcel");
+      clearSelectionForSearch({ preserveSearchResults: true });
+      state.suppressNextAutoFit = true;
+      setSelectedLocation(
+        buildMultiParcelSelection([
+          buildUiTestMockParcelFeature(
+            "1114010300100310000",
+            "서울 중구 세종대로 110",
+            37.566701,
+            126.978347
+          ),
+          buildUiTestMockParcelFeature(
+            "1114010300100270000",
+            "서울 중구 덕수궁길 15",
+            37.56589,
+            126.97685
+          ),
+        ]),
+        false
+      );
       return buildUiTestStateSummary();
     },
     async selectRangeFromBounds(bounds) {

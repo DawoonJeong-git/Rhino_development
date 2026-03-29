@@ -9,7 +9,7 @@ const DEFAULT_SEARCH_QUERY =
   process.env.VERIFY_UI_QUERY || "서울 중구 세종대로 110";
 const DEFAULT_MULTI_PARCEL_QUERIES = [
   "서울 중구 세종대로 110",
-  "서울도서관",
+  "서울 중구 덕수궁길 15",
 ];
 const DEFAULT_RANGE_BOUNDS = Object.freeze({
   minLat: 37.56595,
@@ -53,6 +53,34 @@ function resolveBrowserExecutable() {
 
 function normalizeSuiteName(value) {
   return /^(extended|full)$/i.test(String(value || "").trim()) ? "extended" : "smoke";
+}
+
+function normalizeScenarioName(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  if (!normalized) {
+    return "";
+  }
+
+  if (/^(smoke|address-dxf-smoke)$/.test(normalized)) {
+    return "address-dxf-smoke";
+  }
+
+  if (/^(multi|multi-parcel|multi-parcel-preview)$/.test(normalized)) {
+    return "multi-parcel-preview";
+  }
+
+  if (/^(range|manual-range|manual-range-3dm)$/.test(normalized)) {
+    return "manual-range-3dm";
+  }
+
+  if (/^(skp|1km|address-1km-skp)$/.test(normalized)) {
+    return "address-1km-skp";
+  }
+
+  return normalized;
 }
 
 async function waitForStableText(
@@ -107,6 +135,17 @@ async function waitForChipText(page, selector, pattern, timeoutMs = 30000) {
   return page.locator(selector).innerText();
 }
 
+async function waitForButtonEnabled(page, selector, timeoutMs = 30000) {
+  await page.waitForFunction(
+    (targetSelector) => {
+      const button = document.querySelector(targetSelector);
+      return Boolean(button) && !button.disabled;
+    },
+    selector,
+    { timeout: timeoutMs }
+  );
+}
+
 async function openStudioPage(page, baseUrl) {
   await page.goto(`${baseUrl}/contour3dmodel`, {
     waitUntil: "networkidle",
@@ -151,6 +190,7 @@ function isFullSiteContextResponse(response) {
 }
 
 async function runSiteContextPreview(page, timeoutMs = 120000) {
+  await waitForButtonEnabled(page, "#previewSiteContextButton", timeoutMs);
   const siteContextResponsePromise = page.waitForResponse(isFullSiteContextResponse, {
     timeout: timeoutMs,
   });
@@ -263,6 +303,7 @@ async function setModelOptions(page, options = {}) {
 
 async function downloadModel(page, format, timeoutMs = 120000) {
   await page.selectOption('select[name="exportFormat"]', format);
+  await waitForButtonEnabled(page, "#downloadObjButton", timeoutMs);
 
   const downloadPromise = page.waitForEvent("download", {
     timeout: timeoutMs,
@@ -357,13 +398,14 @@ async function runMultiParcelScenario(context, baseUrl) {
   const page = await context.newPage();
 
   try {
+    console.error("[verify-ui] multi-parcel: open page");
     await openStudioPage(page, baseUrl);
     await waitForUiVerificationApi(page);
 
+    console.error("[verify-ui] multi-parcel: select mock parcels");
     const hookResult = await callUiVerificationMethod(
       page,
-      "selectMultiParcelFromQueries",
-      DEFAULT_MULTI_PARCEL_QUERIES
+      "selectMockMultiParcel"
     );
 
     assert.equal(
@@ -376,13 +418,14 @@ async function runMultiParcelScenario(context, baseUrl) {
       "Multi-parcel scenario should select at least two parcels."
     );
 
+    console.error("[verify-ui] multi-parcel: wait for selection summary");
     const selectionSummary = await waitForStableText(
       page,
       "#selectionMeta",
       ["선택 전"],
       60000
     );
-    const previewResult = await runSiteContextPreview(page, 120000);
+    console.error("[verify-ui] multi-parcel: wait for group-mode chips");
     const landInfoChip = await waitForChipText(
       page,
       "#landInfoStatusChip",
@@ -398,9 +441,10 @@ async function runMultiParcelScenario(context, baseUrl) {
 
     return {
       name: "multi-parcel-preview",
-      queries: DEFAULT_MULTI_PARCEL_QUERIES,
+      selectionSource: "mock-parcels",
+      parcelLabels: DEFAULT_MULTI_PARCEL_QUERIES,
       selectionSummary,
-      ...previewResult,
+      siteContextChip: await page.locator("#siteContextStatusChip").innerText(),
       landInfoChip,
       buildingRegisterChip,
       selectedParcelCount: hookResult.selectedParcelCount,
@@ -498,6 +542,7 @@ async function runOneKmSkpScenario(context, baseUrl, searchQuery) {
 async function main() {
   const baseUrl = readArgValue("--base-url") || DEFAULT_BASE_URL;
   const suite = normalizeSuiteName(readArgValue("--suite") || DEFAULT_SUITE);
+  const onlyScenario = normalizeScenarioName(readArgValue("--only"));
   const searchQuery = readArgValue("--query") || DEFAULT_SEARCH_QUERY;
   const executablePath = resolveBrowserExecutable();
   const headless = !/^(1|true|yes)$/i.test(
@@ -525,12 +570,22 @@ async function main() {
 
   try {
     const scenarios = [];
-    scenarios.push(await runSmokeScenario(context, baseUrl, searchQuery));
+    if (!onlyScenario || onlyScenario === "address-dxf-smoke") {
+      scenarios.push(await runSmokeScenario(context, baseUrl, searchQuery));
+    }
 
     if (suite === "extended") {
-      scenarios.push(await runMultiParcelScenario(context, baseUrl));
-      scenarios.push(await runManualRange3dmScenario(context, baseUrl));
-      scenarios.push(await runOneKmSkpScenario(context, baseUrl, searchQuery));
+      if (!onlyScenario || onlyScenario === "multi-parcel-preview") {
+        scenarios.push(await runMultiParcelScenario(context, baseUrl));
+      }
+
+      if (!onlyScenario || onlyScenario === "manual-range-3dm") {
+        scenarios.push(await runManualRange3dmScenario(context, baseUrl));
+      }
+
+      if (!onlyScenario || onlyScenario === "address-1km-skp") {
+        scenarios.push(await runOneKmSkpScenario(context, baseUrl, searchQuery));
+      }
     }
 
     console.log(
@@ -541,6 +596,7 @@ async function main() {
           baseUrl,
           browser: executablePath,
           suite,
+          onlyScenario,
           scenarios,
         },
         null,
@@ -555,5 +611,14 @@ async function main() {
 
 main().catch((error) => {
   console.error(error instanceof Error ? error.stack || error.message : error);
+
+  if (error?.cause) {
+    console.error(
+      error.cause instanceof Error
+        ? error.cause.stack || error.cause.message
+        : error.cause
+    );
+  }
+
   process.exitCode = 1;
 });
