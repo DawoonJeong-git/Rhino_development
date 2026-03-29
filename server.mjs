@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import {
   mkdtemp,
   open,
@@ -26,6 +27,9 @@ const configPath = path.join(__dirname, "config.local.json");
 const METERS_PER_DEGREE_LAT = 111_320;
 const OPEN_METEO_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
 const OPEN_METEO_MAX_POINTS_PER_REQUEST = 100;
+const OPEN_METEO_MAX_CONCURRENT_REQUESTS = 3;
+const OPEN_TOPO_DATA_MAX_POINTS_PER_REQUEST = 80;
+const OPEN_TOPO_DATA_MAX_CONCURRENT_REQUESTS = 2;
 const SITE_CONTEXT_CACHE_TTL_MS = 1000 * 60 * 10;
 const GEOCODE_CACHE_TTL_MS = 1000 * 60 * 10;
 const EXPORT_ARTIFACT_CACHE_TTL_MS = 1000 * 60 * 5;
@@ -36,6 +40,7 @@ const TERRAIN_SOURCE_SPATIAL_RESOLUTION_METERS = 90;
 const MIN_CONTOUR_INTERVAL_METERS = 0.1;
 const TERRAIN_GRID_MIN_STEP_METERS = 10;
 const DEFAULT_TERRAIN_CONTOUR_CRS = "EPSG:5179";
+const DEFAULT_TERRAIN_CONTOUR_PATH = path.join(__dirname, "data", "contours");
 const RHINO6_FILE3DM_VERSION = 6;
 const REQUEST_PROGRESS_TTL_MS = 1000 * 60 * 20;
 const ROAD_SURFACE_OFFSET_METERS = 0.01;
@@ -992,12 +997,62 @@ function getSiteContextGeometrySignature(siteContext) {
   return signature;
 }
 
+function normalizePathForComparison(filePath) {
+  return String(filePath || "")
+    .trim()
+    .replace(/[\\/]+/g, "/")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
+function canUseWorkspaceTerrainContourFallback(requestedPath) {
+  const normalizedPath = normalizePathForComparison(requestedPath);
+
+  return (
+    normalizedPath === "" ||
+    normalizedPath.endsWith("/data/contours") ||
+    normalizedPath.endsWith("/contours")
+  );
+}
+
+function resolveTerrainContourPath(configuredPath = "") {
+  const requestedPath = normalizeConfigString(configuredPath);
+
+  if (requestedPath && existsSync(requestedPath)) {
+    return {
+      path: requestedPath,
+      source: "configured",
+      requestedPath,
+    };
+  }
+
+  if (
+    existsSync(DEFAULT_TERRAIN_CONTOUR_PATH) &&
+    canUseWorkspaceTerrainContourFallback(requestedPath)
+  ) {
+    return {
+      path: DEFAULT_TERRAIN_CONTOUR_PATH,
+      source: requestedPath ? "workspace-fallback" : "workspace-default",
+      requestedPath,
+    };
+  }
+
+  return {
+    path: requestedPath,
+    source: requestedPath ? "configured-missing" : "missing",
+    requestedPath,
+  };
+}
+
 function buildRuntimeConfig(localConfig) {
   const maxSiteRadiusMeters = resolvePositiveInteger(
     process.env.MAX_SITE_RADIUS_METERS ||
       localConfig.MAX_SITE_RADIUS_METERS ||
       DEFAULT_MAX_SITE_RADIUS_METERS,
     DEFAULT_MAX_SITE_RADIUS_METERS
+  );
+  const terrainContourPathResolution = resolveTerrainContourPath(
+    process.env.TERRAIN_CONTOUR_PATH || localConfig.TERRAIN_CONTOUR_PATH || ""
   );
   const maxManualRangeSideFallback = Math.max(
     DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS,
@@ -1030,9 +1085,9 @@ function buildRuntimeConfig(localConfig) {
     terrainDemPath: normalizeConfigString(
       process.env.TERRAIN_DEM_PATH || localConfig.TERRAIN_DEM_PATH || ""
     ),
-    terrainContourPath: normalizeConfigString(
-      process.env.TERRAIN_CONTOUR_PATH || localConfig.TERRAIN_CONTOUR_PATH || ""
-    ),
+    terrainContourPath: terrainContourPathResolution.path,
+    terrainContourPathSource: terrainContourPathResolution.source,
+    terrainContourPathRequested: terrainContourPathResolution.requestedPath,
     terrainContourCrs: normalizeConfigString(
       process.env.TERRAIN_CONTOUR_CRS ||
         localConfig.TERRAIN_CONTOUR_CRS ||
@@ -6575,6 +6630,27 @@ function buildSyntheticTerrainGrid(location, clipFeature, options) {
   };
 }
 
+async function mapItemsWithConcurrency(items, concurrency, mapper) {
+  const normalizedItems = Array.isArray(items) ? items : [];
+  const results = new Array(normalizedItems.length);
+  const workerCount = Math.max(
+    1,
+    Math.min(normalizedItems.length || 1, Number(concurrency) || 1)
+  );
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < normalizedItems.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await mapper(normalizedItems[currentIndex], currentIndex);
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
 async function fetchOpenMeteoElevationChunk(points) {
   const cacheKey = points
     .map((point) => `${point.lat.toFixed(6)},${point.lng.toFixed(6)}`)
@@ -6648,72 +6724,105 @@ async function fetchOpenMeteoElevationChunk(points) {
 }
 
 async function fetchOpenMeteoElevations(points) {
-  const elevations = [];
+  const chunks = [];
 
   for (
     let index = 0;
     index < points.length;
     index += OPEN_METEO_MAX_POINTS_PER_REQUEST
   ) {
-    const chunk = points.slice(index, index + OPEN_METEO_MAX_POINTS_PER_REQUEST);
-    const values = await fetchOpenMeteoElevationChunk(chunk);
-    elevations.push(...values);
+    chunks.push(points.slice(index, index + OPEN_METEO_MAX_POINTS_PER_REQUEST));
   }
 
-  return elevations;
+  const elevationChunks = await mapItemsWithConcurrency(
+    chunks,
+    OPEN_METEO_MAX_CONCURRENT_REQUESTS,
+    (chunk) => fetchOpenMeteoElevationChunk(chunk)
+  );
+
+  return elevationChunks.flat();
+}
+
+async function fetchOpenTopoDataElevationChunk(points) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetchWithTimeout(
+        "https://api.opentopodata.org/v1/srtm90m",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": "space-work/0.1",
+          },
+          body: JSON.stringify({
+            locations: points
+              .map((point) => `${point.lat.toFixed(6)},${point.lng.toFixed(6)}`)
+              .join("|"),
+            interpolation: "bilinear",
+          }),
+        },
+        {
+          requestLabel: "OpenTopoData elevation request",
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`OpenTopoData elevation request failed with ${response.status}`);
+      }
+
+      const payload = await response.json();
+
+      if (payload?.status !== "OK") {
+        throw new Error(payload?.error || "OpenTopoData elevation request failed.");
+      }
+
+      const results = Array.isArray(payload?.results) ? payload.results : [];
+
+      if (results.length !== points.length) {
+        throw new Error("OpenTopoData elevation response did not match the request.");
+      }
+
+      const values = results.map((item) => Number(item?.elevation));
+
+      if (values.some((value) => !Number.isFinite(value))) {
+        throw new Error("OpenTopoData elevation response contained invalid values.");
+      }
+
+      return values;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => {
+        setTimeout(resolve, attempt * 700);
+      });
+    }
+  }
+
+  if (points.length > 20) {
+    const midpoint = Math.ceil(points.length / 2);
+    const leftValues = await fetchOpenTopoDataElevationChunk(points.slice(0, midpoint));
+    const rightValues = await fetchOpenTopoDataElevationChunk(points.slice(midpoint));
+    return [...leftValues, ...rightValues];
+  }
+
+  throw lastError;
 }
 
 async function fetchOpenTopoDataElevations(points) {
-  const elevations = [];
+  const chunks = [];
 
-  for (let index = 0; index < points.length; index += 80) {
-    const chunk = points.slice(index, index + 80);
-    const response = await fetchWithTimeout(
-      "https://api.opentopodata.org/v1/srtm90m",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": "space-work/0.1",
-        },
-        body: JSON.stringify({
-          locations: chunk
-            .map((point) => `${point.lat.toFixed(6)},${point.lng.toFixed(6)}`)
-            .join("|"),
-          interpolation: "bilinear",
-        }),
-      },
-      {
-        requestLabel: "OpenTopoData elevation request",
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error(`OpenTopoData elevation request failed with ${response.status}`);
-    }
-
-    const payload = await response.json();
-
-    if (payload?.status !== "OK") {
-      throw new Error(payload?.error || "OpenTopoData elevation request failed.");
-    }
-
-    const results = Array.isArray(payload?.results) ? payload.results : [];
-
-    if (results.length !== chunk.length) {
-      throw new Error("OpenTopoData elevation response did not match the request.");
-    }
-
-    const values = results.map((item) => Number(item?.elevation));
-
-    if (values.some((value) => !Number.isFinite(value))) {
-      throw new Error("OpenTopoData elevation response contained invalid values.");
-    }
-
-    elevations.push(...values);
+  for (let index = 0; index < points.length; index += OPEN_TOPO_DATA_MAX_POINTS_PER_REQUEST) {
+    chunks.push(points.slice(index, index + OPEN_TOPO_DATA_MAX_POINTS_PER_REQUEST));
   }
 
-  return elevations;
+  const elevationChunks = await mapItemsWithConcurrency(
+    chunks,
+    OPEN_TOPO_DATA_MAX_CONCURRENT_REQUESTS,
+    (chunk) => fetchOpenTopoDataElevationChunk(chunk)
+  );
+
+  return elevationChunks.flat();
 }
 
 function buildTerrainSampleGrid(location, clipFeature, options) {
@@ -17148,6 +17257,21 @@ function createEumLawHandoffHtml(requestUrl) {
 async function createApp() {
   const localConfig = await loadLocalConfig();
   const config = buildRuntimeConfig(localConfig);
+
+  if (config.terrainContourPathSource === "workspace-fallback") {
+    console.warn(
+      `[terrain-config] contour path fallback requested=${config.terrainContourPathRequested} resolved=${config.terrainContourPath}`
+    );
+  } else if (config.terrainContourPathSource === "workspace-default") {
+    console.log(
+      `[terrain-config] using workspace contour path ${config.terrainContourPath}`
+    );
+  } else if (config.terrainContourPathSource === "configured-missing") {
+    console.warn(
+      `[terrain-config] configured contour path is unavailable ${config.terrainContourPathRequested}`
+    );
+  }
+
   const requestHandler = async (request, response) => {
     const requestUrl = new URL(request.url, `http://${request.headers.host}`);
 
@@ -17867,6 +17991,7 @@ export {
   normalizeSearchResultsForQuery,
   prepareSiteContextForExport,
   resolveRawTerrainHeightAtLocalPoint,
+  resolveTerrainContourPath,
   siteHeightAtLocalPoint,
 };
 

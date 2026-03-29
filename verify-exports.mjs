@@ -17,6 +17,7 @@ import {
   isPathInsideDirectory,
   normalizePublicError,
   normalizeSearchResultsForQuery,
+  resolveTerrainContourPath,
 } from "./server.mjs";
 
 const BASE_URL = process.env.SITE_CONTEXT_BASE_URL || "http://127.0.0.1:3000";
@@ -491,6 +492,28 @@ async function runBaselineVerification() {
       Object.keys(configPayload?.data || {}).sort(),
       ["hasVWorldDataKey"],
       "Config data payload shape changed."
+    );
+    const workspaceContourPath = path.join(process.cwd(), "data", "contours");
+    const contourPathFallback = resolveTerrainContourPath(
+      "C:\\Rhino_develop\\data\\contours"
+    );
+    assert.equal(
+      path.resolve(contourPathFallback.path),
+      path.resolve(workspaceContourPath),
+      "Legacy contour path settings should fall back to the workspace contour dataset."
+    );
+    assert.equal(
+      contourPathFallback.source,
+      "workspace-fallback",
+      "Legacy contour path settings should be labeled as a workspace fallback."
+    );
+    const unrelatedContourPath = resolveTerrainContourPath(
+      "C:\\missing\\custom-terrain-source"
+    );
+    assert.equal(
+      unrelatedContourPath.source,
+      "configured-missing",
+      "Unrelated missing contour paths should not silently fall back to the workspace dataset."
     );
 
     const hubResponse = await fetch(`${baseUrl}/`);
@@ -1435,6 +1458,7 @@ async function runBaselineVerification() {
             "max-mass-route",
             "health-shape",
             "config-shape",
+            "terrain-contour-path-fallback",
             "security-headers",
             "csp-no-inline-default",
             "self-hosted-frontend-assets",
