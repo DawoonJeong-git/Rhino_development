@@ -7,6 +7,8 @@ const state = {
   landInfo: null,
   landInfoDetails: null,
   isLandInfoRequesting: false,
+  isSiteContextRequesting: false,
+  isBuildingRegisterRequesting: false,
   mapSelectionMode: "address",
   map: null,
   marker: null,
@@ -32,6 +34,21 @@ const state = {
   modelProgressValue: 0,
   modelProgressSession: null,
   modelProgressEstimates: null,
+  requestUiPhases: {
+    siteContext: "idle",
+    landInfo: "idle",
+    buildingRegister: "idle",
+  },
+  requestUiTimers: {
+    siteContext: [],
+    landInfo: [],
+    buildingRegister: [],
+  },
+  requestUiActiveTokens: {
+    siteContext: new Set(),
+    landInfo: new Set(),
+    buildingRegister: new Set(),
+  },
   history: [],
   layers: {
     buildings: null,
@@ -77,6 +94,7 @@ const searchFormSubmitButton = searchForm?.querySelector('button[type="submit"]'
 const searchFormEmptyState = searchForm?.querySelector(".search-results-empty");
 const modelForm = document.querySelector("#modelForm");
 const loadLandInfoButton = document.querySelector("#loadLandInfoButton");
+const showLandInfoDetailsButton = document.querySelector("#showLandInfoDetailsButton");
 const openLandUseDetailButton = document.querySelector("#openLandUseDetailButton");
 const openLandMapButton = document.querySelector("#openLandMapButton");
 const openLandIssueButton = document.querySelector("#openLandIssueButton");
@@ -117,6 +135,7 @@ const SELECTION_PREVIEW_CACHE_MAX_ENTRIES = 24;
 const MODEL_PROGRESS_MIN_ESTIMATE_MS = 1500;
 const MODEL_PROGRESS_MAX_ESTIMATE_MS = 90000;
 const MODEL_PROGRESS_POLL_INTERVAL_MS = 400;
+const REQUEST_UI_DELAY_STEPS_MS = Object.freeze([2500, 8000]);
 const MODEL_PROGRESS_DEFAULT_ESTIMATES_MS = Object.freeze({
   preview: 3200,
   "export-obj": 5200,
@@ -125,6 +144,32 @@ const MODEL_PROGRESS_DEFAULT_ESTIMATES_MS = Object.freeze({
   "export-3dm-cached": 5200,
   "export-dxf": 4200,
   "export-dxf-cached": 2600,
+});
+const REQUEST_UI_PHASE_MESSAGES = Object.freeze({
+  siteContext: {
+    loading:
+      "대지, 지형, 건물 컨텍스트를 계산하는 중입니다.",
+    slow:
+      "공공데이터 응답을 기다리는 중입니다. 범위가 넓거나 주변 데이터가 많으면 조금 더 걸릴 수 있습니다.",
+    delayed:
+      "응답이 길어지고 있지만 지형, 건물, 도로 데이터를 계속 정리하고 있습니다. 창을 닫지 말고 잠시만 기다려주세요.",
+  },
+  landInfo: {
+    loading:
+      "토지이음 요약 정보를 조회하는 중입니다.",
+    slow:
+      "토지이음 실데이터 응답을 기다리는 중입니다.",
+    delayed:
+      "토지이음 응답이 길어지고 있지만 재시도와 캐시 확인을 계속하고 있습니다.",
+  },
+  buildingRegister: {
+    loading:
+      "건축물대장 요약 정보를 조회하는 중입니다.",
+    slow:
+      "건축HUB 실데이터 응답을 기다리는 중입니다.",
+    delayed:
+      "건축HUB 응답이 길어지고 있지만 재시도와 캐시 확인을 계속하고 있습니다.",
+  },
 });
 
 function updateCardHeading(card, kicker, title) {
@@ -1387,6 +1432,150 @@ function setActionFeedback(message) {
   }
 }
 
+function createRequestUiToken(scope) {
+  return `${scope}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getRequestUiPhase(scope) {
+  return state.requestUiPhases?.[scope] || "idle";
+}
+
+function getRequestUiMessage(scope, phase = getRequestUiPhase(scope)) {
+  return REQUEST_UI_PHASE_MESSAGES?.[scope]?.[phase] || "";
+}
+
+function isRequestUiScopeBusy(scope) {
+  return (state.requestUiActiveTokens?.[scope]?.size || 0) > 0;
+}
+
+function syncRequestUiBusyFlags() {
+  state.isSiteContextRequesting = isRequestUiScopeBusy("siteContext");
+  state.isLandInfoRequesting = isRequestUiScopeBusy("landInfo");
+  state.isBuildingRegisterRequesting = isRequestUiScopeBusy("buildingRegister");
+}
+
+function clearRequestUiTimers(scope) {
+  const timers = state.requestUiTimers?.[scope];
+
+  if (!Array.isArray(timers)) {
+    return;
+  }
+
+  timers.forEach((timerId) => {
+    window.clearTimeout(timerId);
+  });
+  state.requestUiTimers[scope] = [];
+}
+
+function setRequestUiPhase(scope, phase, noteElement = null) {
+  if (state.requestUiPhases) {
+    state.requestUiPhases[scope] = phase;
+  }
+
+  const message = noteElement ? getRequestUiMessage(scope, phase) : "";
+
+  if (noteElement && message) {
+    noteElement.textContent = message;
+  }
+
+  syncRequestUiBusyFlags();
+  syncPanelStatusChips();
+}
+
+function beginRequestUiFeedback(scope, noteElement = null) {
+  const token = createRequestUiToken(scope);
+  const activeTokens = state.requestUiActiveTokens?.[scope];
+
+  if (!(activeTokens instanceof Set)) {
+    return token;
+  }
+
+  const wasBusy = activeTokens.size > 0;
+  activeTokens.add(token);
+  syncRequestUiBusyFlags();
+
+  if (!wasBusy) {
+    clearRequestUiTimers(scope);
+    setRequestUiPhase(scope, "loading", noteElement);
+    state.requestUiTimers[scope] = REQUEST_UI_DELAY_STEPS_MS.map((delayMs, index) =>
+      window.setTimeout(() => {
+        if (!isRequestUiScopeBusy(scope)) {
+          return;
+        }
+
+        const nextPhase = index === 0 ? "slow" : "delayed";
+        setRequestUiPhase(scope, nextPhase, noteElement);
+      }, delayMs)
+    );
+  } else if (noteElement) {
+    const message = getRequestUiMessage(scope);
+
+    if (message) {
+      noteElement.textContent = message;
+    }
+  }
+
+  syncPanelStatusChips();
+  return token;
+}
+
+function endRequestUiFeedback(scope, token) {
+  const activeTokens = state.requestUiActiveTokens?.[scope];
+
+  if (!(activeTokens instanceof Set)) {
+    return;
+  }
+
+  if (token) {
+    activeTokens.delete(token);
+  }
+
+  syncRequestUiBusyFlags();
+
+  if (activeTokens.size === 0) {
+    clearRequestUiTimers(scope);
+    setRequestUiPhase(scope, "idle");
+    return;
+  }
+
+  syncPanelStatusChips();
+}
+
+function resetRequestUiFeedback() {
+  ["siteContext", "landInfo", "buildingRegister"].forEach((scope) => {
+    clearRequestUiTimers(scope);
+    state.requestUiPhases[scope] = "idle";
+
+    if (state.requestUiActiveTokens?.[scope] instanceof Set) {
+      state.requestUiActiveTokens[scope].clear();
+    }
+  });
+
+  syncRequestUiBusyFlags();
+}
+
+function getRequestAwareNote(scope, fallbackText) {
+  return getRequestUiMessage(scope) || fallbackText;
+}
+
+function getRequestUiSummaryLabel(scope) {
+  const phase = getRequestUiPhase(scope);
+
+  if (phase === "slow") {
+    return "응답 대기";
+  }
+
+  if (phase === "delayed") {
+    return "지연중";
+  }
+
+  if (phase === "loading") {
+    return scope === "siteContext" ? "계산중" : "조회중";
+  }
+
+  return "";
+}
+
 function wait(ms) {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
@@ -1536,6 +1725,24 @@ function clearModelProgressPollTimer() {
   }
 }
 
+function buildTimedModelProgressHint(message, elapsedMs) {
+  const normalizedMessage = String(message || "");
+
+  if (/대기|재시도|retry|queue|응답/i.test(normalizedMessage)) {
+    return "";
+  }
+
+  if (elapsedMs >= 14000) {
+    return "공공데이터 응답과 모델 병합이 길어지고 있습니다.";
+  }
+
+  if (elapsedMs >= 7000) {
+    return "외부 데이터 응답을 기다리는 중일 수 있습니다.";
+  }
+
+  return "";
+}
+
 function syncTimedModelProgress() {
   const session = state.modelProgressSession;
 
@@ -1548,12 +1755,12 @@ function syncTimedModelProgress() {
     session.maxValue,
     Math.max(0, session.minValue, session.currentValue)
   );
+  const hint = buildTimedModelProgressHint(session.message, elapsedMs);
+  const label = `${session.message} · ${formatModelElapsedTime(elapsedMs)}${
+    hint ? ` · ${hint}` : ""
+  }`;
 
-  setModelProgress(
-    nextValue,
-    `${session.message} · ${formatModelElapsedTime(elapsedMs)}`,
-    "active"
-  );
+  setModelProgress(nextValue, label, "active");
 }
 
 function startModelProgress(operationKey, message, options = {}) {
@@ -1957,17 +2164,21 @@ function renderSelectionMeta() {
 }
 
 function renderSiteContextMeta() {
+  const siteContextRequestLabel = getRequestUiSummaryLabel("siteContext");
+
   if (!state.siteContext) {
     siteContextMeta.innerHTML = `
-      <div><dt>대지 경계</dt><dd>아직 불러오지 않음</dd></div>
-      <div><dt>지형 생성</dt><dd>아직 불러오지 않음</dd></div>
-      <div><dt>건물 매스</dt><dd>아직 불러오지 않음</dd></div>
-      <div><dt>대지 면적</dt><dd>아직 불러오지 않음</dd></div>
-      <div><dt>표고 범위</dt><dd>아직 불러오지 않음</dd></div>
-      <div><dt>포함 건물</dt><dd>아직 불러오지 않음</dd></div>
+      <div><dt>대지 경계</dt><dd>${escapeHtml(siteContextRequestLabel || "아직 불러오지 않음")}</dd></div>
+      <div><dt>지형 생성</dt><dd>${escapeHtml(siteContextRequestLabel || "아직 불러오지 않음")}</dd></div>
+      <div><dt>건물 매스</dt><dd>${escapeHtml(siteContextRequestLabel || "아직 불러오지 않음")}</dd></div>
+      <div><dt>대지 면적</dt><dd>${escapeHtml(siteContextRequestLabel || "아직 불러오지 않음")}</dd></div>
+      <div><dt>표고 범위</dt><dd>${escapeHtml(siteContextRequestLabel || "아직 불러오지 않음")}</dd></div>
+      <div><dt>포함 건물</dt><dd>${escapeHtml(siteContextRequestLabel || "아직 불러오지 않음")}</dd></div>
     `;
-    siteContextNote.textContent =
-      "위치를 선택한 뒤 대지/지형/건물 미리보기를 불러오세요.";
+    siteContextNote.textContent = getRequestAwareNote(
+      "siteContext",
+      "위치를 선택한 뒤 대지/지형/건물 미리보기를 불러오세요."
+    );
     return;
   }
 
@@ -1996,8 +2207,10 @@ function renderSiteContextMeta() {
       `${stats.buildingCount || 0}개 / 대지 내부 ${stats.targetBuildingCount || 0}개`
     )}</dd></div>
   `;
-  siteContextNote.textContent =
-    contours?.note || terrain?.note || buildings?.note || parcel?.note || "대지 컨텍스트를 불러왔습니다.";
+  siteContextNote.textContent = getRequestAwareNote(
+    "siteContext",
+    contours?.note || terrain?.note || buildings?.note || parcel?.note || "대지 컨텍스트를 불러왔습니다."
+  );
 }
 
 function renderInfoItems(container, items, emptyMessage) {
@@ -2050,6 +2263,8 @@ function trimMetaGrid(container, itemCount) {
 }
 
 function renderLandInfo() {
+  const landInfoRequestLabel = getRequestUiSummaryLabel("landInfo");
+
   if (!state.selectedLocation) {
     landInfoMeta.innerHTML = `
       <div><dt>조회 상태</dt><dd>선택 전</dd></div>
@@ -2084,15 +2299,17 @@ function renderLandInfo() {
 
   if (!state.landInfo) {
     landInfoMeta.innerHTML = `
-      <div><dt>조회 상태</dt><dd>조회 전</dd></div>
-      <div><dt>지목</dt><dd>조회 전</dd></div>
-      <div><dt>면적</dt><dd>조회 전</dd></div>
-      <div><dt>지역지구 수</dt><dd>조회 전</dd></div>
-      <div><dt>공시지가</dt><dd>조회 전</dd></div>
-      <div><dt>기준 주소</dt><dd>조회 전</dd></div>
+      <div><dt>조회 상태</dt><dd>${escapeHtml(landInfoRequestLabel || "조회 전")}</dd></div>
+      <div><dt>지목</dt><dd>${escapeHtml(landInfoRequestLabel || "조회 전")}</dd></div>
+      <div><dt>면적</dt><dd>${escapeHtml(landInfoRequestLabel || "조회 전")}</dd></div>
+      <div><dt>지역지구 수</dt><dd>${escapeHtml(landInfoRequestLabel || "조회 전")}</dd></div>
+      <div><dt>공시지가</dt><dd>${escapeHtml(landInfoRequestLabel || "조회 전")}</dd></div>
+      <div><dt>기준 주소</dt><dd>${escapeHtml(landInfoRequestLabel || "조회 전")}</dd></div>
     `;
-    landInfoNote.textContent =
-      "토지정보 불러오기를 누르면 토지이음의 필지 결과와 법규 요약을 이 화면에 정리합니다.";
+    landInfoNote.textContent = getRequestAwareNote(
+      "landInfo",
+      "토지정보 불러오기를 누르면 토지이음의 필지 결과와 법규 요약을 이 화면에 정리합니다."
+    );
     renderInfoItems(landInfoList, [], "토지정보 요약 결과가 여기에 표시됩니다.");
     renderInfoItems(lawInfoList, [], "법규 요약 결과가 여기에 표시됩니다.");
     return;
@@ -2103,17 +2320,17 @@ function renderLandInfo() {
   const otherLawItems = state.landInfo.regulations?.otherLawItems || [];
 
   landInfoMeta.innerHTML = `
-    <div><dt>조회 상태</dt><dd>실데이터 조회 완료</dd></div>
+    <div><dt>조회 상태</dt><dd>${escapeHtml(landInfoRequestLabel || "실데이터 조회 완료")}</dd></div>
     <div><dt>지목</dt><dd>${escapeHtml(summary.landCategory || "미확인")}</dd></div>
     <div><dt>면적</dt><dd>${escapeHtml(summary.areaText || "미확인")}</dd></div>
     <div><dt>지역지구 수</dt><dd>${escapeHtml(`${summary.urbanPlanningCount || 0} / ${summary.otherLawCount || 0}`)}</dd></div>
     <div><dt>공시지가</dt><dd>${escapeHtml(summary.announcedPrice || "미확인")}</dd></div>
     <div><dt>기준 주소</dt><dd>${escapeHtml(state.landInfo.address || buildSelectionLabel(state.selectedLocation))}</dd></div>
   `;
-  landInfoNote.textContent = `${state.landInfo.address || buildSelectionLabel(state.selectedLocation)} 기준 토지이음 결과를 정리했습니다.`; /*
-    ? "직접 지정 범위는 특정 필지 토지요약 대신 범위 안의 컨텍스트를 확인합니다."
-    `${state.landInfo.address || buildSelectionLabel(state.selectedLocation)} 기준 토지이음 결과를 정리했습니다.`;
-  */
+  landInfoNote.textContent = getRequestAwareNote(
+    "landInfo",
+    `${state.landInfo.address || buildSelectionLabel(state.selectedLocation)} 기준 토지이음 결과를 정리했습니다.`
+  );
   renderInfoItems(
     landInfoList,
     urbanPlanningItems,
@@ -2127,6 +2344,8 @@ function renderLandInfo() {
 }
 
 function renderBuildingRegister() {
+  const buildingRequestLabel = getRequestUiSummaryLabel("buildingRegister");
+
   if (!state.runtimeConfig?.futureSources?.hasBuildingHubKey) {
     buildingRegisterMeta.innerHTML = `
       <div><dt>조회 상태</dt><dd>키 미설정</dd></div>
@@ -2163,16 +2382,18 @@ function renderBuildingRegister() {
 
   if (!state.buildingRegister) {
     buildingRegisterMeta.innerHTML = `
-      <div><dt>조회 상태</dt><dd>조회 전</dd></div>
-      <div><dt>건물 수</dt><dd>조회 전</dd></div>
-      <div><dt>대표 용도</dt><dd>조회 전</dd></div>
-      <div><dt>대표 연면적</dt><dd>조회 전</dd></div>
-      <div><dt>대표 층수</dt><dd>조회 전</dd></div>
-      <div><dt>대표 구조</dt><dd>조회 전</dd></div>
+      <div><dt>조회 상태</dt><dd>${escapeHtml(buildingRequestLabel || "조회 전")}</dd></div>
+      <div><dt>건물 수</dt><dd>${escapeHtml(buildingRequestLabel || "조회 전")}</dd></div>
+      <div><dt>대표 용도</dt><dd>${escapeHtml(buildingRequestLabel || "조회 전")}</dd></div>
+      <div><dt>대표 연면적</dt><dd>${escapeHtml(buildingRequestLabel || "조회 전")}</dd></div>
+      <div><dt>대표 층수</dt><dd>${escapeHtml(buildingRequestLabel || "조회 전")}</dd></div>
+      <div><dt>대표 구조</dt><dd>${escapeHtml(buildingRequestLabel || "조회 전")}</dd></div>
     `;
     trimMetaGrid(buildingRegisterMeta, 5);
-    buildingRegisterNote.textContent =
-      "주소 검색 결과를 선택하거나 대지를 먼저 불러온 뒤 조회하세요. 현재 인쇄는 요약본 기준입니다.";
+    buildingRegisterNote.textContent = getRequestAwareNote(
+      "buildingRegister",
+      "주소 검색 결과를 선택하거나 대지를 먼저 불러온 뒤 조회하세요. 현재 인쇄는 요약본 기준입니다."
+    );
     buildingRegisterList.innerHTML =
       '<p class="search-results-empty">건축물대장 요약 결과가 여기에 표시됩니다.</p>';
     return;
@@ -2181,7 +2402,7 @@ function renderBuildingRegister() {
   const primary = state.buildingRegister.primary;
   const items = state.buildingRegister.items || [];
   buildingRegisterMeta.innerHTML = `
-    <div><dt>조회 상태</dt><dd>실데이터 조회 완료</dd></div>
+    <div><dt>조회 상태</dt><dd>${escapeHtml(buildingRequestLabel || "실데이터 조회 완료")}</dd></div>
     <div><dt>건물 수</dt><dd>${escapeHtml(String(state.buildingRegister.buildingCount || 0))}</dd></div>
     <div><dt>대표 용도</dt><dd>${escapeHtml(primary?.mainPurpose || "미확인")}</dd></div>
     <div><dt>대표 연면적</dt><dd>${escapeHtml(formatArea(primary?.totalAreaSqm || 0))}</dd></div>
@@ -2189,8 +2410,10 @@ function renderBuildingRegister() {
     <div><dt>대표 구조</dt><dd>${escapeHtml(primary?.structureName || "미확인")}</dd></div>
   `;
   trimMetaGrid(buildingRegisterMeta, 5);
-  buildingRegisterNote.textContent =
-    "건축HUB 표제부 조회 결과를 요약해 보여주고 있습니다. 공식 원본 확인은 세움터 팝업을 이용하세요.";
+  buildingRegisterNote.textContent = getRequestAwareNote(
+    "buildingRegister",
+    "건축HUB 표제부 조회 결과를 요약해 보여주고 있습니다. 공식 원본 확인은 세움터 팝업을 이용하세요."
+  );
 
   if (!items.length) {
     buildingRegisterList.innerHTML =
@@ -3005,6 +3228,7 @@ function clearSelectionForSearch(options = {}) {
   const preserveSearchResults = options?.preserveSearchResults === true;
   clearPreviewMarker();
   clearRangeDraftLayer();
+  resetRequestUiFeedback();
   state.manualRangePoints = [];
   state.activeSelectionKey = "";
   state.selectedLocation = null;
@@ -3059,6 +3283,7 @@ function clearSelectionForSearch(options = {}) {
       button.disabled = false;
     }
   });
+  syncPanelStatusChips();
 }
 
 function hasActiveMapSelectionState() {
@@ -3536,6 +3761,9 @@ async function loadSiteContext(
     return state.siteContextRequest.promise;
   }
 
+  const requestFeedbackToken = beginRequestUiFeedback("siteContext", siteContextNote);
+  renderSiteContextMeta();
+
   const requestPromise = (async () => {
     const requestInit = {
       method: "POST",
@@ -3631,6 +3859,9 @@ async function loadSiteContext(
     if (state.siteContextRequest?.key === requestKey) {
       state.siteContextRequest = null;
     }
+
+    endRequestUiFeedback("siteContext", requestFeedbackToken);
+    renderSiteContextMeta();
   }
 }
 
@@ -3642,51 +3873,61 @@ async function loadBuildingRegisterCore(
     throw new Error("먼저 위치를 선택하세요.");
   }
 
+  const requestFeedbackToken = beginRequestUiFeedback(
+    "buildingRegister",
+    buildingRegisterNote
+  );
+  renderBuildingRegister();
+
   const location = { ...state.selectedLocation };
   let requestPayload = buildParcelLookupRequestPayload(location);
 
-  let response = await fetch("/api/building-register", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(requestPayload),
-  });
-
-  let payload = await response.json();
-
-  if (!response.ok && !hasParcelLookupReference(location)) {
-    await loadSiteContext(selectionKey);
-    requestPayload = buildParcelLookupRequestPayload(state.selectedLocation);
-
-    response = await fetch("/api/building-register", {
+  try {
+    let response = await fetch("/api/building-register", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(requestPayload),
     });
-    payload = await response.json();
-  }
+    let payload = await response.json();
 
-  if (!response.ok) {
-    throw new Error(payload.error || "건축물대장 조회에 실패했습니다.");
-  }
+    if (!response.ok && !hasParcelLookupReference(location)) {
+      await loadSiteContext(selectionKey);
+      requestPayload = buildParcelLookupRequestPayload(state.selectedLocation);
 
-  if (!isSelectionRequestCurrent(selectionKey)) {
+      response = await fetch("/api/building-register", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(requestPayload),
+      });
+      payload = await response.json();
+    }
+
+    if (!response.ok) {
+      throw new Error(payload.error || "건축물대장 조회에 실패했습니다.");
+    }
+
+    if (!isSelectionRequestCurrent(selectionKey)) {
+      return payload;
+    }
+
+    if (payload?.parcelReference?.pnu) {
+      state.selectedLocation = {
+        ...state.selectedLocation,
+        pnu: state.selectedLocation?.pnu || payload.parcelReference.pnu,
+      };
+    }
+
+    state.buildingRegister = payload;
+    renderBuildingRegister();
     return payload;
+  } finally {
+    endRequestUiFeedback("buildingRegister", requestFeedbackToken);
+    renderBuildingRegister();
   }
-
-  if (payload?.parcelReference?.pnu) {
-    state.selectedLocation = {
-      ...state.selectedLocation,
-      pnu: state.selectedLocation?.pnu || payload.parcelReference.pnu,
-    };
-  }
-
-  state.buildingRegister = payload;
-  renderBuildingRegister();
-  return payload;
 }
 
 async function printBuildingRegister(printWindow = null) {
@@ -3785,9 +4026,11 @@ async function loadLandInfo(
   }
 
   const location = { ...state.selectedLocation };
+  const requestFeedbackToken =
+    retryCount === 0 ? beginRequestUiFeedback("landInfo", landInfoNote) : null;
 
   if (retryCount === 0) {
-    state.isLandInfoRequesting = true;
+    renderLandInfo();
   }
 
   try {
@@ -3855,8 +4098,8 @@ async function loadLandInfo(
     throw error;
   } finally {
     if (retryCount === 0) {
-      state.isLandInfoRequesting = false;
-      syncPanelStatusChips();
+      endRequestUiFeedback("landInfo", requestFeedbackToken);
+      renderLandInfo();
     }
   }
 }
@@ -3873,6 +4116,13 @@ async function loadLandInfoDetails(
 ) {
   if (!state.selectedLocation) {
     throw new Error("먼저 위치를 선택해 주세요.");
+  }
+
+  const requestFeedbackToken =
+    retryCount === 0 ? beginRequestUiFeedback("landInfo", landInfoNote) : null;
+
+  if (retryCount === 0) {
+    renderLandInfo();
   }
 
   if (!state.landInfo) {
@@ -3926,6 +4176,11 @@ async function loadLandInfoDetails(
     }
 
     throw error;
+  } finally {
+    if (retryCount === 0) {
+      endRequestUiFeedback("landInfo", requestFeedbackToken);
+      renderLandInfo();
+    }
   }
 }
 
@@ -4115,23 +4370,201 @@ function ensureStatusChip(id, labelElement) {
   chip.id = id;
   chip.className = "data-status-chip";
   chip.textContent = "대기";
+  chip.dataset.state = "idle";
   labelElement.append(chip);
 }
 
-function syncPanelStatusChips() {
-  const landChip = document.querySelector("#landInfoStatusChip");
+function initializePanelStatusChips() {
+  ensureStatusChip(
+    "siteContextStatusChip",
+    siteContextCard?.querySelector(".card-header > div:first-child")
+  );
+  ensureStatusChip(
+    "landInfoStatusChip",
+    landInfoCard?.querySelector(".card-header > div:first-child")
+  );
+  ensureStatusChip(
+    "buildingRegisterStatusChip",
+    buildingRegisterCard?.querySelector(".card-header > div:first-child")
+  );
+}
 
-  if (landChip) {
-    landChip.textContent = !state.selectedLocation
-      ? "대기"
-      : isMultiParcelSelection(state.selectedLocation)
-        ? "그룹 모드"
-      : state.landInfo
-        ? "조회 완료"
-        : state.isLandInfoRequesting
-          ? "조회중"
-          : "미조회";
+function setStatusChipState(chip, label, stateName = "idle") {
+  if (!chip) {
+    return;
   }
+
+  chip.textContent = label;
+  chip.dataset.state = stateName;
+}
+
+function resolvePanelChipState(scope) {
+  const selection = state.selectedLocation;
+  const phase = getRequestUiPhase(scope);
+
+  if (scope === "siteContext") {
+    if (!selection) {
+      return { label: "대기", stateName: "idle" };
+    }
+
+    if (phase !== "idle") {
+      return { label: getRequestUiSummaryLabel(scope), stateName: phase };
+    }
+
+    if (state.siteContext) {
+      return { label: "준비 완료", stateName: "success" };
+    }
+
+    return {
+      label: isMultiParcelSelection(selection) ? "그룹 준비" : "미리보기 전",
+      stateName: "idle",
+    };
+  }
+
+  if (scope === "landInfo") {
+    if (!selection) {
+      return { label: "대기", stateName: "idle" };
+    }
+
+    if (isRangeSelection(selection)) {
+      return { label: "범위 모드", stateName: "disabled" };
+    }
+
+    if (isMultiParcelSelection(selection)) {
+      return { label: "그룹 모드", stateName: "disabled" };
+    }
+
+    if (phase !== "idle") {
+      return { label: getRequestUiSummaryLabel(scope), stateName: phase };
+    }
+
+    if (state.landInfoDetails) {
+      return { label: "상세 완료", stateName: "success" };
+    }
+
+    if (state.landInfo) {
+      return { label: "조회 완료", stateName: "success" };
+    }
+
+    return { label: "미조회", stateName: "idle" };
+  }
+
+  if (!state.runtimeConfig?.futureSources?.hasBuildingHubKey) {
+    return { label: "키 필요", stateName: "disabled" };
+  }
+
+  if (!selection) {
+    return { label: "대기", stateName: "idle" };
+  }
+
+  if (isRangeSelection(selection)) {
+    return { label: "범위 모드", stateName: "disabled" };
+  }
+
+  if (isMultiParcelSelection(selection)) {
+    return { label: "그룹 모드", stateName: "disabled" };
+  }
+
+  if (phase !== "idle") {
+    return { label: getRequestUiSummaryLabel(scope), stateName: phase };
+  }
+
+  if (state.buildingRegister) {
+    return { label: "조회 완료", stateName: "success" };
+  }
+
+  return { label: "미조회", stateName: "idle" };
+}
+
+function syncBusyButtonState(button, isDisabled, isBusy = false) {
+  if (!button) {
+    return;
+  }
+
+  button.disabled = Boolean(isDisabled);
+  button.setAttribute("aria-busy", isBusy ? "true" : "false");
+}
+
+function syncPanelStatusChips() {
+  initializePanelStatusChips();
+
+  setStatusChipState(
+    document.querySelector("#siteContextStatusChip"),
+    resolvePanelChipState("siteContext").label,
+    resolvePanelChipState("siteContext").stateName
+  );
+  setStatusChipState(
+    document.querySelector("#landInfoStatusChip"),
+    resolvePanelChipState("landInfo").label,
+    resolvePanelChipState("landInfo").stateName
+  );
+  setStatusChipState(
+    document.querySelector("#buildingRegisterStatusChip"),
+    resolvePanelChipState("buildingRegister").label,
+    resolvePanelChipState("buildingRegister").stateName
+  );
+
+  const hasSelection = Boolean(state.selectedLocation);
+  const rangeMode = isRangeSelection(state.selectedLocation);
+  const multiParcelMode = isMultiParcelSelection(state.selectedLocation);
+  const parcelLookupBlocked = !hasSelection || rangeMode || multiParcelMode;
+  const buildingLookupBlocked =
+    parcelLookupBlocked || !state.runtimeConfig?.futureSources?.hasBuildingHubKey;
+  const previewBlocked =
+    !hasSelection || state.isSiteContextRequesting || state.isExportDownloadInFlight;
+
+  syncBusyButtonState(
+    loadSiteContextButton,
+    previewBlocked,
+    state.isSiteContextRequesting
+  );
+  syncBusyButtonState(
+    previewSiteContextButton,
+    previewBlocked,
+    state.isSiteContextRequesting
+  );
+  syncBusyButtonState(
+    downloadSiteContextButton,
+    !state.siteContext || state.isSiteContextRequesting || state.isExportDownloadInFlight,
+    state.isSiteContextRequesting || state.isExportDownloadInFlight
+  );
+  syncBusyButtonState(
+    loadLandInfoButton,
+    parcelLookupBlocked || state.isLandInfoRequesting,
+    state.isLandInfoRequesting
+  );
+  syncBusyButtonState(
+    showLandInfoDetailsButton,
+    parcelLookupBlocked || state.isLandInfoRequesting,
+    state.isLandInfoRequesting
+  );
+  syncBusyButtonState(
+    openLandUseDetailButton,
+    parcelLookupBlocked || state.isLandInfoRequesting,
+    state.isLandInfoRequesting
+  );
+  syncBusyButtonState(
+    loadBuildingRegisterButton,
+    buildingLookupBlocked || state.isBuildingRegisterRequesting,
+    state.isBuildingRegisterRequesting
+  );
+  syncBusyButtonState(
+    showBuildingRegisterDetailsButton,
+    buildingLookupBlocked || state.isBuildingRegisterRequesting,
+    state.isBuildingRegisterRequesting
+  );
+  syncBusyButtonState(
+    printBuildingRegisterButton,
+    buildingLookupBlocked ||
+      state.isBuildingRegisterRequesting ||
+      !state.buildingRegister,
+    state.isBuildingRegisterRequesting
+  );
+  syncBusyButtonState(
+    openOfficialBuildingRegisterButton,
+    buildingLookupBlocked || state.isBuildingRegisterRequesting,
+    state.isBuildingRegisterRequesting
+  );
 }
 
 function createModelOptionLabel(name, title, options, value, description = "") {
@@ -5136,6 +5569,7 @@ function createMap(config) {
 
 function setSelectedLocation(location, moveMap = true) {
   clearPreviewMarker();
+  resetRequestUiFeedback();
   state.pendingSearchSelectionId = "";
   setSearchSelectionCardVisible(false);
   state.selectedLocation = location;
@@ -5225,6 +5659,7 @@ function setSelectedLocation(location, moveMap = true) {
     }
   );
 
+  syncPanelStatusChips();
   void hydrateSelectedLocationParcelReference(state.activeSelectionKey);
 }
 
@@ -5395,6 +5830,7 @@ async function bootstrap() {
   relocateSearchUiToSidePanel();
   syncDesktopPanelLayout();
   attachEvents();
+  initializePanelStatusChips();
   loadHistory();
   renderHistory();
   renderSelectionSummary();

@@ -993,6 +993,35 @@ h3 {
   font-size: 0.78rem;
   font-weight: 700;
   white-space: nowrap;
+  transition:
+    background-color 140ms ease,
+    color 140ms ease,
+    border-color 140ms ease;
+}
+
+.data-status-chip[data-state="loading"] {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.data-status-chip[data-state="slow"] {
+  background: var(--sky-soft);
+  color: var(--sky);
+}
+
+.data-status-chip[data-state="delayed"] {
+  background: rgba(179, 117, 63, 0.16);
+  color: #8b4b28;
+}
+
+.data-status-chip[data-state="success"] {
+  background: var(--olive-soft);
+  color: var(--olive);
+}
+
+.data-status-chip[data-state="disabled"] {
+  background: rgba(103, 87, 73, 0.08);
+  color: var(--muted);
 }
 
 .meta-grid {

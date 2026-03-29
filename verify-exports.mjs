@@ -852,6 +852,21 @@ async function runBaselineVerification() {
       /async function loadLandInfoDetails[\s\S]*?siteContext[\s\S]*?async function ensureLandInfoDetailsLoaded/s,
       "Land-info detail requests should not post the full siteContext payload."
     );
+    assert.match(
+      appSource,
+      /const REQUEST_UI_PHASE_MESSAGES = Object\.freeze\(/,
+      "Frontend should define request-phase copy for slow or delayed upstream states."
+    );
+    assert.match(
+      appSource,
+      /function beginRequestUiFeedback\s*\(/,
+      "Frontend should manage request-phase UI feedback for long-running panel requests."
+    );
+    assert.match(
+      appSource,
+      /siteContextStatusChip|landInfoStatusChip|buildingRegisterStatusChip/,
+      "Frontend should expose visible status chips for key panel requests."
+    );
 
     const hubResponse = await fetch(`${baseUrl}/`);
     const hubHtml = await hubResponse.text();
@@ -1940,6 +1955,7 @@ async function runBaselineVerification() {
             "provider-timeout-config",
             "vworld-domain-candidates",
             "parcel-lookup-lite-client",
+            "ui-request-status-feedback",
             "security-headers",
             "csp-no-inline-default",
             "self-hosted-frontend-assets",
