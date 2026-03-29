@@ -10,7 +10,8 @@
     "verify:deployment-security": "node scripts/verify-deployment-security.mjs",
     "verify:dxf": "node scripts/verify-dxf.mjs",
     "verify:exports": "node verify-exports.mjs",
-    "verify:exports:full": "set VERIFY_EXPORTS_FULL_SKP=1&& node verify-exports.mjs"
+    "verify:exports:full": "set VERIFY_EXPORTS_FULL_SKP=1&& node verify-exports.mjs",
+    "verify:ui": "node scripts/verify-ui-flow.mjs"
   },
   "dependencies": {
     "earcut": "^3.0.2",
@@ -19,5 +20,8 @@
     "proj4": "^2.20.4",
     "rhino3dm": "^8.17.0",
     "shapefile": "^0.6.6"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2"
   }
 }
