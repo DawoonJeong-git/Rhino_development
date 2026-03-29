@@ -1187,6 +1187,57 @@ async function runBaselineVerification() {
       syntheticContourSiteContext.contourLines,
       "DXF export should preserve official contour geometries instead of regenerating grid contours."
     );
+    const exportMutationSourceSiteContext = cloneJsonValue({
+      ...syntheticContourSiteContext,
+      options: {
+        ...syntheticContourSiteContext.options,
+        includeBuildings: true,
+      },
+      buildings: {
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            properties: {
+              buildingId: "B-1",
+              buildingName: "Mutation Check",
+              heightMeters: 12,
+            },
+            geometry: {
+              type: "Polygon",
+              coordinates: [[
+                [126.97808, 37.56647],
+                [126.97818, 37.56647],
+                [126.97818, 37.56657],
+                [126.97808, 37.56657],
+                [126.97808, 37.56647],
+              ]],
+            },
+          },
+        ],
+      },
+    });
+    const exportMutationOriginalSnapshot = cloneJsonValue(exportMutationSourceSiteContext);
+    const exportMutationPreparedSiteContext = prepareSiteContextForExport(
+      exportMutationSourceSiteContext,
+      exportMutationSourceSiteContext.options,
+      "skp"
+    );
+    assert.equal(
+      exportMutationSourceSiteContext?.terrainGrid?.step,
+      exportMutationOriginalSnapshot?.terrainGrid?.step,
+      "prepareSiteContextForExport should not mutate the source terrain grid."
+    );
+    assert.equal(
+      exportMutationSourceSiteContext?.buildings?.features?.[0]?.properties?.buildingPlacementDebug,
+      undefined,
+      "prepareSiteContextForExport should not write building placement debug info back onto the source siteContext."
+    );
+    assert.notEqual(
+      exportMutationPreparedSiteContext?.buildings?.features?.[0]?.properties?.buildingPlacementDebug,
+      undefined,
+      "prepareSiteContextForExport should still attach building placement debug info on the export copy."
+    );
     const serverOwnedSiteContext = await fetchJson("/api/site-context", {
       location: syntheticContourSiteContext.location,
       options: syntheticContourSiteContext.options,
@@ -1351,6 +1402,7 @@ async function runBaselineVerification() {
             "search-ranking-tokens",
             "skp-terrain-refine",
             "skp-contour-curves",
+            "export-prep-no-mutation",
             "export-cache-key-geometry",
             "export-ignores-client-site-context",
             "export-without-site-context",

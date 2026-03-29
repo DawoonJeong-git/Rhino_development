@@ -16392,25 +16392,23 @@ function addRhinoPolylineCollection(
 }
 
 function prepareSiteContextForExport(siteContext, requestedOptions, format) {
-  const exportSiteContext = {
-    ...siteContext,
-    options: {
-      ...(siteContext?.options || {}),
-      ...(requestedOptions || {}),
-      exportFormat: format,
-    },
-    stats: {
-      ...(siteContext?.stats || {}),
-    },
-    dataSources: {
-      ...(siteContext?.dataSources || {}),
-      terrain: siteContext?.dataSources?.terrain
-        ? { ...siteContext.dataSources.terrain }
-        : siteContext?.dataSources?.terrain,
-      contours: siteContext?.dataSources?.contours
-        ? { ...siteContext.dataSources.contours }
-        : siteContext?.dataSources?.contours,
-    },
+  const exportSiteContext = cloneSiteContextForExport(siteContext);
+  exportSiteContext.options = {
+    ...(exportSiteContext?.options || {}),
+    ...(requestedOptions || {}),
+    exportFormat: format,
+  };
+  exportSiteContext.stats = {
+    ...(exportSiteContext?.stats || {}),
+  };
+  exportSiteContext.dataSources = {
+    ...(exportSiteContext?.dataSources || {}),
+    terrain: exportSiteContext?.dataSources?.terrain
+      ? { ...exportSiteContext.dataSources.terrain }
+      : exportSiteContext?.dataSources?.terrain,
+    contours: exportSiteContext?.dataSources?.contours
+      ? { ...exportSiteContext.dataSources.contours }
+      : exportSiteContext?.dataSources?.contours,
   };
   maybeRefineSketchUpTerrainGrid(exportSiteContext);
   const requestedContourInterval = normalizeContourInterval(
@@ -16755,6 +16753,36 @@ function estimateExportArtifactSizeBytes(payload, payloadType = "binary") {
   }
 
   return Buffer.byteLength(String(payload || ""), "utf8");
+}
+
+function cloneSerializableValue(value) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return JSON.parse(JSON.stringify(value));
+}
+
+function cloneSiteContextForExport(siteContext) {
+  if (!siteContext || typeof siteContext !== "object") {
+    return siteContext;
+  }
+
+  return {
+    ...siteContext,
+    location: cloneSerializableValue(siteContext.location),
+    options: cloneSerializableValue(siteContext.options) || {},
+    stats: cloneSerializableValue(siteContext.stats) || {},
+    dataSources: cloneSerializableValue(siteContext.dataSources) || {},
+    parcelBoundary: cloneSerializableValue(siteContext.parcelBoundary),
+    targetParcelGroups: cloneSerializableValue(siteContext.targetParcelGroups),
+    parcelContext: cloneSerializableValue(siteContext.parcelContext),
+    clipBoundary: cloneSerializableValue(siteContext.clipBoundary),
+    contourLines: cloneSerializableValue(siteContext.contourLines),
+    terrainGrid: cloneSerializableValue(siteContext.terrainGrid),
+    buildings: cloneSerializableValue(siteContext.buildings),
+    roads: cloneSerializableValue(siteContext.roads),
+  };
 }
 
 function pruneExportArtifactCache(now = Date.now()) {
