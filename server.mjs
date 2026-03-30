@@ -5163,6 +5163,7 @@ function selectGeocodedVWorldResultForJusoCandidate(
 
 async function geocodeJusoCandidate(item, config, options = {}) {
   const query = item.roadAddress || item.parcelAddress || item.label;
+  const candidateNote = item.roadAddress || item.parcelAddress || item.label || "";
 
   if (!query) {
     return null;
@@ -5171,9 +5172,24 @@ async function geocodeJusoCandidate(item, config, options = {}) {
   let result = null;
 
   if (config.jusoCoordinateConfirmKey || config.jusoConfirmKey) {
+    const coordinateStartedAt = Date.now();
     try {
       result = await geocodeJusoCandidateWithCoordinateApi(item, config);
+      appendGeocodeTraceStage(options.trace, {
+        name: "juso-coordinate",
+        outcome: result ? "ok" : "empty",
+        durationMs: Date.now() - coordinateStartedAt,
+        count: result ? 1 : 0,
+        note: candidateNote,
+      });
     } catch {
+      appendGeocodeTraceStage(options.trace, {
+        name: "juso-coordinate",
+        outcome: "error",
+        durationMs: Date.now() - coordinateStartedAt,
+        count: 0,
+        note: candidateNote,
+      });
       result = null;
     }
   }
@@ -5186,6 +5202,13 @@ async function geocodeJusoCandidate(item, config, options = {}) {
     );
 
     if (sharedMatch) {
+      appendGeocodeTraceStage(options.trace, {
+        name: "juso-shared-vworld-match",
+        outcome: "ok",
+        durationMs: 0,
+        count: 1,
+        note: candidateNote,
+      });
       result = mergeGeocodedSearchResultWithJusoCandidate(
         sharedMatch,
         item,
@@ -5195,6 +5218,7 @@ async function geocodeJusoCandidate(item, config, options = {}) {
   }
 
   if (!result && options.allowVWorldFallback !== false && config.vworldApiKey) {
+    const vworldFallbackStartedAt = Date.now();
     const sharedCategories = new Set(
       Array.isArray(options.sharedVWorldCategories)
         ? options.sharedVWorldCategories.map((category) =>
@@ -5213,24 +5237,55 @@ async function geocodeJusoCandidate(item, config, options = {}) {
         : Promise.resolve([]),
     ]);
 
+    appendGeocodeTraceStage(options.trace, {
+      name: "juso-vworld-fallback",
+      outcome: roadResults[0] || parcelResults[0] ? "ok" : "empty",
+      durationMs: Date.now() - vworldFallbackStartedAt,
+      count: (roadResults?.length || 0) + (parcelResults?.length || 0),
+      note: candidateNote,
+    });
+
     result = roadResults[0] || parcelResults[0] || null;
   }
 
   if (!result && options.allowParcelFallback !== false && item.parcelAddress) {
+    const parcelFallbackStartedAt = Date.now();
     try {
       const parcelFallbackResults = await geocodeParcelQueryWithDataFallback(
         item.parcelAddress,
         [],
         config
       );
+      appendGeocodeTraceStage(options.trace, {
+        name: "juso-parcel-fallback",
+        outcome: parcelFallbackResults[0] ? "ok" : "empty",
+        durationMs: Date.now() - parcelFallbackStartedAt,
+        count: parcelFallbackResults.length,
+        note: candidateNote,
+      });
       result = parcelFallbackResults[0] || null;
     } catch {
+      appendGeocodeTraceStage(options.trace, {
+        name: "juso-parcel-fallback",
+        outcome: "error",
+        durationMs: Date.now() - parcelFallbackStartedAt,
+        count: 0,
+        note: candidateNote,
+      });
       result = null;
     }
   }
 
   if (!result && options.allowNominatimFallback !== false && config.useNominatimFallback) {
+    const nominatimFallbackStartedAt = Date.now();
     const fallbackResults = await geocodeWithNominatim(query, config);
+    appendGeocodeTraceStage(options.trace, {
+      name: "juso-nominatim-fallback",
+      outcome: fallbackResults[0] ? "ok" : "empty",
+      durationMs: Date.now() - nominatimFallbackStartedAt,
+      count: fallbackResults.length,
+      note: candidateNote,
+    });
     result = fallbackResults[0] || null;
   }
 
@@ -5698,6 +5753,7 @@ async function geocodeWithPreferredProviders(query, config, trace = null) {
       await Promise.all(
         jusoFastPathCandidates.map((candidate) =>
           geocodeJusoCandidate(candidate, config, {
+            trace,
             queryHints: hints,
             sharedVWorldResults: fastVworldResult.items || [],
             sharedVWorldCategories: fastVworldResult.timedOut
@@ -5750,6 +5806,7 @@ async function geocodeWithPreferredProviders(query, config, trace = null) {
       await Promise.all(
         [shortCircuitJusoCandidate].map((candidate) =>
           geocodeJusoCandidate(candidate, config, {
+            trace,
             queryHints: hints,
             sharedVWorldResults: sharedVworldResult.items || [],
             sharedVWorldCategories: sharedVworldResult.timedOut
@@ -5836,6 +5893,7 @@ async function geocodeWithPreferredProviders(query, config, trace = null) {
             : remainingJuso.slice(0, searchProfile.jusoHydrationLimit)
         ).map((candidate) =>
           geocodeJusoCandidate(candidate, config, {
+            trace,
             queryHints: hints,
             sharedVWorldResults: vworldItems,
             sharedVWorldCategories: vworldCategories,
@@ -5876,6 +5934,7 @@ async function geocodeWithPreferredProviders(query, config, trace = null) {
       await Promise.all(
         jusoItems.slice(0, searchProfile.jusoHydrationLimit).map((candidate) =>
           geocodeJusoCandidate(candidate, config, {
+            trace,
             queryHints: hints,
             sharedVWorldResults: vworldItems,
             sharedVWorldCategories: vworldCategories,
