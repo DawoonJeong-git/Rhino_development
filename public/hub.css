@@ -269,6 +269,60 @@ h2 {
   padding: 24px 28px;
 }
 
+.service-note {
+  display: grid;
+  gap: 12px;
+  margin-top: 20px;
+  padding: 24px 28px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(250, 245, 238, 0.9));
+  backdrop-filter: blur(12px);
+  box-shadow: var(--shadow-md);
+}
+
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 24px;
+}
+
+.hero-primary {
+  min-width: 220px;
+}
+
+.hero-secondary {
+  min-width: 170px;
+}
+
+.service-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.service-list li {
+  position: relative;
+  padding-left: 18px;
+  color: var(--muted);
+  line-height: 1.7;
+}
+
+.service-list li::before {
+  content: "";
+  position: absolute;
+  top: 0.72em;
+  left: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+}
+
 @media (max-width: 1040px) {
   .hub-grid {
     grid-template-columns: 1fr;
@@ -287,12 +341,22 @@ h2 {
 
   .hero,
   .feature-card,
-  .roadmap-card {
+  .roadmap-card,
+  .service-note {
     padding: 24px;
   }
 
   .feature-head {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .hero-actions {
+    flex-direction: column;
+  }
+
+  .hero-primary,
+  .hero-secondary {
+    width: 100%;
   }
 }

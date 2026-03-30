@@ -125,44 +125,44 @@ const FEATURE_PAGE_DEFINITIONS = Object.freeze([
     routePath: "/contour3dmodel",
     title: "3D 대지모형 스튜디오",
     summary:
-      "주소 선택, 범위 지정, 다중 필지 선택, 대지/건물 컨텍스트 확인, 3D와 CAD export를 한 화면에서 이어가는 현재 메인 기능입니다.",
+      "주소 검색과 지도 선택으로 대상지를 정하고, 지형·건물·도로 맥락을 확인한 뒤 3DM, OBJ, DXF, SKP 파일까지 바로 준비할 수 있는 서비스입니다.",
     enabledMeta: [
-      { label: "진입 주소", value: "/contour3dmodel", code: true },
-      { label: "현재 출력", value: "OBJ / DXF / SKP / 3DM" },
+      { label: "바로가기", value: "/contour3dmodel", code: true },
+      { label: "출력 형식", value: "OBJ / DXF / SKP / 3DM" },
     ],
     disabledMeta: [
-      { label: "상태", value: "공개 준비 중" },
-      { label: "초점 방향", value: "대지 컨텍스트 + 3D/CAD 출력" },
+      { label: "상태", value: "곧 공개" },
+      { label: "주요 내용", value: "대지 맥락 검토 + 3D/CAD 출력" },
     ],
   },
   {
     id: "heritage-risk",
     routePath: "/heritage-risk",
-    title: "문화재 발굴 위험도 지도",
+    title: "문화재 발굴 위험도 검토",
     summary:
-      "후보지 주변의 문화재 조사 이력과 발굴 위험도를 지도 중심 흐름으로 검토하는 기능입니다. 메인 대지 검토와 이어지는 다음 단계로 준비 중입니다.",
+      "후보지 주변의 문화재 조사 이력과 발굴 가능성을 지도 중심으로 살펴볼 수 있도록 준비 중인 기능입니다.",
     enabledMeta: [
-      { label: "진입 주소", value: "/heritage-risk", code: true },
-      { label: "핵심 방향", value: "지도 중심 위험도 검토" },
+      { label: "바로가기", value: "/heritage-risk", code: true },
+      { label: "주요 내용", value: "문화재 조사 이력과 발굴 가능성 검토" },
     ],
     disabledMeta: [
-      { label: "상태", value: "공개 준비 중" },
-      { label: "핵심 방향", value: "지도 중심 위험도 검토" },
+      { label: "예정 내용", value: "문화재 조사 이력과 발굴 가능성 검토" },
+      { label: "공개 상태", value: "순차 제공 예정" },
     ],
   },
   {
     id: "max-mass",
     routePath: "/max-mass",
-    title: "법규 기반 최대 매스 생성",
+    title: "법규 기반 최대 매스 검토",
     summary:
-      "대지와 법규 조건을 바탕으로 초기 최대 매스를 검토하는 기능입니다. 이후 안별 비교와 후속 설계 검토로 이어가기 좋은 흐름으로 준비 중입니다.",
+      "대지와 법규 조건을 바탕으로 초기 볼륨과 배치 가능성을 빠르게 살펴볼 수 있도록 준비 중인 기능입니다.",
     enabledMeta: [
-      { label: "진입 주소", value: "/max-mass", code: true },
-      { label: "핵심 방향", value: "법규 해석 + 초기 매스 검토" },
+      { label: "바로가기", value: "/max-mass", code: true },
+      { label: "주요 내용", value: "법규 해석과 초기 볼륨 검토" },
     ],
     disabledMeta: [
-      { label: "상태", value: "공개 준비 중" },
-      { label: "핵심 방향", value: "법규 해석 + 초기 매스 검토" },
+      { label: "예정 내용", value: "법규 해석과 초기 볼륨 검토" },
+      { label: "공개 상태", value: "순차 제공 예정" },
     ],
   },
 ]);
@@ -605,16 +605,16 @@ function renderFeatureMetaRow(meta) {
 }
 
 function renderHubFeatureCard(feature) {
-  const cardKicker = feature.publicEnabled ? "Live Now" : "Next Track";
-  const badgeText = feature.publicEnabled ? "사용 가능" : "공개 준비 중";
+  const cardKicker = feature.publicEnabled ? "Available Now" : "Coming Soon";
+  const badgeText = feature.publicEnabled ? "지금 사용 가능" : "곧 제공";
   const badgeClass = feature.publicEnabled ? "feature-badge is-live" : "feature-badge";
   const cardClass = feature.publicEnabled ? "feature-card-live" : "feature-card-plan";
   const metaRows = (feature.publicEnabled ? feature.enabledMeta : feature.disabledMeta)
     .map((meta) => renderFeatureMetaRow(meta))
     .join("");
   const actionMarkup = feature.publicEnabled
-    ? `<a class="feature-link" href="${escapeHtml(feature.routePath)}">기능 열기</a>`
-    : '<span class="feature-link is-secondary is-disabled" aria-disabled="true">공개 준비 중</span>';
+    ? `<a class="feature-link" href="${escapeHtml(feature.routePath)}">바로 시작하기</a>`
+    : '<span class="feature-link is-secondary is-disabled" aria-disabled="true">곧 공개됩니다</span>';
 
   return [
     `<article class="feature-card ${cardClass}">`,
@@ -631,7 +631,7 @@ function renderHubFeatureCard(feature) {
 }
 
 function renderHubStatusChip(feature) {
-  const label = feature.publicEnabled ? "운영 중" : "다음 단계";
+  const label = feature.publicEnabled ? "현재 제공" : "곧 제공";
 
   return [
     '<div class="status-chip">',
@@ -651,36 +651,43 @@ function renderHubHtml(config) {
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Space Work Hub</title>
-    <link rel="stylesheet" href="/hub.css?v=20260326-hub2" />
+    <title>Spaceswork</title>
+    <link rel="stylesheet" href="/hub.css?v=20260331-main1" />
   </head>
   <body>
     <main class="hub-shell">
       <section class="hero">
         <div class="hero-copy">
-          <p class="eyebrow">Space Work Hub</p>
-          <h1>대지 분석 흐름을 한 허브에서 차례대로 이어갑니다</h1>
+          <p class="eyebrow">Spaceswork</p>
+          <h1>대지 검토와 3D 출력 작업을 한 곳에서 시작하세요</h1>
           <p class="hero-lead">
-            메인 허브에서 현재 운영 중인 기능과 다음 단계 기능을 함께 살피고, 실제 작업은 각 단계의 화면에서 이어가도록 정리했습니다. 현재는 3D 대지모형이 운영 중이며, 다음 흐름으로 문화재 위험도 검토와 법규 기반 최대 매스 검토를 준비하고 있습니다.
+            주소 검색부터 지형·건물·도로 맥락 확인, 3DM·OBJ·DXF·SKP 출력까지 빠르게 이어지는 공간 검토 서비스입니다.
+            현재는 3D 대지모형 스튜디오를 사용할 수 있고, 문화재 발굴 위험도와 최대 매스 검토 기능도 순차적으로 제공될 예정입니다.
           </p>
+          <div class="hero-actions">
+            <a class="feature-link hero-primary" href="/contour3dmodel">3D 대지모형 시작하기</a>
+            <a class="feature-link is-secondary hero-secondary" href="#services">서비스 둘러보기</a>
+          </div>
         </div>
         <div class="hero-status">
           ${statusChipsMarkup}
         </div>
       </section>
 
-      <section class="hub-grid" aria-label="기능 목록">
-        ${featureCardsMarkup}
+      <section class="service-note" aria-label="서비스 소개">
+        <div>
+          <p class="card-kicker">What You Can Do</p>
+          <h2>현재 제공 범위</h2>
+        </div>
+        <ul class="service-list">
+          <li>주소 검색, 지도 클릭, 다중 필지, 수동 범위 지정으로 대상지를 정할 수 있습니다.</li>
+          <li>주변 건물, 도로, 지형, 토지 정보를 한 흐름으로 살펴볼 수 있습니다.</li>
+          <li>검토 결과를 3DM, OBJ, DXF, SKP 파일로 바로 이어갈 수 있습니다.</li>
+        </ul>
       </section>
 
-      <section class="roadmap-card" aria-label="확장 메모">
-        <div>
-          <p class="card-kicker">Structure Note</p>
-          <h2>공개 전환은 설정 한 곳에서 관리합니다</h2>
-        </div>
-        <p class="card-copy">
-          허브 노출, 버튼 상태, 실제 공개 접근은 같은 release flag를 기준으로 맞춰집니다. 준비가 끝난 기능만 공개로 전환하고, 나머지는 허브에서 다음 단계로만 소개하는 구조를 유지합니다.
-        </p>
+      <section class="hub-grid" id="services" aria-label="서비스 목록">
+        ${featureCardsMarkup}
       </section>
     </main>
   </body>

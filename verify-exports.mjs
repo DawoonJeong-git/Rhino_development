@@ -920,32 +920,32 @@ async function runBaselineVerification() {
 
     const hubResponse = await fetch(`${baseUrl}/`);
     const hubHtml = await hubResponse.text();
-    assert.equal(hubResponse.status, 200, "Hub route should respond.");
-    assert.match(hubHtml, /Space Work Hub/, "Hub page title/content should exist.");
+    assert.equal(hubResponse.status, 200, "Main route should respond.");
+    assert.match(hubHtml, /Spaceswork/, "Main page title/content should exist.");
     assert.match(
       hubHtml,
       /\/contour3dmodel/,
-      "Hub page should link to the feature route."
+      "Main page should link to the feature route."
     );
     assert.match(
       hubHtml,
-      /문화재 발굴 위험도 지도/,
-      "Hub page should still introduce the heritage-risk feature on the public roadmap."
+      /문화재 발굴 위험도 검토/,
+      "Main page should still introduce the heritage-risk feature."
     );
     assert.match(
       hubHtml,
-      /법규 기반 최대 매스 생성/,
-      "Hub page should still introduce the max-mass feature on the public roadmap."
+      /법규 기반 최대 매스 검토/,
+      "Main page should still introduce the max-mass feature."
     );
     assert.doesNotMatch(
       hubHtml,
       /\/heritage-risk/,
-      "Hub page should not publicly expose the heritage-risk route before release."
+      "Main page should not publicly expose the heritage-risk route before release."
     );
     assert.doesNotMatch(
       hubHtml,
       /\/max-mass/,
-      "Hub page should not publicly expose the max-mass route before release."
+      "Main page should not publicly expose the max-mass route before release."
     );
     const hubCsp = hubResponse.headers.get("content-security-policy");
     assert.ok(hubCsp, "Hub page should send a CSP header.");
