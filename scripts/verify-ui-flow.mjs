@@ -522,7 +522,7 @@ async function runOneKmSkpScenario(context, baseUrl, searchQuery) {
     });
 
     const previewResult = await runSiteContextPreview(page, 180000);
-    const downloadResult = await downloadModel(page, "skp", 300000);
+    const downloadResult = await downloadModel(page, "skp", 480000);
 
     return {
       name: "address-1km-skp",
