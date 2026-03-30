@@ -11384,6 +11384,109 @@ function simplifyLocalPolygonDouglasPeucker(points, toleranceMeters = 0.001) {
   return simplifiedOpen.length >= 3 ? simplifiedOpen : polygon;
 }
 
+function smoothLocalPolygonChaikin(
+  points,
+  {
+    iterations = 1,
+    ratio = 0.2,
+    maxPointCount = 192,
+    minSegmentLength = 0.05,
+  } = {}
+) {
+  let polygon = dedupeLocalPolygonPoints(points, 0.001);
+
+  if (polygon.length < 4) {
+    return polygon;
+  }
+
+  const iterationCount = Math.max(0, Math.min(2, Number(iterations) || 0));
+  const cornerRatio = Math.max(0.12, Math.min(0.32, Number(ratio) || 0.2));
+  const limit = Math.max(32, Number(maxPointCount) || 192);
+  const segmentFloor = Math.max(0.01, Number(minSegmentLength) || 0.05);
+  const targetAreaSign = Math.sign(computeLocalPolygonSignedArea(polygon)) || -1;
+
+  for (let iterationIndex = 0; iterationIndex < iterationCount; iterationIndex += 1) {
+    if (polygon.length < 4 || polygon.length >= limit) {
+      break;
+    }
+
+    const smoothed = [];
+
+    for (let index = 0; index < polygon.length; index += 1) {
+      const current = polygon[index];
+      const next = polygon[(index + 1) % polygon.length];
+      const dx = next[0] - current[0];
+      const dy = next[1] - current[1];
+      const segmentLength = Math.hypot(dx, dy);
+
+      if (segmentLength <= segmentFloor) {
+        smoothed.push(current);
+        continue;
+      }
+
+      smoothed.push([
+        Number((current[0] + dx * cornerRatio).toFixed(6)),
+        Number((current[1] + dy * cornerRatio).toFixed(6)),
+      ]);
+      smoothed.push([
+        Number((current[0] + dx * (1 - cornerRatio)).toFixed(6)),
+        Number((current[1] + dy * (1 - cornerRatio)).toFixed(6)),
+      ]);
+    }
+
+    polygon = dedupeLocalPolygonPoints(smoothed, 0.001);
+
+    if (polygon.length < 3) {
+      return dedupeLocalPolygonPoints(points, 0.001);
+    }
+
+    const nextAreaSign = Math.sign(computeLocalPolygonSignedArea(polygon)) || targetAreaSign;
+
+    if (nextAreaSign !== targetAreaSign) {
+      polygon = [...polygon].reverse();
+    }
+  }
+
+  return polygon.length >= 3 ? polygon : dedupeLocalPolygonPoints(points, 0.001);
+}
+
+function smoothSketchUpSolidLoop(points, toleranceMeters = 0) {
+  const tolerance = Math.max(0, Number(toleranceMeters) || 0);
+  const polygon = dedupeLocalPolygonPoints(points, Math.max(0.001, tolerance * 0.12));
+
+  if (polygon.length < 4 || tolerance < 0.28) {
+    return polygon;
+  }
+
+  const areaBefore = Math.abs(computeLocalPolygonSignedArea(polygon));
+
+  if (!(areaBefore > 0.01)) {
+    return polygon;
+  }
+
+  const smoothed = smoothLocalPolygonChaikin(polygon, {
+    iterations: tolerance >= 0.95 ? 2 : 1,
+    ratio: tolerance >= 0.95 ? 0.2 : 0.18,
+    maxPointCount: polygon.length >= 80 ? 256 : 192,
+    minSegmentLength: Math.max(0.04, tolerance * 0.12),
+  });
+  const normalized = simplifyLocalPolygon(
+    smoothed,
+    Math.max(0.01, tolerance * 0.08)
+  );
+  const areaAfter = Math.abs(computeLocalPolygonSignedArea(normalized));
+
+  if (
+    normalized.length < 3 ||
+    areaAfter <= areaBefore * 0.7 ||
+    areaAfter >= areaBefore * 1.05
+  ) {
+    return polygon;
+  }
+
+  return normalized;
+}
+
 function buildLocalPointKey(point, decimals = 3) {
   return `${point[0].toFixed(decimals)},${point[1].toFixed(decimals)}`;
 }
@@ -14488,18 +14591,20 @@ function resolveSketchUpTerrainSolidSimplifyTolerance(siteContext) {
   const sourceContourInterval = resolveSourceContourInterval(siteContext);
   const radiusMeters = Math.max(30, Number(siteContext?.options?.radius) || 120);
   const baseTolerance = Math.max(
-    0.15,
-    terrainStep > 0 ? terrainStep * 0.9 : 0,
-    sourceContourInterval > 0 ? sourceContourInterval * 0.2 : 0
+    0.22,
+    terrainStep > 0 ? terrainStep * 1.2 : 0,
+    sourceContourInterval > 0 ? sourceContourInterval * 0.35 : 0
   );
   const scaledTolerance =
     radiusMeters <= 120
       ? baseTolerance
       : radiusMeters <= 220
-        ? baseTolerance * 1.15
-        : baseTolerance * 1.3;
+        ? baseTolerance * 1.18
+        : radiusMeters <= 420
+          ? baseTolerance * 1.35
+          : baseTolerance * 1.5;
 
-  return Number(Math.max(0.15, Math.min(1.2, scaledTolerance)).toFixed(3));
+  return Number(Math.max(0.22, Math.min(1.9, scaledTolerance)).toFixed(3));
 }
 
 function simplifySketchUpSolidRegion(region, toleranceMeters = 0) {
@@ -14513,19 +14618,37 @@ function simplifySketchUpSolidRegion(region, toleranceMeters = 0) {
     region.outerPoints || [],
     tolerance
   );
+  const outerSeedPoints =
+    outerPoints.length >= 4
+      ? outerPoints
+      : simplifyLocalPolygonDouglasPeucker(
+          region.outerPoints || [],
+          Math.max(0.12, tolerance * 0.55)
+        );
+  const smoothedOuterPoints = smoothSketchUpSolidLoop(outerSeedPoints, tolerance);
 
-  if (outerPoints.length < 3) {
+  if (smoothedOuterPoints.length < 3) {
     return region;
   }
 
   const holeTolerance = Math.max(0.08, Math.min(0.9, tolerance * 0.8));
   const holePoints = (region.holePoints || [])
-    .map((ring) => simplifyLocalPolygonDouglasPeucker(ring, holeTolerance))
+    .map((ring) => {
+      const simplifiedHole = simplifyLocalPolygonDouglasPeucker(ring, holeTolerance);
+      const holeSeedPoints =
+        simplifiedHole.length >= 4
+          ? simplifiedHole
+          : simplifyLocalPolygonDouglasPeucker(
+              ring,
+              Math.max(0.08, holeTolerance * 0.55)
+            );
+      return smoothSketchUpSolidLoop(holeSeedPoints, holeTolerance);
+    })
     .filter((ring) => ring.length >= 3);
 
   return {
     ...region,
-    outerPoints,
+    outerPoints: smoothedOuterPoints,
     holePoints,
   };
 }
