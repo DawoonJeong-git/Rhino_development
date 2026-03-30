@@ -1603,6 +1603,17 @@ async function runBaselineVerification() {
         lng: 127.0242,
       },
     ];
+    const rawJusoFastRoadCandidates = fastRoadCandidates.map(({ lat, lng, ...item }) => item);
+    const selectedRawJusoFastRoadCandidates = selectStrongJusoFastPathCandidates(
+      "\uC11C\uC6B8 \uC11C\uCD08\uAD6C \uC11C\uCD08\uB300\uB85C 411",
+      fastRoadHints,
+      rawJusoFastRoadCandidates
+    );
+    assert.equal(
+      selectedRawJusoFastRoadCandidates.length,
+      1,
+      "Strong Juso fast-path ranking should work even before raw Juso candidates are geocoded."
+    );
     const selectedFastRoadCandidates = selectStrongJusoFastPathCandidates(
       "서울 서초구 서초대로 411",
       fastRoadHints,

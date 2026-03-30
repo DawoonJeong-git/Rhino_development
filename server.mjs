@@ -5356,9 +5356,9 @@ async function geocodeJusoCandidate(item, config, options = {}) {
   );
 }
 
-function selectShortCircuitJusoCandidate(query, queryHints, jusoItems) {
+function rankJusoSearchItemsForQuery(query, queryHints, jusoItems) {
   if (!Array.isArray(jusoItems) || !jusoItems.length) {
-    return null;
+    return [];
   }
 
   const sortedItems = sortSearchItemsByParcelConfidence(jusoItems, query);
@@ -5375,6 +5375,11 @@ function selectShortCircuitJusoCandidate(query, queryHints, jusoItems) {
       ? tokenFiltered.filter((item) => item?.searchType === "road")
       : tokenFiltered
     : tokenFiltered;
+  return rankedItems;
+}
+
+function selectShortCircuitJusoCandidate(query, queryHints, jusoItems) {
+  const rankedItems = rankJusoSearchItemsForQuery(query, queryHints, jusoItems);
   const candidate = rankedItems[0];
 
   if (!candidate) {
@@ -5406,7 +5411,7 @@ function selectStrongJusoFastPathCandidates(query, queryHints, jusoItems) {
     return [];
   }
 
-  const rankedItems = normalizeSearchResultsForQuery(jusoItems, query);
+  const rankedItems = rankJusoSearchItemsForQuery(query, queryHints, jusoItems);
 
   if (!rankedItems.length) {
     return [];
