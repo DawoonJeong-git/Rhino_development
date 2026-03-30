@@ -8,6 +8,7 @@ Set these in the deployment environment instead of committing real values:
 - `VWORLD_API_KEY`
 - `VWORLD_API_DOMAIN`
 - `PUBLIC_BASE_URL`
+- `INTERNAL_ONLY_STATIC_PATHS`
 - `ADS_TXT_LINES`
 - `JUSO_CONFIRM_KEY`
 - `JUSO_COORD_CONFIRM_KEY`
@@ -24,6 +25,7 @@ Recommended:
 
 - Keep `VWORLD_API_DOMAIN` aligned with the VWorld-registered origin.
 - Set `PUBLIC_BASE_URL` to the real public HTTPS share origin when it differs from `VWORLD_API_DOMAIN`.
+- Keep `INTERNAL_ONLY_STATIC_PATHS` listing unfinished pages so they stay blocked on the public origin.
 - Keep `AD_PREVIEW_ALLOWED_PATHS` and `AD_PREVIEW_FRAME_ANCESTORS` configured if AdSense or Google ad preview needs iframe access.
 - Publish `/ads.txt` before submitting the site to AdSense when your publisher line is ready.
 - Keep `USE_NOMINATIM_FALLBACK=true` only as a safety net, not as the main search path.

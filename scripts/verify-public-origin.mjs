@@ -88,6 +88,41 @@ async function main() {
     "Blocked public runtime stats response should explain that access is forbidden."
   );
 
+  const hubResponse = await fetch(`${baseUrl}/`, {
+    redirect: "manual",
+    headers: {
+      Accept: "text/html",
+      "Cache-Control": "no-cache",
+    },
+  });
+  const hubHtml = await readResponseBody(hubResponse);
+  const hubSummary = summarizeBody(hubHtml);
+
+  assert.equal(hubResponse.status, 200, "Public hub route should stay reachable.");
+  assert.doesNotMatch(
+    hubSummary,
+    /\/heritage-risk|\/max-mass/i,
+    "Public hub should not expose unfinished internal routes."
+  );
+
+  const hiddenRoutes = ["/heritage-risk", "/max-mass"];
+
+  for (const pathname of hiddenRoutes) {
+    const hiddenResponse = await fetch(`${baseUrl}${pathname}`, {
+      redirect: "manual",
+      headers: {
+        Accept: "text/html,application/json",
+        "Cache-Control": "no-cache",
+      },
+    });
+
+    assert.equal(
+      hiddenResponse.status,
+      404,
+      `Unfinished route ${pathname} should stay blocked on the public origin.`
+    );
+  }
+
   console.log(
     JSON.stringify(
       {
@@ -105,6 +140,16 @@ async function main() {
             status: "pass",
             httpStatus: runtimeStatsResponse.status,
           },
+          {
+            id: "public-hub-hides-internal-routes",
+            status: "pass",
+            httpStatus: hubResponse.status,
+          },
+          ...hiddenRoutes.map((pathname) => ({
+            id: `public-hidden-route-${pathname.slice(1)}-blocked`,
+            status: "pass",
+            httpStatus: 404,
+          })),
         ],
       },
       null,

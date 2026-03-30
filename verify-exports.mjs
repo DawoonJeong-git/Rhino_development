@@ -884,15 +884,15 @@ async function runBaselineVerification() {
       /\/contour3dmodel/,
       "Hub page should link to the feature route."
     );
-    assert.match(
+    assert.doesNotMatch(
       hubHtml,
       /\/heritage-risk/,
-      "Hub page should link to the heritage-risk route."
+      "Hub page should not publicly expose the heritage-risk route before release."
     );
-    assert.match(
+    assert.doesNotMatch(
       hubHtml,
       /\/max-mass/,
-      "Hub page should link to the max-mass route."
+      "Hub page should not publicly expose the max-mass route before release."
     );
     const hubCsp = hubResponse.headers.get("content-security-policy");
     assert.ok(hubCsp, "Hub page should send a CSP header.");
@@ -1082,7 +1082,11 @@ async function runBaselineVerification() {
 
     const heritageResponse = await fetch(`${baseUrl}/heritage-risk`);
     const heritageHtml = await heritageResponse.text();
-    assert.equal(heritageResponse.status, 200, "Heritage route should respond.");
+    assert.equal(
+      heritageResponse.status,
+      200,
+      "Heritage route should stay available from localhost for internal review."
+    );
     assert.match(
       heritageHtml,
       /data-page="heritage-risk"/,
@@ -1096,7 +1100,11 @@ async function runBaselineVerification() {
 
     const maxMassResponse = await fetch(`${baseUrl}/max-mass`);
     const maxMassHtml = await maxMassResponse.text();
-    assert.equal(maxMassResponse.status, 200, "Max-mass route should respond.");
+    assert.equal(
+      maxMassResponse.status,
+      200,
+      "Max-mass route should stay available from localhost for internal review."
+    );
     assert.match(
       maxMassHtml,
       /data-page="max-mass"/,

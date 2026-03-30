@@ -105,6 +105,10 @@ const DEFAULT_AD_PREVIEW_ALLOWED_PATHS = Object.freeze([
   "/heritage-risk",
   "/max-mass",
 ]);
+const DEFAULT_INTERNAL_ONLY_STATIC_PATHS = Object.freeze([
+  "/heritage-risk",
+  "/max-mass",
+]);
 const DEFAULT_AD_PREVIEW_FRAME_ANCESTORS = Object.freeze([
   "'self'",
   "https://ads.google.com",
@@ -429,6 +433,12 @@ function matchesPathPrefix(requestPath, pathPrefix) {
 
 function isAdPreviewAllowedPath(requestPath, config) {
   return (config?.adPreviewAllowedPaths || []).some((pathPrefix) =>
+    matchesPathPrefix(requestPath, pathPrefix)
+  );
+}
+
+function isInternalOnlyStaticPath(requestPath, config) {
+  return (config?.internalOnlyStaticPaths || []).some((pathPrefix) =>
     matchesPathPrefix(requestPath, pathPrefix)
   );
 }
@@ -1514,6 +1524,11 @@ function buildRuntimeConfig(localConfig) {
         localConfig.AD_PREVIEW_ALLOWED_PATHS ||
         DEFAULT_AD_PREVIEW_ALLOWED_PATHS
     ),
+    internalOnlyStaticPaths: normalizePathPrefixList(
+      process.env.INTERNAL_ONLY_STATIC_PATHS ||
+        localConfig.INTERNAL_ONLY_STATIC_PATHS ||
+        DEFAULT_INTERNAL_ONLY_STATIC_PATHS
+    ),
     adPreviewFrameAncestors: normalizeFrameAncestorList(
       process.env.AD_PREVIEW_FRAME_ANCESTORS ||
         localConfig.AD_PREVIEW_FRAME_ANCESTORS ||
@@ -1854,7 +1869,16 @@ async function readJsonBody(request, options = {}) {
   });
 }
 
-async function serveStatic(requestPath, response, config) {
+async function serveStatic(request, requestPath, response, config) {
+  if (isInternalOnlyStaticPath(requestPath, config)) {
+    const clientIp = getClientIp(request);
+
+    if (!isLoopbackIp(clientIp)) {
+      sendJson(response, 404, { error: "Not found" });
+      return;
+    }
+  }
+
   if (requestPath === "/ads.txt" && Array.isArray(config?.adsTxtLines) && config.adsTxtLines.length) {
     sendText(
       response,
@@ -19377,7 +19401,7 @@ async function createApp() {
         return;
       }
 
-      await serveStatic(requestUrl.pathname, response, config);
+      await serveStatic(request, requestUrl.pathname, response, config);
     } catch (error) {
       const publicError = normalizePublicError(error);
       const statusCode =
