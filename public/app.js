@@ -133,7 +133,7 @@ const buildingRegisterCard = buildingRegisterMeta?.closest(".card");
 const modelCard = modelForm?.closest(".card");
 const MIN_CONTOUR_INTERVAL_METERS = 0.1;
 const DEFAULT_SELECTION_SUMMARY =
-  "아직 확정된 대상지가 없습니다. 주소를 검색하거나 지도에서 선택하세요.";
+  "대상지를 아직 확정하지 않았습니다. 주소를 검색하거나 지도에서 위치를 선택하세요.";
 const MODEL_PROGRESS_STORAGE_KEY =
   "space-work.model-progress-estimates.v1";
 const SELECTION_PREVIEW_CACHE_TTL_MS = 1000 * 60 * 2;
@@ -206,7 +206,7 @@ function applyStudioChrome() {
   selectionSummaryStack?.classList.add("target-site-stack");
 
   if (topbarEyebrow) {
-    topbarEyebrow.textContent = "Contour + Parcel + Context";
+    topbarEyebrow.textContent = "Site + Terrain + Output";
   }
 
   if (topbarTitle) {
@@ -215,7 +215,7 @@ function applyStudioChrome() {
 
   if (topbarSubtitle) {
     topbarSubtitle.textContent =
-      "주소에서 대상지를 확정하고, 지형 · 건물 · 토지/법규를 한 화면에서 검토한 뒤 3DM · DXF · SKP 파일까지 바로 이어서 준비하는 작업 스튜디오입니다.";
+      "주소나 지도를 통해 대상지를 정하고, 지형 · 건물 · 토지/법규를 검토한 뒤 3DM · OBJ · DXF · SKP 파일까지 한 흐름으로 준비하는 작업 화면입니다.";
   }
 
   if (topbarHighlights[0]) {
@@ -226,11 +226,11 @@ function applyStudioChrome() {
       label.textContent = "Selection";
     }
     if (title) {
-      title.textContent = "주소 검색, 대지 선택, 범위 지정";
+      title.textContent = "대상지 선택과 범위 설정";
     }
     if (description) {
       description.textContent =
-        "먼저 대상지를 잡고 작업 범위와 기준 위치를 같은 흐름 안에서 확정합니다.";
+        "주소 검색, 지도 클릭, 다중 필지, 수동 범위 지정을 한 화면에서 이어서 진행합니다.";
     }
   }
 
@@ -246,7 +246,7 @@ function applyStudioChrome() {
     }
     if (description) {
       description.textContent =
-        "필지 경계와 주변 맥락, 핵심 규제 정보를 한 화면에서 이어서 검토합니다.";
+        "필지 경계와 주변 맥락, 핵심 규제 정보를 정리해 바로 모델링 판단으로 이어갑니다.";
     }
   }
 
@@ -262,16 +262,16 @@ function applyStudioChrome() {
     }
     if (description) {
       description.textContent =
-        "모델 범위를 확인한 뒤 필요한 포맷으로 바로 내려받아 후속 설계 작업에 넘길 수 있습니다.";
+        "미리보기 결과를 확인한 뒤 필요한 포맷으로 바로 내려받아 후속 설계 작업으로 넘길 수 있습니다.";
     }
   }
 
   if (searchFormLabel) {
-    searchFormLabel.textContent = "주소 검색";
+    searchFormLabel.textContent = "주소 · 지번 · 건물명 검색";
   }
 
   if (searchInput) {
-    searchInput.placeholder = "예: 서울 중구 세종대로 110, 세평로, 서울시청";
+    searchInput.placeholder = "예: 서울 중구 세종대로 110, 서울시청, 세평로";
   }
 
   if (searchFormSubmitButton) {
@@ -280,7 +280,7 @@ function applyStudioChrome() {
 
   if (searchFormHelper) {
     searchFormHelper.textContent =
-      "도로명주소, 지번주소, 건물명을 함께 찾습니다. 입력을 멈추면 결과를 미리 준비하고, 확정 즉시 지도 미리보기와 토지 맥락으로 이어집니다.";
+      "도로명주소, 지번주소, 건물명을 함께 찾습니다. 입력을 멈추면 결과를 미리 준비해 두고, 확정 즉시 지도와 모델 컨텍스트로 이어집니다.";
   }
 
   if (searchFormEmptyState) {
@@ -292,15 +292,15 @@ function applyStudioChrome() {
   }
 
   ensureSelectionSummaryChrome();
-  updateCardHeading(selectionCard, "Selection Details", "선택 세부 정보");
-  updateCardHeading(siteContextCard, "Site Context Preview", "대지 · 지형 · 건물 미리보기");
-  updateCardHeading(landInfoCard, "Land & Zoning", "토지이음 기반 토지 정보");
+  updateCardHeading(selectionCard, "Target Site", "선택된 대상지");
+  updateCardHeading(siteContextCard, "Preview Context", "대지 · 지형 · 건물 미리보기");
+  updateCardHeading(landInfoCard, "Land & Regulation", "토지 · 규제 정보");
   updateCardHeading(
     buildingRegisterCard,
     "Building Register",
-    "세움터 기반 건축물대장 정보"
+    "건축물대장 정보"
   );
-  updateCardHeading(modelCard, "Model Studio", "3D / CAD 모델 출력");
+  updateCardHeading(modelCard, "Model Output", "3D / CAD 모델 출력");
 }
 
 function clearRangeDraftLayer() {
