@@ -4837,6 +4837,18 @@ function buildJusoSearchItem(item, index) {
   };
 }
 
+function resolveVWorldSearchCategories(queryHints = {}) {
+  if (queryHints?.parcelReference) {
+    return ["parcel"];
+  }
+
+  if (queryHints?.roadAddressQuery) {
+    return ["road"];
+  }
+
+  return ["road", "parcel"];
+}
+
 async function searchJuso(query, config, options = {}) {
   const resultLimit = Math.max(
     1,
@@ -5045,6 +5057,74 @@ async function geocodeJusoCandidateWithCoordinateApi(item, config) {
   };
 }
 
+function mergeGeocodedSearchResultWithJusoCandidate(result, item, provider = "") {
+  if (!result) {
+    return null;
+  }
+
+  return {
+    ...result,
+    id: result.id || item.id,
+    label: item.label || result.label,
+    roadAddress: item.roadAddress || result.roadAddress || "",
+    parcelAddress: item.parcelAddress || result.parcelAddress || "",
+    provider: provider || result.provider || "juso",
+    searchType: item.searchType || result.searchType || "road",
+    pnu: item.pnu || result.pnu || "",
+    buildingName: item.buildingName || result.buildingName || "",
+    juso: item.juso || result.juso || null,
+  };
+}
+
+function selectGeocodedVWorldResultForJusoCandidate(
+  vworldItems,
+  candidate,
+  queryHints = null
+) {
+  if (!Array.isArray(vworldItems) || !vworldItems.length || !candidate) {
+    return null;
+  }
+
+  const hints =
+    queryHints && typeof queryHints === "object"
+      ? queryHints
+      : buildSearchQueryHints(
+          candidate.roadAddress || candidate.parcelAddress || candidate.label || ""
+        );
+  const rankedItems = vworldItems
+    .map((item, index) => ({
+      item,
+      index,
+      addressScore: scoreAddressMatch(item, candidate),
+      queryScore: scoreSearchItemQueryMatch(item, hints),
+      parcelConfidence: scoreSearchItemParcelConfidence(item, hints),
+    }))
+    .sort(
+      (left, right) =>
+        right.addressScore - left.addressScore ||
+        right.queryScore - left.queryScore ||
+        right.parcelConfidence - left.parcelConfidence ||
+        left.index - right.index
+    );
+  const bestMatch = rankedItems[0];
+
+  if (!bestMatch) {
+    return null;
+  }
+
+  const exactAddressMatch = bestMatch.addressScore >= 100;
+  const strongRoadMatch =
+    hints?.roadAddressQuery &&
+    bestMatch.addressScore >= 70 &&
+    bestMatch.queryScore >= 4000;
+  const strongParcelMatch =
+    !hints?.roadAddressQuery && bestMatch.queryScore >= 4500;
+
+  return exactAddressMatch || strongRoadMatch || strongParcelMatch
+    ? bestMatch.item
+    : null;
+}
+
 async function geocodeJusoCandidate(item, config, options = {}) {
   const query = item.roadAddress || item.parcelAddress || item.label;
 
@@ -5062,12 +5142,35 @@ async function geocodeJusoCandidate(item, config, options = {}) {
     }
   }
 
+  if (!result && Array.isArray(options.sharedVWorldResults)) {
+    const sharedMatch = selectGeocodedVWorldResultForJusoCandidate(
+      options.sharedVWorldResults,
+      item,
+      options.queryHints
+    );
+
+    if (sharedMatch) {
+      result = mergeGeocodedSearchResultWithJusoCandidate(
+        sharedMatch,
+        item,
+        "juso+vworld-fast"
+      );
+    }
+  }
+
   if (!result && options.allowVWorldFallback !== false && config.vworldApiKey) {
+    const sharedCategories = new Set(
+      Array.isArray(options.sharedVWorldCategories)
+        ? options.sharedVWorldCategories.map((category) =>
+            String(category || "").trim().toLowerCase()
+          )
+        : []
+    );
     const [roadResults, parcelResults] = await Promise.all([
-      item.roadAddress
+      item.roadAddress && !sharedCategories.has("road")
         ? searchVWorldCategory(item.roadAddress, "road", config).catch(() => [])
         : Promise.resolve([]),
-      item.parcelAddress
+      item.parcelAddress && !sharedCategories.has("parcel")
         ? searchVWorldCategory(item.parcelAddress, "parcel", config).catch(
             () => []
           )
@@ -5099,18 +5202,11 @@ async function geocodeJusoCandidate(item, config, options = {}) {
     return null;
   }
 
-  return {
-    ...result,
-    provider:
-      result.provider ||
-      (config.vworldApiKey ? "juso+vworld" : "juso+nominatim"),
-    pnu: item.pnu || "",
-    buildingName: item.buildingName || result.buildingName || "",
-    juso: item.juso,
-    roadAddress: item.roadAddress || result.roadAddress,
-    parcelAddress: item.parcelAddress || result.parcelAddress,
-    label: item.label || result.label,
-  };
+  return mergeGeocodedSearchResultWithJusoCandidate(
+    result,
+    item,
+    result.provider || (config.vworldApiKey ? "juso+vworld" : "juso+nominatim")
+  );
 }
 
 function shouldShortCircuitToJusoCandidate(queryHints, jusoItems) {
@@ -5398,6 +5494,7 @@ async function finalizeSearchResults(primaryResults, query, config) {
 async function geocodeWithPreferredProviders(query, config) {
   const hints = buildSearchQueryHints(query);
   const searchProfile = buildSearchResponseProfile(hints);
+  const vworldCategories = resolveVWorldSearchCategories(hints);
   const providerErrors = [];
   const vworldPromise = config.vworldApiKey
     ? geocodeWithVWorld(query, config, {
@@ -5415,18 +5512,33 @@ async function geocodeWithPreferredProviders(query, config) {
     : Promise.resolve({ ok: true, items: [] });
   const jusoResult = await jusoPromise;
   const jusoItems = jusoResult.items || [];
+  let resolvedVworldResult = null;
+
+  async function readVWorldResult() {
+    if (!resolvedVworldResult) {
+      resolvedVworldResult = await vworldPromise;
+    }
+
+    return resolvedVworldResult;
+  }
 
   const jusoFastPathCandidates =
     jusoResult.ok &&
-    (config.jusoCoordinateConfirmKey || config.jusoConfirmKey)
+    (config.jusoCoordinateConfirmKey || config.vworldApiKey)
       ? selectStrongJusoFastPathCandidates(query, hints, jusoItems)
       : [];
 
   if (jusoFastPathCandidates.length) {
+    const fastVworldResult = config.vworldApiKey
+      ? await readVWorldResult()
+      : { ok: true, items: [] };
     const fastJusoResults = (
       await Promise.all(
         jusoFastPathCandidates.map((candidate) =>
           geocodeJusoCandidate(candidate, config, {
+            queryHints: hints,
+            sharedVWorldResults: fastVworldResult.items || [],
+            sharedVWorldCategories: vworldCategories,
             allowVWorldFallback: false,
             allowParcelFallback: false,
             allowNominatimFallback: false,
@@ -5436,8 +5548,18 @@ async function geocodeWithPreferredProviders(query, config) {
     ).filter(Boolean);
 
     if (fastJusoResults.length) {
+      const fastProvider =
+        fastJusoResults.length > 1
+          ? fastJusoResults.every((item) => item?.provider === "juso+vworld-fast")
+            ? "juso+vworld-fast-batch"
+            : fastJusoResults.every((item) => item?.provider === "juso+coord")
+              ? "juso+coord-fast-batch"
+              : "juso-fast-batch"
+          : fastJusoResults[0]?.provider === "juso+coord"
+            ? "juso+coord-fast"
+            : fastJusoResults[0]?.provider || "juso-fast";
       return {
-        provider: fastJusoResults.length > 1 ? "juso+coord-fast-batch" : "juso+coord-fast",
+        provider: fastProvider,
         results: normalizeSearchResultsForQuery(fastJusoResults, query),
       };
     }
@@ -5447,17 +5569,24 @@ async function geocodeWithPreferredProviders(query, config) {
     jusoResult.ok &&
     shouldShortCircuitToJusoCandidate(hints, jusoItems)
   ) {
+    const sharedVworldResult = config.vworldApiKey
+      ? await readVWorldResult()
+      : { ok: true, items: [] };
     const directJusoResults = (
       await Promise.all(
-        jusoItems
-          .slice(0, 1)
-          .map((candidate) => geocodeJusoCandidate(candidate, config).catch(() => null))
+        jusoItems.slice(0, 1).map((candidate) =>
+          geocodeJusoCandidate(candidate, config, {
+            queryHints: hints,
+            sharedVWorldResults: sharedVworldResult.items || [],
+            sharedVWorldCategories: vworldCategories,
+          }).catch(() => null)
+        )
       )
     ).filter(Boolean);
 
     if (directJusoResults.length) {
       return {
-        provider: "juso+geocoded",
+        provider: directJusoResults[0]?.provider || "juso+geocoded",
         results: await finalizeSearchResults(
           await hydrateSearchItemsWithReverse(directJusoResults, config, 1),
           query,
@@ -5467,7 +5596,7 @@ async function geocodeWithPreferredProviders(query, config) {
     }
   }
 
-  const vworldResult = await vworldPromise;
+  const vworldResult = await readVWorldResult();
   const vworldItems = vworldResult.items || [];
 
   if (!vworldResult.ok && vworldResult.error) {
@@ -7230,11 +7359,7 @@ async function searchVWorldCategory(query, category, config, options = {}) {
 
 async function geocodeWithVWorld(query, config, options = {}) {
   const hints = buildSearchQueryHints(query);
-  const categories = hints.parcelReference
-    ? ["parcel"]
-    : hints.roadAddressQuery
-      ? ["road"]
-      : ["road", "parcel"];
+  const categories = resolveVWorldSearchCategories(hints);
   const settledResults = await Promise.allSettled(
     categories.map((category) =>
       searchVWorldCategory(query, category, config, options)
@@ -19986,6 +20111,7 @@ export {
   localMetersFromLngLat,
   normalizePublicError,
   normalizeSearchResultsForQuery,
+  selectGeocodedVWorldResultForJusoCandidate,
   selectStrongJusoFastPathCandidates,
   prepareSiteContextForExport,
   pruneCacheEntries,

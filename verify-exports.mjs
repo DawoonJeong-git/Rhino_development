@@ -30,6 +30,7 @@ import {
   resolveRateLimitBucket,
   resolveSketchUpTerrainSolidSimplifyTolerance,
   resolveTerrainContourPath,
+  selectGeocodedVWorldResultForJusoCandidate,
   selectStrongJusoFastPathCandidates,
   simplifySketchUpSolidRegion,
 } from "./server.mjs";
@@ -1592,6 +1593,38 @@ async function runBaselineVerification() {
       selectedFastRoadCandidates[0]?.roadAddress,
       "서울 서초구 서초대로 411",
       "The strongest exact road address should be selected for the Juso fast path."
+    );
+
+    const matchedSharedVworldRoadResult = selectGeocodedVWorldResultForJusoCandidate(
+      [
+        {
+          id: "vworld-fast-1",
+          label: fastRoadCandidates[0].label,
+          roadAddress: fastRoadCandidates[0].roadAddress,
+          parcelAddress: fastRoadCandidates[0].parcelAddress,
+          provider: "vworld",
+          searchType: "road",
+          lat: 37.49662,
+          lng: 127.02412,
+        },
+        {
+          id: "vworld-fast-2",
+          label: fastRoadCandidates[1].label,
+          roadAddress: fastRoadCandidates[1].roadAddress,
+          parcelAddress: fastRoadCandidates[1].parcelAddress,
+          provider: "vworld",
+          searchType: "road",
+          lat: 37.49668,
+          lng: 127.0242,
+        },
+      ],
+      fastRoadCandidates[0],
+      fastRoadHints
+    );
+    assert.equal(
+      matchedSharedVworldRoadResult?.roadAddress,
+      fastRoadCandidates[0].roadAddress,
+      "Shared VWorld road results should reuse the strongest exact match instead of re-querying."
     );
 
     const syntheticContourSiteContext = {
