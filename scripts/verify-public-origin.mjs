@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const DEFAULT_BASE_URL =
   process.env.VERIFY_PUBLIC_ORIGIN_BASE_URL || "";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const REPO_ROOT = path.resolve(__dirname, "..");
 
 function readArgValue(flag) {
   const index = process.argv.indexOf(flag);
@@ -15,6 +21,25 @@ function readArgValue(flag) {
 
 function normalizeBaseUrl(value) {
   return String(value || "").trim().replace(/\/+$/u, "");
+}
+
+async function readConfiguredAdsTxtLines(repoRoot = REPO_ROOT) {
+  const configPath = path.join(repoRoot, "config.local.json");
+  const raw = await readFile(configPath, "utf8").catch(() => "");
+
+  if (!raw) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    const lines = Array.isArray(parsed?.ADS_TXT_LINES) ? parsed.ADS_TXT_LINES : [];
+    return lines
+      .map((line) => String(line || "").trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
 }
 
 async function readResponseBody(response) {
@@ -41,6 +66,7 @@ function summarizeBody(body) {
 
 async function main() {
   const baseUrl = normalizeBaseUrl(readArgValue("--base-url") || DEFAULT_BASE_URL);
+  const expectedAdsTxtLines = await readConfiguredAdsTxtLines();
 
   assert.ok(
     /^https?:\/\//i.test(baseUrl),
@@ -123,6 +149,40 @@ async function main() {
     );
   }
 
+  let adsTxtCheck = null;
+
+  if (expectedAdsTxtLines.length) {
+    const adsTxtResponse = await fetch(`${baseUrl}/ads.txt`, {
+      redirect: "manual",
+      headers: {
+        Accept: "text/plain",
+        "Cache-Control": "no-cache",
+      },
+    });
+    const adsTxtBody = String(await readResponseBody(adsTxtResponse) || "").trim();
+
+    assert.equal(
+      adsTxtResponse.status,
+      200,
+      "Public /ads.txt should stay reachable when ADS_TXT_LINES is configured."
+    );
+
+    for (const line of expectedAdsTxtLines) {
+      assert.match(
+        adsTxtBody,
+        new RegExp(line.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")),
+        `Public /ads.txt should include configured publisher line: ${line}`
+      );
+    }
+
+    adsTxtCheck = {
+      id: "public-ads-txt-published",
+      status: "pass",
+      httpStatus: adsTxtResponse.status,
+      lineCount: expectedAdsTxtLines.length,
+    };
+  }
+
   console.log(
     JSON.stringify(
       {
@@ -145,6 +205,7 @@ async function main() {
             status: "pass",
             httpStatus: hubResponse.status,
           },
+          ...(adsTxtCheck ? [adsTxtCheck] : []),
           ...hiddenRoutes.map((pathname) => ({
             id: `public-hidden-route-${pathname.slice(1)}-blocked`,
             status: "pass",
