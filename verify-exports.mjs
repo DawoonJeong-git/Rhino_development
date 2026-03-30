@@ -31,6 +31,7 @@ import {
   resolveSketchUpTerrainSolidSimplifyTolerance,
   resolveTerrainContourPath,
   selectGeocodedVWorldResultForJusoCandidate,
+  selectShortCircuitJusoCandidate,
   selectStrongJusoFastPathCandidates,
   simplifySketchUpSolidRegion,
 } from "./server.mjs";
@@ -1593,6 +1594,17 @@ async function runBaselineVerification() {
       selectedFastRoadCandidates[0]?.roadAddress,
       "서울 서초구 서초대로 411",
       "The strongest exact road address should be selected for the Juso fast path."
+    );
+
+    const selectedShortCircuitRoadCandidate = selectShortCircuitJusoCandidate(
+      "?쒖슱 ?쒖큹援??쒖큹?濡?411",
+      fastRoadHints,
+      fastRoadCandidates
+    );
+    assert.equal(
+      selectedShortCircuitRoadCandidate?.roadAddress,
+      fastRoadCandidates[0].roadAddress,
+      "Exact road-address matches should short-circuit to the strongest Juso result even when multiple candidates exist."
     );
 
     const matchedSharedVworldRoadResult = selectGeocodedVWorldResultForJusoCandidate(

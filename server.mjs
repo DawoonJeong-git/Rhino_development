@@ -5209,23 +5209,36 @@ async function geocodeJusoCandidate(item, config, options = {}) {
   );
 }
 
-function shouldShortCircuitToJusoCandidate(queryHints, jusoItems) {
-  if (!Array.isArray(jusoItems) || jusoItems.length !== 1) {
-    return false;
+function selectShortCircuitJusoCandidate(query, queryHints, jusoItems) {
+  if (!Array.isArray(jusoItems) || !jusoItems.length) {
+    return null;
   }
 
-  const [candidate] = jusoItems;
+  const rankedItems = normalizeSearchResultsForQuery(jusoItems, query);
+  const candidate = rankedItems[0];
+
+  if (!candidate) {
+    return null;
+  }
+
   const matchScore = scoreSearchItemQueryMatch(candidate, queryHints);
 
   if (hasExactParcelAddressMatch(candidate, queryHints)) {
-    return true;
+    return candidate;
   }
 
   if (queryHints?.roadAddressQuery) {
-    return matchScore >= 4200;
+    const exactRoadAddressMatch =
+      normalizeAddressKey(candidate?.roadAddress) === queryHints.normalizedQuery;
+
+    if (exactRoadAddressMatch) {
+      return candidate;
+    }
+
+    return rankedItems.length === 1 && matchScore >= 4200 ? candidate : null;
   }
 
-  return matchScore >= 5000;
+  return rankedItems.length === 1 && matchScore >= 5000 ? candidate : null;
 }
 
 function selectStrongJusoFastPathCandidates(query, queryHints, jusoItems) {
@@ -5591,16 +5604,17 @@ async function geocodeWithPreferredProviders(query, config) {
     }
   }
 
-  if (
-    jusoResult.ok &&
-    shouldShortCircuitToJusoCandidate(hints, jusoItems)
-  ) {
+  const shortCircuitJusoCandidate = jusoResult.ok
+    ? selectShortCircuitJusoCandidate(query, hints, jusoItems)
+    : null;
+
+  if (shortCircuitJusoCandidate) {
     const sharedVworldResult = config.vworldApiKey
       ? await readVWorldResultWithinBudget()
       : { ok: true, items: [], timedOut: false };
     const directJusoResults = (
       await Promise.all(
-        jusoItems.slice(0, 1).map((candidate) =>
+        [shortCircuitJusoCandidate].map((candidate) =>
           geocodeJusoCandidate(candidate, config, {
             queryHints: hints,
             sharedVWorldResults: sharedVworldResult.items || [],
@@ -20148,6 +20162,7 @@ export {
   normalizePublicError,
   normalizeSearchResultsForQuery,
   selectGeocodedVWorldResultForJusoCandidate,
+  selectShortCircuitJusoCandidate,
   selectStrongJusoFastPathCandidates,
   prepareSiteContextForExport,
   pruneCacheEntries,
