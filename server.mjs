@@ -5045,7 +5045,7 @@ async function geocodeJusoCandidateWithCoordinateApi(item, config) {
   };
 }
 
-async function geocodeJusoCandidate(item, config) {
+async function geocodeJusoCandidate(item, config, options = {}) {
   const query = item.roadAddress || item.parcelAddress || item.label;
 
   if (!query) {
@@ -5062,7 +5062,7 @@ async function geocodeJusoCandidate(item, config) {
     }
   }
 
-  if (!result && config.vworldApiKey) {
+  if (!result && options.allowVWorldFallback !== false && config.vworldApiKey) {
     const [roadResults, parcelResults] = await Promise.all([
       item.roadAddress
         ? searchVWorldCategory(item.roadAddress, "road", config).catch(() => [])
@@ -5077,7 +5077,7 @@ async function geocodeJusoCandidate(item, config) {
     result = roadResults[0] || parcelResults[0] || null;
   }
 
-  if (!result && item.parcelAddress) {
+  if (!result && options.allowParcelFallback !== false && item.parcelAddress) {
     try {
       const parcelFallbackResults = await geocodeParcelQueryWithDataFallback(
         item.parcelAddress,
@@ -5090,7 +5090,7 @@ async function geocodeJusoCandidate(item, config) {
     }
   }
 
-  if (!result && config.useNominatimFallback) {
+  if (!result && options.allowNominatimFallback !== false && config.useNominatimFallback) {
     const fallbackResults = await geocodeWithNominatim(query, config);
     result = fallbackResults[0] || null;
   }
@@ -5130,6 +5130,37 @@ function shouldShortCircuitToJusoCandidate(queryHints, jusoItems) {
   }
 
   return matchScore >= 5000;
+}
+
+function selectStrongJusoFastPathCandidates(query, queryHints, jusoItems) {
+  if (!Array.isArray(jusoItems) || !jusoItems.length || queryHints?.parcelReference) {
+    return [];
+  }
+
+  const rankedItems = normalizeSearchResultsForQuery(jusoItems, query);
+
+  if (!rankedItems.length) {
+    return [];
+  }
+
+  const strongThreshold = queryHints?.roadAddressQuery ? 4300 : 5000;
+  const topScore = scoreSearchItemQueryMatch(rankedItems[0], queryHints);
+
+  if (topScore < strongThreshold) {
+    return [];
+  }
+
+  const candidates = [rankedItems[0]];
+
+  if (rankedItems.length > 1) {
+    const secondScore = scoreSearchItemQueryMatch(rankedItems[1], queryHints);
+
+    if (secondScore >= strongThreshold && topScore - secondScore <= 700) {
+      candidates.push(rankedItems[1]);
+    }
+  }
+
+  return candidates;
 }
 
 function hasSearchParcelReference(item) {
@@ -5384,6 +5415,33 @@ async function geocodeWithPreferredProviders(query, config) {
     : Promise.resolve({ ok: true, items: [] });
   const jusoResult = await jusoPromise;
   const jusoItems = jusoResult.items || [];
+
+  const jusoFastPathCandidates =
+    jusoResult.ok &&
+    (config.jusoCoordinateConfirmKey || config.jusoConfirmKey)
+      ? selectStrongJusoFastPathCandidates(query, hints, jusoItems)
+      : [];
+
+  if (jusoFastPathCandidates.length) {
+    const fastJusoResults = (
+      await Promise.all(
+        jusoFastPathCandidates.map((candidate) =>
+          geocodeJusoCandidate(candidate, config, {
+            allowVWorldFallback: false,
+            allowParcelFallback: false,
+            allowNominatimFallback: false,
+          }).catch(() => null)
+        )
+      )
+    ).filter(Boolean);
+
+    if (fastJusoResults.length) {
+      return {
+        provider: fastJusoResults.length > 1 ? "juso+coord-fast-batch" : "juso+coord-fast",
+        results: normalizeSearchResultsForQuery(fastJusoResults, query),
+      };
+    }
+  }
 
   if (
     jusoResult.ok &&
@@ -19928,6 +19986,7 @@ export {
   localMetersFromLngLat,
   normalizePublicError,
   normalizeSearchResultsForQuery,
+  selectStrongJusoFastPathCandidates,
   prepareSiteContextForExport,
   pruneCacheEntries,
   readOrLoadResponseCache,

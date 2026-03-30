@@ -30,6 +30,7 @@ import {
   resolveRateLimitBucket,
   resolveSketchUpTerrainSolidSimplifyTolerance,
   resolveTerrainContourPath,
+  selectStrongJusoFastPathCandidates,
   simplifySketchUpSolidRegion,
 } from "./server.mjs";
 
@@ -1527,6 +1528,70 @@ async function runBaselineVerification() {
       rankedExactParcelResults?.[0]?.parcelAddress,
       "서울특별시 종로구 교남동 18-1",
       "Exact parcel text matches should outrank nearby PNU-backed alternatives."
+    );
+
+    const fastRoadHints = {
+      normalizedQuery: "서울서초구서초대로411",
+      parcelReference: null,
+      mainNumber: "",
+      subNumber: "",
+      mtYn: "0",
+      roadAddressQuery: true,
+      areaQuery: "",
+      normalizedAreaQuery: "",
+      textTokens: ["서울", "서초구", "서초대로", "411"],
+      areaTokens: ["서울", "서초구", "서초대로"],
+    };
+    const fastRoadCandidates = [
+      {
+        id: "fast-1",
+        label: "서울 서초구 서초대로 411",
+        roadAddress: "서울 서초구 서초대로 411",
+        parcelAddress: "서울 서초구 서초동 1321-15",
+        provider: "juso",
+        searchType: "road",
+        pnu: "1165010800113210015",
+        lat: 37.49662,
+        lng: 127.02412,
+        juso: {
+          admCd: "1165010800",
+          rnMgtSn: "116503121001",
+          roadAddr: "서울 서초구 서초대로 411",
+          roadAddrPart1: "서울 서초구 서초대로 411",
+          jibunAddr: "서울 서초구 서초동 1321-15",
+          mtYn: "0",
+          lnbrMnnm: "1321",
+          lnbrSlno: "15",
+          buldMnnm: "00411",
+          buldSlno: "00000",
+        },
+      },
+      {
+        id: "fast-2",
+        label: "서울 서초구 서초대로 413",
+        roadAddress: "서울 서초구 서초대로 413",
+        parcelAddress: "서울 서초구 서초동 1321-16",
+        provider: "juso",
+        searchType: "road",
+        pnu: "1165010800113210016",
+        lat: 37.49668,
+        lng: 127.0242,
+      },
+    ];
+    const selectedFastRoadCandidates = selectStrongJusoFastPathCandidates(
+      "서울 서초구 서초대로 411",
+      fastRoadHints,
+      fastRoadCandidates
+    );
+    assert.equal(
+      selectedFastRoadCandidates.length,
+      1,
+      "Strong exact road queries should short-circuit to the best Juso candidate."
+    );
+    assert.equal(
+      selectedFastRoadCandidates[0]?.roadAddress,
+      "서울 서초구 서초대로 411",
+      "The strongest exact road address should be selected for the Juso fast path."
     );
 
     const syntheticContourSiteContext = {
