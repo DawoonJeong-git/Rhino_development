@@ -20,6 +20,7 @@ import {
   withExportJobSlot,
   fetchWithTimeout,
   getRhino3dm,
+  isInternalOnlyStaticPath,
   isPathInsideDirectory,
   normalizePublicError,
   normalizeSearchResultsForQuery,
@@ -729,6 +730,22 @@ async function runBaselineVerification() {
       buildParcelDataCacheKey({ pnu: "1111010100100010000" }, "eum-land-page"),
       "eum-land-page:1111010100100010000",
       "Parcel data cache keys should be scoped by the parcel PNU."
+    );
+    assert.equal(
+      isInternalOnlyStaticPath("/contour3dmodel", {
+        publicEnabledFeatures: ["contour3dmodel"],
+        internalOnlyStaticPaths: ["/contour3dmodel"],
+      }),
+      false,
+      "Public feature routes should stay open even when a stale internal-only path overlap remains."
+    );
+    assert.equal(
+      isInternalOnlyStaticPath("/heritage-risk", {
+        publicEnabledFeatures: ["contour3dmodel"],
+        internalOnlyStaticPaths: ["/heritage-risk"],
+      }),
+      true,
+      "Unreleased feature routes should stay blocked when they are not included in the public feature list."
     );
     const responseCacheStore = new Map();
     const responseCacheInFlight = new Map();

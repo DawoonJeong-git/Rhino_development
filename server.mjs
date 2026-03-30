@@ -532,11 +532,8 @@ function buildPublicFeatureCatalog(config) {
 function isInternalOnlyStaticPath(requestPath, config) {
   const featureDefinition = findFeatureDefinitionByRequestPath(requestPath);
 
-  if (
-    featureDefinition &&
-    !(config?.publicEnabledFeatures || []).includes(featureDefinition.id)
-  ) {
-    return true;
+  if (featureDefinition) {
+    return !(config?.publicEnabledFeatures || []).includes(featureDefinition.id);
   }
 
   return (config?.internalOnlyStaticPaths || []).some((pathPrefix) =>
@@ -2113,10 +2110,29 @@ async function serveStatic(request, requestPath, response, config) {
     return;
   }
 
+  const clientIp = getClientIp(request);
+  const staticPageAliases = new Map([
+    ["/contour3dmodel", "index.html"],
+    ["/contour3dmodel/", "index.html"],
+    ["/heritage-risk", "heritage-risk/index.html"],
+    ["/heritage-risk/", "heritage-risk/index.html"],
+    ["/max-mass", "max-mass/index.html"],
+    ["/max-mass/", "max-mass/index.html"],
+  ]);
+  const resolvedPath = staticPageAliases.has(requestPath)
+    ? path.resolve(publicDir, staticPageAliases.get(requestPath))
+    : path.resolve(publicDir, `.${requestPath}`);
+
   if (isInternalOnlyStaticPath(requestPath, config)) {
-    const clientIp = getClientIp(request);
 
     if (!isLoopbackIp(clientIp)) {
+      console.warn(
+        `[static] blocked path=${requestPath} host=${String(
+          request.headers.host || ""
+        )} client=${String(clientIp || "unknown")} publicEnabled=${(
+          config?.publicEnabledFeatures || []
+        ).join(",") || "none"}`
+      );
       sendJson(response, 404, { error: "Not found" });
       return;
     }
@@ -2130,18 +2146,6 @@ async function serveStatic(request, requestPath, response, config) {
     );
     return;
   }
-
-  const staticPageAliases = new Map([
-    ["/contour3dmodel", "index.html"],
-    ["/contour3dmodel/", "index.html"],
-    ["/heritage-risk", "heritage-risk/index.html"],
-    ["/heritage-risk/", "heritage-risk/index.html"],
-    ["/max-mass", "max-mass/index.html"],
-    ["/max-mass/", "max-mass/index.html"],
-  ]);
-  const resolvedPath = staticPageAliases.has(requestPath)
-    ? path.resolve(publicDir, staticPageAliases.get(requestPath))
-    : path.resolve(publicDir, `.${requestPath}`);
 
   if (!isPathInsideDirectory(publicDir, resolvedPath)) {
     sendJson(response, 403, { error: "Forbidden" });
@@ -2179,7 +2183,14 @@ async function serveStatic(request, requestPath, response, config) {
       })
     );
     response.end(body);
-  } catch {
+  } catch (error) {
+    console.warn(
+      `[static] miss path=${requestPath} host=${String(
+        request.headers.host || ""
+      )} client=${String(clientIp || "unknown")} resolved=${resolvedPath} alias=${staticPageAliases.get(
+        requestPath
+      ) || ""} error=${formatErrorForLog(error)}`
+    );
     sendJson(response, 404, { error: "Not found" });
   }
 }
@@ -18933,6 +18944,11 @@ function createEumLawHandoffHtml(requestUrl) {
 async function createApp() {
   const localConfig = await loadLocalConfig();
   const config = buildRuntimeConfig(localConfig);
+  const ignoredInternalOnlyFeaturePaths = (config.internalOnlyStaticPaths || []).filter(
+    (pathPrefix) =>
+      Boolean(findFeatureDefinitionByRequestPath(pathPrefix)) &&
+      !isInternalOnlyStaticPath(pathPrefix, config)
+  );
 
   if (config.terrainContourPathSource === "workspace-fallback") {
     console.warn(
@@ -18945,6 +18961,12 @@ async function createApp() {
   } else if (config.terrainContourPathSource === "configured-missing") {
     console.warn(
       `[terrain-config] configured contour path is unavailable ${config.terrainContourPathRequested}`
+    );
+  }
+
+  if (ignoredInternalOnlyFeaturePaths.length) {
+    console.warn(
+      `[feature-config] ignoring internal-only overlap for public feature paths=${ignoredInternalOnlyFeaturePaths.join(",")}`
     );
   }
 
@@ -19733,6 +19755,7 @@ export {
   ensureRhinoLayer,
   fetchWithTimeout,
   getRhino3dm,
+  isInternalOnlyStaticPath,
   isPathInsideDirectory,
   localMetersFromLngLat,
   normalizePublicError,
