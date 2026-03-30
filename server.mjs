@@ -5495,6 +5495,7 @@ async function geocodeWithPreferredProviders(query, config) {
   const hints = buildSearchQueryHints(query);
   const searchProfile = buildSearchResponseProfile(hints);
   const vworldCategories = resolveVWorldSearchCategories(hints);
+  const sharedVworldBudgetMs = hints.roadAddressQuery ? 700 : 500;
   const providerErrors = [];
   const vworldPromise = config.vworldApiKey
     ? geocodeWithVWorld(query, config, {
@@ -5522,6 +5523,29 @@ async function geocodeWithPreferredProviders(query, config) {
     return resolvedVworldResult;
   }
 
+  async function readVWorldResultWithinBudget(timeoutMs = sharedVworldBudgetMs) {
+    if (!config.vworldApiKey) {
+      return { ok: true, items: [], timedOut: false };
+    }
+
+    if (resolvedVworldResult) {
+      return { ...resolvedVworldResult, timedOut: false };
+    }
+
+    const outcome = await Promise.race([
+      readVWorldResult().then((result) => ({ timedOut: false, result })),
+      waitForRetryDelay(timeoutMs).then(() => ({
+        timedOut: true,
+        result: { ok: true, items: [] },
+      })),
+    ]);
+
+    return {
+      ...outcome.result,
+      timedOut: outcome.timedOut,
+    };
+  }
+
   const jusoFastPathCandidates =
     jusoResult.ok &&
     (config.jusoCoordinateConfirmKey || config.vworldApiKey)
@@ -5530,15 +5554,17 @@ async function geocodeWithPreferredProviders(query, config) {
 
   if (jusoFastPathCandidates.length) {
     const fastVworldResult = config.vworldApiKey
-      ? await readVWorldResult()
-      : { ok: true, items: [] };
+      ? await readVWorldResultWithinBudget()
+      : { ok: true, items: [], timedOut: false };
     const fastJusoResults = (
       await Promise.all(
         jusoFastPathCandidates.map((candidate) =>
           geocodeJusoCandidate(candidate, config, {
             queryHints: hints,
             sharedVWorldResults: fastVworldResult.items || [],
-            sharedVWorldCategories: vworldCategories,
+            sharedVWorldCategories: fastVworldResult.timedOut
+              ? []
+              : vworldCategories,
             allowVWorldFallback: false,
             allowParcelFallback: false,
             allowNominatimFallback: false,
@@ -5570,15 +5596,17 @@ async function geocodeWithPreferredProviders(query, config) {
     shouldShortCircuitToJusoCandidate(hints, jusoItems)
   ) {
     const sharedVworldResult = config.vworldApiKey
-      ? await readVWorldResult()
-      : { ok: true, items: [] };
+      ? await readVWorldResultWithinBudget()
+      : { ok: true, items: [], timedOut: false };
     const directJusoResults = (
       await Promise.all(
         jusoItems.slice(0, 1).map((candidate) =>
           geocodeJusoCandidate(candidate, config, {
             queryHints: hints,
             sharedVWorldResults: sharedVworldResult.items || [],
-            sharedVWorldCategories: vworldCategories,
+            sharedVWorldCategories: sharedVworldResult.timedOut
+              ? []
+              : vworldCategories,
           }).catch(() => null)
         )
       )
