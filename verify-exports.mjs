@@ -1007,6 +1007,11 @@ async function runBaselineVerification() {
     );
     assert.match(
       featureHtml,
+      /pagead2\.googlesyndication\.com\/pagead\/js\/adsbygoogle\.js\?client=ca-pub-9740772629663258/i,
+      "Feature page should include the AdSense verification snippet in the head."
+    );
+    assert.match(
+      featureHtml,
       /\/vendor\/leaflet\/leaflet\.css\?v=20260326-security4/,
       "Feature page should reference the self-hosted Leaflet stylesheet."
     );
