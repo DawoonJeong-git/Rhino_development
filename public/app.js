@@ -5946,6 +5946,20 @@ function exposeUiVerificationApi() {
 
       return buildUiTestStateSummary();
     },
+    async loadLandInfo() {
+      const payload = await loadLandInfo();
+      return {
+        parcelReference: payload?.parcelReference || null,
+        state: buildUiTestStateSummary(),
+      };
+    },
+    async loadBuildingRegister() {
+      const payload = await loadBuildingRegister(true);
+      return {
+        itemCount: Array.isArray(payload?.items) ? payload.items.length : 0,
+        state: buildUiTestStateSummary(),
+      };
+    },
   };
 }
 

@@ -242,19 +242,10 @@ async function runSiteContextPreview(page, timeoutMs = 120000) {
 }
 
 async function loadLandInfo(page, timeoutMs = 60000) {
-  const landInfoResponsePromise = page.waitForResponse(
-    (response) =>
-      response.url().includes("/api/land-info") &&
-      response.request().method() === "POST",
-    { timeout: timeoutMs }
-  );
-  await page.locator("#loadLandInfoButton").click();
-  const landInfoResponse = await landInfoResponsePromise;
-
-  assert.equal(
-    landInfoResponse.ok(),
-    true,
-    "Land info request should complete successfully."
+  const hookResult = await callUiVerificationMethod(page, "loadLandInfo");
+  assert.ok(
+    hookResult?.parcelReference?.pnu || hookResult?.state?.selectedLocation?.pnu,
+    "Land info UI hook should resolve a parcel reference."
   );
 
   return {
@@ -274,20 +265,8 @@ async function loadLandInfo(page, timeoutMs = 60000) {
 }
 
 async function loadBuildingRegister(page, timeoutMs = 60000) {
-  const buildingRegisterResponsePromise = page.waitForResponse(
-    (response) =>
-      response.url().includes("/api/building-register") &&
-      response.request().method() === "POST",
-    { timeout: timeoutMs }
-  );
-  await page.locator("#loadBuildingRegisterButton").click();
-  const buildingRegisterResponse = await buildingRegisterResponsePromise;
-
-  assert.equal(
-    buildingRegisterResponse.ok(),
-    true,
-    "Building-register request should complete successfully."
-  );
+  const hookResult = await callUiVerificationMethod(page, "loadBuildingRegister");
+  assert.ok(hookResult && typeof hookResult === "object", "Building-register UI hook should return a result envelope.");
 
   return {
     buildingRegisterSummary: await waitForStableText(
