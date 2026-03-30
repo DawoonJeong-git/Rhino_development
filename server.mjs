@@ -11903,7 +11903,7 @@ function smoothLocalPolygonChaikin(
     return polygon;
   }
 
-  const iterationCount = Math.max(0, Math.min(2, Number(iterations) || 0));
+  const iterationCount = Math.max(0, Math.min(3, Number(iterations) || 0));
   const cornerRatio = Math.max(0.12, Math.min(0.32, Number(ratio) || 0.2));
   const limit = Math.max(32, Number(maxPointCount) || 192);
   const segmentFloor = Math.max(0.01, Number(minSegmentLength) || 0.05);
@@ -11969,26 +11969,43 @@ function smoothSketchUpSolidLoop(points, toleranceMeters = 0) {
   }
 
   const smoothed = smoothLocalPolygonChaikin(polygon, {
-    iterations: tolerance >= 0.95 ? 2 : 1,
-    ratio: tolerance >= 0.95 ? 0.2 : 0.18,
-    maxPointCount: polygon.length >= 80 ? 256 : 192,
-    minSegmentLength: Math.max(0.04, tolerance * 0.12),
+    iterations: tolerance >= 1.35 ? 3 : tolerance >= 0.95 ? 2 : 1,
+    ratio: tolerance >= 1.35 ? 0.22 : tolerance >= 0.95 ? 0.2 : 0.18,
+    maxPointCount: polygon.length >= 80 ? 320 : 224,
+    minSegmentLength: Math.max(0.04, tolerance * 0.1),
   });
-  const normalized = simplifyLocalPolygon(
-    smoothed,
-    Math.max(0.01, tolerance * 0.08)
+  const normalized = simplifyLocalPolygon(smoothed, Math.max(0.01, tolerance * 0.08));
+  const postSmoothTolerance = Math.max(
+    0.08,
+    tolerance * (tolerance >= 1.1 ? 0.28 : 0.2)
   );
-  const areaAfter = Math.abs(computeLocalPolygonSignedArea(normalized));
+  const rounded = normalized.length >= 4
+    ? simplifyLocalPolygonDouglasPeucker(normalized, postSmoothTolerance)
+    : normalized;
+  let candidate = rounded.length >= 3 ? rounded : normalized;
+
+  if (candidate.length >= polygon.length && polygon.length >= 6) {
+    const tightened = simplifyLocalPolygonDouglasPeucker(
+      candidate,
+      Math.max(0.1, tolerance * 0.35)
+    );
+
+    if (tightened.length >= 3) {
+      candidate = tightened;
+    }
+  }
+
+  const areaAfter = Math.abs(computeLocalPolygonSignedArea(candidate));
 
   if (
-    normalized.length < 3 ||
+    candidate.length < 3 ||
     areaAfter <= areaBefore * 0.7 ||
     areaAfter >= areaBefore * 1.05
   ) {
     return polygon;
   }
 
-  return normalized;
+  return candidate;
 }
 
 function buildLocalPointKey(point, decimals = 3) {
@@ -15095,20 +15112,20 @@ function resolveSketchUpTerrainSolidSimplifyTolerance(siteContext) {
   const sourceContourInterval = resolveSourceContourInterval(siteContext);
   const radiusMeters = Math.max(30, Number(siteContext?.options?.radius) || 120);
   const baseTolerance = Math.max(
-    0.22,
-    terrainStep > 0 ? terrainStep * 1.2 : 0,
-    sourceContourInterval > 0 ? sourceContourInterval * 0.35 : 0
+    0.28,
+    terrainStep > 0 ? terrainStep * 1.45 : 0,
+    sourceContourInterval > 0 ? sourceContourInterval * 0.45 : 0
   );
   const scaledTolerance =
     radiusMeters <= 120
       ? baseTolerance
       : radiusMeters <= 220
-        ? baseTolerance * 1.18
+        ? baseTolerance * 1.22
         : radiusMeters <= 420
-          ? baseTolerance * 1.35
-          : baseTolerance * 1.5;
+          ? baseTolerance * 1.42
+          : baseTolerance * 1.62;
 
-  return Number(Math.max(0.22, Math.min(1.9, scaledTolerance)).toFixed(3));
+  return Number(Math.max(0.28, Math.min(2.4, scaledTolerance)).toFixed(3));
 }
 
 function simplifySketchUpSolidRegion(region, toleranceMeters = 0) {

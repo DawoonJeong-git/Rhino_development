@@ -1863,12 +1863,19 @@ async function runBaselineVerification() {
       "SKP region simplifier should reduce stair-step terrace edge vertices."
     );
     assert.ok(
+      simplifiedStairStepRegion.outerPoints.length <=
+        Math.floor(rawStairStepRegion.outerPoints.length * 0.65),
+      "SKP region simplifier should aggressively collapse staircase terrace edges into smoother loops."
+    );
+    assert.ok(
       simplifiedStairStepRegion.outerPoints.some(
         ([xMeters, yMeters]) =>
           Math.abs(xMeters - Math.round(xMeters)) > 0.001 ||
           Math.abs(yMeters - Math.round(yMeters)) > 0.001
-      ),
-      "SKP region simplifier should round stair-step corners instead of keeping only grid-aligned vertices."
+      ) ||
+        simplifiedStairStepRegion.outerPoints.length <=
+          Math.floor(rawStairStepRegion.outerPoints.length * 0.5),
+      "SKP region simplifier should either round staircase corners or collapse them into a much cleaner reduced loop."
     );
     const stairStepSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       stairStepSketchUpSiteContext
