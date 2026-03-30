@@ -19756,10 +19756,13 @@ async function createApp() {
         }
 
         try {
+          const geocodeCacheKey = buildGeocodeCacheKey(query);
+          const hadInFlightGeocode = geocodeInFlight.has(geocodeCacheKey);
+          const cacheLoadStartedAt = Date.now();
           const payload = await readOrLoadResponseCache(
             geocodeCache,
             geocodeInFlight,
-            buildGeocodeCacheKey(query),
+            geocodeCacheKey,
             async () => {
               const { provider, results } = await geocodeWithPreferredProviders(
                 query,
@@ -19773,6 +19776,12 @@ async function createApp() {
               maxEntries: GEOCODE_CACHE_MAX_ENTRIES,
             }
           );
+          appendGeocodeTraceStage(geocodeTrace, {
+            name: "geocode-cache-load",
+            outcome: hadInFlightGeocode ? "shared" : "loader",
+            durationMs: Date.now() - cacheLoadStartedAt,
+            count: Number(payload.results?.length || 0),
+          });
           recordGeocodeTelemetry({
             query,
             provider: payload.provider || geocodeTrace.provider || "",
