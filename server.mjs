@@ -5214,7 +5214,20 @@ function selectShortCircuitJusoCandidate(query, queryHints, jusoItems) {
     return null;
   }
 
-  const rankedItems = normalizeSearchResultsForQuery(jusoItems, query);
+  const sortedItems = sortSearchItemsByParcelConfidence(jusoItems, query);
+  const textTokens = queryHints?.areaTokens?.length
+    ? queryHints.areaTokens
+    : queryHints?.textTokens || [];
+  const tokenFiltered = filterSearchItemsByBestTokenCoverage(
+    sortedItems,
+    textTokens,
+    queryHints?.areaTokens?.length ? 1 : Math.min(2, textTokens.length || 0)
+  );
+  const rankedItems = queryHints?.roadAddressQuery
+    ? tokenFiltered.filter((item) => item?.searchType === "road").length
+      ? tokenFiltered.filter((item) => item?.searchType === "road")
+      : tokenFiltered
+    : tokenFiltered;
   const candidate = rankedItems[0];
 
   if (!candidate) {
