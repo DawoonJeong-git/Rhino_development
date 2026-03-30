@@ -1039,10 +1039,10 @@ async function runBaselineVerification() {
       /unpkg\.com/i,
       "Feature page should no longer reference unpkg-hosted frontend assets."
     );
-    assert.match(
+    assert.doesNotMatch(
       featureHtml,
-      /pagead2\.googlesyndication\.com\/pagead\/js\/adsbygoogle\.js\?client=ca-pub-9740772629663258/i,
-      "Feature page should include the AdSense verification snippet in the head."
+      /pagead2\.googlesyndication\.com|googlesyndication|googleads\.g\.doubleclick\.net/i,
+      "Feature page should not load paused ad network snippets."
     );
     assert.match(
       featureHtml,

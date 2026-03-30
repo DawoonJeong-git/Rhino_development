@@ -89,7 +89,7 @@ const DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS = DEFAULT_MAX_SITE_RADIUS_METERS * 2;
 const DEFAULT_MAX_CONCURRENT_EXPORT_JOBS = 2;
 const DEFAULT_CONTENT_SECURITY_POLICY_DIRECTIVES = Object.freeze([
   "default-src 'self'",
-  "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com https://pagead2.googlesyndication.com",
+  "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com",
   "style-src 'self'",
   "img-src 'self' data: blob: https:",
   "font-src 'self' data: https:",
@@ -118,7 +118,6 @@ const DEFAULT_AD_PREVIEW_FRAME_ANCESTORS = Object.freeze([
   "https://*.googleusercontent.com",
 ]);
 const DEFAULT_ADS_TXT_LINES = Object.freeze([]);
-const ADSENSE_CLIENT_ID = "ca-pub-9740772629663258";
 const FEATURE_PAGE_DEFINITIONS = Object.freeze([
   {
     id: "contour3dmodel",
@@ -550,16 +549,6 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-function buildAdSenseVerificationSnippet() {
-  return [
-    "<script",
-    "  async",
-    `  src=\"https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${ADSENSE_CLIENT_ID}\"`,
-    '  crossorigin="anonymous"',
-    "></script>",
-  ].join("\n");
-}
-
 function renderFeatureMetaRow(meta) {
   const label = escapeHtml(meta?.label || "");
   const value = escapeHtml(meta?.value || "");
@@ -621,7 +610,6 @@ function renderHubHtml(config) {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Space Work Hub</title>
-    ${buildAdSenseVerificationSnippet()}
     <link rel="stylesheet" href="/hub.css?v=20260326-hub2" />
   </head>
   <body>
@@ -2175,6 +2163,7 @@ async function serveStatic(request, requestPath, response, config) {
       buildResponseHeaders({
         "Content-Type":
           contentTypes[ext] || "application/octet-stream; charset=utf-8",
+        ...(ext === ".html" ? { "Cache-Control": "no-store" } : {}),
       }, {
         frameAncestors:
           ext === ".html" && isAdPreviewAllowedPath(requestPath, config)
