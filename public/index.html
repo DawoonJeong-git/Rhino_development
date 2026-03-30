@@ -5,17 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>대지·건물 3D 검토</title>
     <link rel="stylesheet" href="/vendor/leaflet/leaflet.css?v=20260326-security4" />
-    <link rel="stylesheet" href="/styles.css?v=20260329-uifeedback1" />
+    <link rel="stylesheet" href="/styles.css?v=20260331-blue2" />
   </head>
   <body>
     <div class="app-shell">
       <header class="topbar">
         <div class="topbar-copy">
-          <p class="eyebrow">Site + Terrain + Output</p>
+          <p class="eyebrow">대지 · 건물 · 파일</p>
           <h1>대지·건물 3D 검토</h1>
           <p class="topbar-subtitle">
-            주소나 지도를 통해 대상지를 정하고, 토지·건축물 정보와 지형 · 건물 · 도로 맥락을 검토한 뒤
-            3DM · OBJ · DXF · SKP 파일까지 한 흐름으로 준비하는 작업 화면입니다.
+            주소 검색, 토지·건축물 정보 확인, 3D 파일 출력을 한 화면에서 진행합니다.
           </p>
         </div>
         <div class="topbar-actions">
@@ -24,26 +23,26 @@
         </div>
         <div class="topbar-highlights" aria-label="작업 흐름">
           <article class="topbar-highlight">
-            <p class="topbar-highlight-label">Selection</p>
-            <strong>대상지 선택과 범위 설정</strong>
-            <p>주소 검색, 지도 클릭, 다중 필지, 수동 범위 지정을 한 화면에서 이어서 진행합니다.</p>
+            <p class="topbar-highlight-label">대상지</p>
+            <strong>위치와 범위 선택</strong>
+            <p>주소 검색, 지도 클릭, 다중 필지, 범위 지정을 지원합니다.</p>
           </article>
           <article class="topbar-highlight">
-            <p class="topbar-highlight-label">Context</p>
-            <strong>토지 · 지형 · 건물 · 법규 확인</strong>
-            <p>필지 경계와 주변 맥락, 핵심 규제 정보를 정리해 바로 모델링 판단으로 이어갑니다.</p>
+            <p class="topbar-highlight-label">정보</p>
+            <strong>토지 · 건축물 · 주변 맥락</strong>
+            <p>토지 정보와 건축물대장, 주변 건물과 도로를 함께 확인합니다.</p>
           </article>
           <article class="topbar-highlight">
-            <p class="topbar-highlight-label">Output</p>
-            <strong>미리보기 후 3DM · OBJ · DXF · SKP 출력</strong>
-            <p>미리보기 결과를 확인한 뒤 필요한 포맷으로 바로 내려받아 후속 설계 작업으로 넘길 수 있습니다.</p>
+            <p class="topbar-highlight-label">출력</p>
+            <strong>미리보기와 파일 출력</strong>
+            <p>검토 결과를 확인한 뒤 3DM, OBJ, DXF, SKP로 이어갑니다.</p>
           </article>
         </div>
       </header>
 
       <section class="toolbar">
         <form id="searchForm" class="search-form">
-          <label class="search-label" for="searchInput">주소 · 지번 · 건물명 검색</label>
+          <label class="search-label" for="searchInput">주소 · 지번 · 건물명</label>
           <div class="search-row">
             <input
               id="searchInput"
@@ -55,14 +54,14 @@
             <button type="submit">주소 찾기</button>
           </div>
           <p class="helper-text">
-            도로명주소, 지번주소, 건물명을 함께 찾습니다. 입력을 멈추면 결과를 미리 준비해 두고, 확정 즉시 지도와 모델 컨텍스트로 이어집니다.
+            주소, 지번, 건물명을 검색합니다.
           </p>
             <p class="search-results-empty">검색 결과가 여기에 표시됩니다.</p>
         </form>
 
         <div class="selection-summary-stack">
           <div class="selection-summary" id="selectionSummary">
-            대상지를 아직 확정하지 않았습니다. 주소를 검색하거나 지도에서 위치를 선택하세요.
+            주소를 검색하거나 지도에서 위치를 선택하세요.
           </div>
 
           <div class="selection-history is-hidden" aria-hidden="true">
@@ -117,7 +116,7 @@
           <article class="card selection-card is-hidden" aria-hidden="true">
             <div class="card-header">
               <div>
-                <p class="card-kicker">Selection</p>
+                <p class="card-kicker">대상지</p>
                 <h2>선택 위치</h2>
               </div>
             </div>
@@ -144,7 +143,7 @@
           <article class="card context-card is-hidden" aria-hidden="true">
             <div class="card-header">
               <div>
-                <p class="card-kicker">Site Context</p>
+                <p class="card-kicker">주변 맥락</p>
                 <h2>대지, 지형, 건물 미리보기</h2>
               </div>
               <button class="secondary-button" id="loadSiteContextButton" type="button">
@@ -185,22 +184,22 @@
           <article class="card land-card">
             <div class="card-header">
               <div>
-                <p class="card-kicker">Land Info</p>
+                <p class="card-kicker">토지 · 규제</p>
                 <h2>토지 정보</h2>
               </div>
               <div class="button-row compact-row">
                 <button class="secondary-button" id="loadLandInfoButton" type="button">
-                  요약 정보
+                  토지 정보
                 </button>
                 <button
                   class="secondary-button"
                   id="showLandInfoDetailsButton"
                   type="button"
                 >
-                  상세 정보
+                  규제 상세
                 </button>
                 <button class="secondary-button" id="openLandUseDetailButton" type="button">
-                  토지이음 열기
+                  토지이음
                 </button>
               </div>
             </div>
@@ -231,7 +230,7 @@
               </div>
             </dl>
             <p class="helper-text" id="landInfoNote">
-              토지 요약은 패널에 반영되고, 자세한 내용은 토지이음에서 이어서 확인할 수 있습니다.
+              토지 정보와 규제 요약을 확인할 수 있습니다.
             </p>
             <div class="land-info-section">
               <h3>국토계획법 지역, 지구</h3>
@@ -250,8 +249,8 @@
           <article class="card building-card">
             <div class="card-header">
               <div>
-                <p class="card-kicker">Building Register</p>
-                <h2>건축물 대장 정보</h2>
+                <p class="card-kicker">건축물</p>
+                <h2>건축물 정보</h2>
               </div>
               <div class="button-row compact-row">
                 <button
@@ -259,21 +258,21 @@
                   id="loadBuildingRegisterButton"
                   type="button"
                 >
-                  요약 정보
+                  건축물 정보
                 </button>
                 <button
                   class="secondary-button"
                   id="showBuildingRegisterDetailsButton"
                   type="button"
                 >
-                  상세 정보
+                  대장 상세
                 </button>
                 <button
                   class="secondary-button"
                   id="openOfficialBuildingRegisterButton"
                   type="button"
                 >
-                  세움터 열기
+                  세움터
                 </button>
               </div>
             </div>
@@ -300,7 +299,7 @@
               </div>
             </dl>
             <p class="helper-text" id="buildingRegisterNote">
-              앱에서는 건축물대장 요약을 먼저 보여주고, 원본 확인은 세움터에서 이어집니다.
+              건축물대장 요약을 먼저 확인하고 필요하면 상세로 이어집니다.
             </p>
             <div class="building-register-list" id="buildingRegisterList">
               <p class="search-results-empty">건축물대장 요약 결과가 여기에 표시됩니다.</p>
@@ -310,8 +309,8 @@
           <article class="card model-card model-card-featured">
             <div class="card-header">
               <div>
-                <p class="card-kicker">Model Output</p>
-                <h2>3D / CAD 모델 출력</h2>
+                <p class="card-kicker">파일 출력</p>
+                <h2>3D / CAD 파일</h2>
               </div>
             </div>
             <form id="modelForm" class="model-form">
@@ -332,20 +331,20 @@
 
               <div class="toggle-grid">
                 <label class="checkbox">
-                  건물 mass 포함
+                  건물 포함
                 </label>
                 <label class="checkbox">
-                  대지 경계 포함
+                  대지 경계
                 </label>
                 <label class="checkbox" data-model-option="splitParcelBoundary">
                   <input type="checkbox" name="splitParcelBoundary" />
                   <span class="checkbox-label">필지 그룹 분리</span>
                 </label>
                 <label class="checkbox">
-                  등고선 포함
+                  등고선
                 </label>
                 <label class="checkbox">
-                  도로 레이어 포함
+                  도로 포함
                 </label>
               </div>
 
@@ -354,7 +353,7 @@
                   <div class="model-progress-fill" id="modelProgressFill"></div>
                 </div>
                 <p class="model-progress-label" id="modelProgressLabel">
-                  범위를 설정하면 지도 버퍼와 3D 추출 범위가 여기에 표시됩니다.
+                  범위와 포함 항목은 미리보기 후 여기에서 먼저 확인할 수 있습니다.
                 </p>
               </div>
 
@@ -376,7 +375,7 @@
               </div>
             </form>
             <div class="export-status" id="specPreview">
-              모델 미리보기를 누르면 현재 반경, 버퍼, 포함 건물 수를 이곳에서 먼저 확인할 수 있습니다.
+              미리보기 후 현재 반경과 포함 항목을 확인할 수 있습니다.
             </div>
           </article>
         </section>
@@ -386,6 +385,6 @@
     <div id="actionFeedback" class="visually-hidden" aria-hidden="true"></div>
 
     <script src="/vendor/leaflet/leaflet.js?v=20260326-security4"></script>
-    <script type="module" src="/app.js?v=20260330-copy1"></script>
+    <script type="module" src="/app.js?v=20260331-copyblue2"></script>
   </body>
 </html>

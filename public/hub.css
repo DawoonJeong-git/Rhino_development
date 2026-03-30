@@ -1,19 +1,19 @@
 :root {
   color-scheme: light;
-  --bg-top: #f5e6d0;
-  --bg-bottom: #eef3e8;
-  --panel: rgba(255, 251, 244, 0.88);
+  --bg-top: #e7f0fa;
+  --bg-bottom: #edf5fc;
+  --panel: rgba(248, 251, 255, 0.9);
   --panel-strong: rgba(255, 255, 255, 0.92);
-  --line: rgba(107, 79, 48, 0.14);
-  --line-strong: rgba(107, 79, 48, 0.24);
-  --text: #2e251d;
-  --muted: #665444;
-  --accent: #b85d31;
-  --accent-strong: #8b3d1c;
-  --olive: #4d6648;
-  --olive-soft: rgba(77, 102, 72, 0.12);
-  --shadow-lg: 0 30px 80px rgba(73, 50, 27, 0.12);
-  --shadow-md: 0 18px 40px rgba(73, 50, 27, 0.09);
+  --line: rgba(48, 89, 136, 0.14);
+  --line-strong: rgba(48, 89, 136, 0.24);
+  --text: #192638;
+  --muted: #5f7188;
+  --accent: #2f6fb6;
+  --accent-strong: #1f4f8a;
+  --olive: #2f6682;
+  --olive-soft: rgba(47, 102, 130, 0.12);
+  --shadow-lg: 0 30px 80px rgba(30, 58, 96, 0.12);
+  --shadow-md: 0 18px 40px rgba(30, 58, 96, 0.09);
   --radius-lg: 30px;
   --radius-md: 20px;
 }
@@ -29,9 +29,9 @@ body {
   font-family: "Pretendard Variable", "Segoe UI", sans-serif;
   color: var(--text);
   background:
-    radial-gradient(circle at top left, rgba(255, 222, 182, 0.9), transparent 32%),
-    radial-gradient(circle at bottom right, rgba(200, 220, 196, 0.72), transparent 28%),
-    linear-gradient(140deg, var(--bg-top), #f8f4ec 55%, var(--bg-bottom));
+    radial-gradient(circle at top left, rgba(183, 214, 246, 0.86), transparent 32%),
+    radial-gradient(circle at bottom right, rgba(214, 232, 247, 0.72), transparent 30%),
+    linear-gradient(140deg, var(--bg-top), #f8fbff 55%, var(--bg-bottom));
 }
 
 body {
@@ -150,14 +150,14 @@ h1 {
 
 .feature-card-live {
   background:
-    radial-gradient(circle at top right, rgba(245, 211, 168, 0.42), transparent 32%),
-    linear-gradient(180deg, rgba(255, 251, 244, 0.96), rgba(248, 239, 228, 0.94));
+    radial-gradient(circle at top right, rgba(188, 217, 248, 0.42), transparent 32%),
+    linear-gradient(180deg, rgba(250, 253, 255, 0.96), rgba(238, 246, 252, 0.94));
 }
 
 .feature-card-plan {
   background:
-    radial-gradient(circle at bottom left, rgba(201, 220, 198, 0.34), transparent 34%),
-    linear-gradient(180deg, rgba(250, 252, 248, 0.94), rgba(246, 241, 234, 0.92));
+    radial-gradient(circle at bottom left, rgba(210, 228, 246, 0.34), transparent 34%),
+    linear-gradient(180deg, rgba(250, 253, 255, 0.94), rgba(240, 246, 252, 0.92));
 }
 
 .feature-head {
@@ -181,7 +181,7 @@ h1 {
 }
 
 .feature-badge.is-live {
-  background: rgba(184, 93, 49, 0.1);
+  background: rgba(47, 111, 182, 0.1);
   color: var(--accent-strong);
 }
 
@@ -236,7 +236,7 @@ h2 {
   color: #fff;
   font-weight: 800;
   text-decoration: none;
-  box-shadow: 0 14px 26px rgba(139, 61, 28, 0.2);
+  box-shadow: 0 14px 26px rgba(31, 79, 138, 0.2);
   transition:
     transform 160ms ease,
     box-shadow 160ms ease,
@@ -245,7 +245,7 @@ h2 {
 
 .feature-link:hover {
   transform: translateY(-1px);
-  box-shadow: 0 18px 28px rgba(139, 61, 28, 0.24);
+  box-shadow: 0 18px 28px rgba(31, 79, 138, 0.24);
   filter: saturate(1.03);
 }
 

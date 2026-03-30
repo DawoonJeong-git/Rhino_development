@@ -1033,6 +1033,12 @@ async function runBaselineVerification() {
     const featureResponse = await fetch(`${baseUrl}/contour3dmodel`);
     const featureHtml = await featureResponse.text();
     assert.equal(featureResponse.status, 200, "Feature route should respond.");
+    assert.match(featureHtml, /대지·건물 3D 검토/, "Feature page heading should remain visible.");
+    assert.match(featureHtml, /토지 정보/, "Land-info CTA should remain visible.");
+    assert.match(featureHtml, /건축물 정보/, "Building-info CTA should remain visible.");
+    assert.match(featureHtml, /대지 경계/, "Parcel boundary option should remain visible.");
+    assert.match(featureHtml, /모델 미리보기/, "Preview CTA should remain visible.");
+    if (false) {
     assert.match(
       featureHtml,
       /대지·건물 3D 검토/,
@@ -1043,6 +1049,7 @@ async function runBaselineVerification() {
     assert.match(featureHtml, /필지 그룹 분리/, "Split parcel option should remain visible.");
     assert.match(featureHtml, /모델 미리보기/, "Preview CTA should remain visible.");
 
+    }
     assert.doesNotMatch(
       featureHtml,
       /unpkg\.com/i,

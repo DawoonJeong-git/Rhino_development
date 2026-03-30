@@ -133,7 +133,7 @@ const buildingRegisterCard = buildingRegisterMeta?.closest(".card");
 const modelCard = modelForm?.closest(".card");
 const MIN_CONTOUR_INTERVAL_METERS = 0.1;
 const DEFAULT_SELECTION_SUMMARY =
-  "대상지를 아직 확정하지 않았습니다. 주소를 검색하거나 지도에서 위치를 선택하세요.";
+  "주소를 검색하거나 지도에서 위치를 선택하세요.";
 const MODEL_PROGRESS_STORAGE_KEY =
   "space-work.model-progress-estimates.v1";
 const SELECTION_PREVIEW_CACHE_TTL_MS = 1000 * 60 * 2;
@@ -156,27 +156,27 @@ const MODEL_PROGRESS_DEFAULT_ESTIMATES_MS = Object.freeze({
 const REQUEST_UI_PHASE_MESSAGES = Object.freeze({
   siteContext: {
     loading:
-      "대지, 지형, 건물 컨텍스트를 계산하는 중입니다.",
+      "대지와 주변 정보를 불러오는 중입니다.",
     slow:
-      "공공데이터 응답을 기다리는 중입니다. 범위가 넓거나 주변 데이터가 많으면 조금 더 걸릴 수 있습니다.",
+      "범위가 넓거나 데이터가 많으면 조금 더 걸릴 수 있습니다.",
     delayed:
-      "응답이 길어지고 있지만 지형, 건물, 도로 데이터를 계속 정리하고 있습니다. 창을 닫지 말고 잠시만 기다려주세요.",
+      "지형, 건물, 도로 데이터를 계속 정리하고 있습니다. 잠시만 기다려주세요.",
   },
   landInfo: {
     loading:
-      "토지이음 요약 정보를 조회하는 중입니다.",
+      "토지 정보를 조회하는 중입니다.",
     slow:
-      "토지이음 실데이터 응답을 기다리는 중입니다.",
+      "토지 정보를 불러오는 중입니다.",
     delayed:
-      "토지이음 응답이 길어지고 있지만 재시도와 캐시 확인을 계속하고 있습니다.",
+      "토지 정보 응답이 길어지고 있지만 계속 조회하고 있습니다.",
   },
   buildingRegister: {
     loading:
-      "건축물대장 요약 정보를 조회하는 중입니다.",
+      "건축물 정보를 조회하는 중입니다.",
     slow:
-      "건축HUB 실데이터 응답을 기다리는 중입니다.",
+      "건축물 정보를 불러오는 중입니다.",
     delayed:
-      "건축HUB 응답이 길어지고 있지만 재시도와 캐시 확인을 계속하고 있습니다.",
+      "건축물 정보 응답이 길어지고 있지만 계속 조회하고 있습니다.",
   },
 });
 
@@ -206,7 +206,7 @@ function applyStudioChrome() {
   selectionSummaryStack?.classList.add("target-site-stack");
 
   if (topbarEyebrow) {
-    topbarEyebrow.textContent = "Site + Terrain + Output";
+    topbarEyebrow.textContent = "대지 · 건물 · 파일";
   }
 
   if (topbarTitle) {
@@ -215,7 +215,7 @@ function applyStudioChrome() {
 
   if (topbarSubtitle) {
     topbarSubtitle.textContent =
-      "주소나 지도를 통해 대상지를 정하고, 지형 · 건물 · 토지/법규를 검토한 뒤 3DM · OBJ · DXF · SKP 파일까지 한 흐름으로 준비하는 작업 화면입니다.";
+      "주소 검색, 토지·건축물 정보 확인, 3D 파일 출력을 한 화면에서 진행합니다.";
   }
 
   if (topbarHighlights[0]) {
@@ -223,14 +223,14 @@ function applyStudioChrome() {
     const title = topbarHighlights[0].querySelector("strong");
     const description = topbarHighlights[0].querySelector("p:last-child");
     if (label) {
-      label.textContent = "Selection";
+      label.textContent = "대상지";
     }
     if (title) {
-      title.textContent = "대상지 선택과 범위 설정";
+      title.textContent = "위치와 범위 선택";
     }
     if (description) {
       description.textContent =
-        "주소 검색, 지도 클릭, 다중 필지, 수동 범위 지정을 한 화면에서 이어서 진행합니다.";
+        "주소 검색, 지도 클릭, 다중 필지, 범위 지정을 지원합니다.";
     }
   }
 
@@ -239,14 +239,14 @@ function applyStudioChrome() {
     const title = topbarHighlights[1].querySelector("strong");
     const description = topbarHighlights[1].querySelector("p:last-child");
     if (label) {
-      label.textContent = "Context";
+      label.textContent = "정보";
     }
     if (title) {
-      title.textContent = "토지 · 지형 · 건물 · 법규 확인";
+      title.textContent = "토지 · 건축물 · 주변 맥락";
     }
     if (description) {
       description.textContent =
-        "필지 경계와 주변 맥락, 핵심 규제 정보를 정리해 바로 모델링 판단으로 이어갑니다.";
+        "토지 정보와 건축물대장, 주변 건물과 도로를 함께 확인합니다.";
     }
   }
 
@@ -255,19 +255,19 @@ function applyStudioChrome() {
     const title = topbarHighlights[2].querySelector("strong");
     const description = topbarHighlights[2].querySelector("p:last-child");
     if (label) {
-      label.textContent = "Output";
+      label.textContent = "출력";
     }
     if (title) {
-      title.textContent = "미리보기 후 3DM · OBJ · DXF · SKP 출력";
+      title.textContent = "미리보기와 파일 출력";
     }
     if (description) {
       description.textContent =
-        "미리보기 결과를 확인한 뒤 필요한 포맷으로 바로 내려받아 후속 설계 작업으로 넘길 수 있습니다.";
+        "검토 결과를 확인한 뒤 3DM, OBJ, DXF, SKP로 이어갑니다.";
     }
   }
 
   if (searchFormLabel) {
-    searchFormLabel.textContent = "주소 · 지번 · 건물명 검색";
+    searchFormLabel.textContent = "주소 · 지번 · 건물명";
   }
 
   if (searchInput) {
@@ -280,7 +280,7 @@ function applyStudioChrome() {
 
   if (searchFormHelper) {
     searchFormHelper.textContent =
-      "도로명주소, 지번주소, 건물명을 함께 찾습니다. 입력을 멈추면 결과를 미리 준비해 두고, 확정 즉시 지도와 모델 컨텍스트로 이어집니다.";
+      "주소, 지번, 건물명을 검색합니다.";
   }
 
   if (searchFormEmptyState) {
@@ -292,15 +292,59 @@ function applyStudioChrome() {
   }
 
   ensureSelectionSummaryChrome();
-  updateCardHeading(selectionCard, "Target Site", "선택된 대상지");
-  updateCardHeading(siteContextCard, "Preview Context", "대지 · 지형 · 건물 미리보기");
-  updateCardHeading(landInfoCard, "Land & Regulation", "토지 · 규제 정보");
+  updateCardHeading(selectionCard, "대상지", "선택 위치");
+  updateCardHeading(siteContextCard, "주변 맥락", "지형 · 건물");
+  updateCardHeading(landInfoCard, "토지 · 규제", "토지 정보");
   updateCardHeading(
     buildingRegisterCard,
-    "Building Register",
-    "건축물대장 정보"
+    "건축물",
+    "건축물 정보"
   );
-  updateCardHeading(modelCard, "Model Output", "3D / CAD 모델 출력");
+  updateCardHeading(modelCard, "파일 출력", "3D / CAD 파일");
+
+  if (loadLandInfoButton) {
+    loadLandInfoButton.textContent = "토지 정보";
+  }
+
+  if (showLandInfoDetailsButton) {
+    showLandInfoDetailsButton.textContent = "규제 상세";
+  }
+
+  if (openLandUseDetailButton) {
+    openLandUseDetailButton.textContent = "토지이음";
+  }
+
+  if (loadBuildingRegisterButton) {
+    loadBuildingRegisterButton.textContent = "건축물 정보";
+  }
+
+  if (showBuildingRegisterDetailsButton) {
+    showBuildingRegisterDetailsButton.textContent = "대장 상세";
+  }
+
+  if (openOfficialBuildingRegisterButton) {
+    openOfficialBuildingRegisterButton.textContent = "세움터";
+  }
+
+  if (siteContextNote) {
+    siteContextNote.textContent =
+      "미리보기를 실행하면 대지와 주변 맥락이 정리됩니다.";
+  }
+
+  if (landInfoNote) {
+    landInfoNote.textContent =
+      "토지 정보와 규제 요약을 확인할 수 있습니다.";
+  }
+
+  if (buildingRegisterNote) {
+    buildingRegisterNote.textContent =
+      "건축물대장 요약을 먼저 확인하고 필요하면 상세로 이어집니다.";
+  }
+
+  if (modelProgressLabel) {
+    modelProgressLabel.textContent =
+      "범위와 포함 항목은 미리보기 후 여기에서 먼저 확인할 수 있습니다.";
+  }
 }
 
 function clearRangeDraftLayer() {
@@ -322,8 +366,8 @@ function ensureSelectionSummaryChrome() {
     header = document.createElement("div");
     header.className = "selection-summary-header";
     header.innerHTML = `
-      <p class="card-kicker">Target Site</p>
-      <h2>대상지 주소</h2>
+      <p class="card-kicker">대상지</p>
+      <h2>선택 주소</h2>
     `;
     selectionSummaryStack.prepend(header);
   }
@@ -429,7 +473,7 @@ function ensureSearchSelectionCard() {
     searchSelectionCard.innerHTML = `
       <div class="card-header">
         <div>
-          <p class="card-kicker">Address Selection</p>
+          <p class="card-kicker">검색 결과</p>
           <h2>주소 선택</h2>
         </div>
       </div>
@@ -1895,7 +1939,7 @@ function failModelProgress(message) {
 }
 
 function resetModelProgress(
-  message = "모델 미리보기를 누르면 지도 버퍼와 3D 추출 범위가 여기에 표시됩니다."
+  message = "범위와 포함 항목이 여기에 표시됩니다."
 ) {
   clearModelProgressTimer();
   clearModelProgressPollTimer();
@@ -1983,14 +2027,14 @@ function updateContextLayers(siteContext) {
   const isRangeMode = siteContext?.selectionMode === "range";
   const isSelectionPreview = siteContext?.layerMode === "selection-preview";
   const targetParcelGroups = siteContext?.targetParcelGroups?.features || [];
-  const targetParcelPalette = ["#223d2c", "#bb5a34", "#436b75", "#8d6c2d", "#7b4862"];
+  const targetParcelPalette = ["#1f4f8a", "#2f6fb6", "#4a86c5", "#5f93cf", "#3d739b"];
 
   if (!isSelectionPreview && siteContext.clipBoundary) {
     state.layers.clipBoundary = L.geoJSON(siteContext.clipBoundary, {
       style: {
-        color: "#bb5a34",
+        color: "#2f6fb6",
         dashArray: "8 8",
-        fillColor: "#bb5a34",
+        fillColor: "#2f6fb6",
         fillOpacity: 0.04,
         weight: 2,
       },
@@ -2000,7 +2044,7 @@ function updateContextLayers(siteContext) {
   if (!isSelectionPreview && siteContext.parcelContext?.features?.length) {
     state.layers.parcelContext = L.geoJSON(siteContext.parcelContext, {
       style: {
-        color: "#6e846d",
+        color: "#7390b6",
         fillOpacity: 0,
         opacity: 0.85,
         weight: 1.3,
@@ -2011,8 +2055,8 @@ function updateContextLayers(siteContext) {
   if (!isRangeMode && siteContext.parcelBoundary) {
     state.layers.parcelBoundary = L.geoJSON(siteContext.parcelBoundary, {
       style: {
-        color: isSelectionPreview ? "#bb5a34" : "#223d2c",
-        fillColor: "#4f6348",
+        color: isSelectionPreview ? "#2f6fb6" : "#1f4f8a",
+        fillColor: "#5a86c4",
         fillOpacity: isSelectionPreview ? 0.16 : 0,
         weight: isSelectionPreview ? 5 : 3,
         dashArray: isSelectionPreview ? "8 4" : null,
@@ -2093,9 +2137,9 @@ function updateContextLayers(siteContext) {
       {
         style: (feature) => ({
           color:
-            !isRangeMode && feature?.properties?.isTarget ? "#c5622e" : "#7f6a59",
+            !isRangeMode && feature?.properties?.isTarget ? "#4e6d93" : "#7d8da3",
           fillColor:
-            !isRangeMode && feature?.properties?.isTarget ? "#d28845" : "#9e8a78",
+            !isRangeMode && feature?.properties?.isTarget ? "#87a7cf" : "#bcc7d5",
           fillOpacity:
             !isRangeMode && feature?.properties?.isTarget
               ? (isSelectionPreview ? 0.42 : 0.32)
@@ -2344,7 +2388,7 @@ function renderLandInfo() {
       <div><dt>기준 주소</dt><dd>선택 전</dd></div>
     `;
     landInfoNote.textContent =
-      "주소를 선택한 뒤 토지정보를 불러오면 토지이음 결과를 검색 없이 바로 연결할 수 있습니다.";
+      "주소를 선택한 뒤 토지 정보를 불러올 수 있습니다.";
     renderInfoItems(landInfoList, [], "토지정보 요약 결과가 여기에 표시됩니다.");
     renderInfoItems(lawInfoList, [], "법규 요약 결과가 여기에 표시됩니다.");
     return;
@@ -2353,15 +2397,15 @@ function renderLandInfo() {
   if (isMultiParcelSelection(state.selectedLocation)) {
     landInfoMeta.innerHTML = `
       <div><dt>조회 상태</dt><dd>다중 선택</dd></div>
-      <div><dt>지목</dt><dd>단건 조회 비활성</dd></div>
+      <div><dt>지목</dt><dd>개별 조회 없음</dd></div>
       <div><dt>면적</dt><dd>필지 그룹 기준 확인</dd></div>
-      <div><dt>지역지구 수</dt><dd>단건 조회 비활성</dd></div>
-      <div><dt>공시지가</dt><dd>단건 조회 비활성</dd></div>
+      <div><dt>지역지구 수</dt><dd>개별 조회 없음</dd></div>
+      <div><dt>공시지가</dt><dd>개별 조회 없음</dd></div>
       <div><dt>기준 주소</dt><dd>필지별 개별 확인 필요</dd></div>
     `;
     landInfoNote.textContent =
-      "다중 필지 선택 모드에서는 토지이음 단건 조회를 자동으로 연결하지 않습니다. 그룹 모델을 먼저 검토한 뒤 필요한 필지를 개별로 열어보는 흐름에 맞춰두었습니다.";
-    renderInfoItems(landInfoList, [], "다중 필지 선택에서는 단건 토지이음 요약 대신 그룹 컨텍스트를 우선 확인합니다.");
+      "다중 필지 선택에서는 그룹 기준 토지 정보를 먼저 확인합니다.";
+    renderInfoItems(landInfoList, [], "다중 필지 선택에서는 그룹 기준 토지 정보를 먼저 확인합니다.");
     renderInfoItems(lawInfoList, [], "필지별 법규 확인은 개별 주소 선택으로 이어서 검토할 수 있습니다.");
     return;
   }
@@ -2377,7 +2421,7 @@ function renderLandInfo() {
     `;
     landInfoNote.textContent = getRequestAwareNote(
       "landInfo",
-      "토지정보 불러오기를 누르면 토지이음의 필지 결과와 법규 요약을 이 화면에 정리합니다."
+      "토지 정보를 불러오면 요약 결과를 이 화면에 정리합니다."
     );
     renderInfoItems(landInfoList, [], "토지정보 요약 결과가 여기에 표시됩니다.");
     renderInfoItems(lawInfoList, [], "법규 요약 결과가 여기에 표시됩니다.");
@@ -2398,7 +2442,7 @@ function renderLandInfo() {
   `;
   landInfoNote.textContent = getRequestAwareNote(
     "landInfo",
-    `${state.landInfo.address || buildSelectionLabel(state.selectedLocation)} 기준 토지이음 결과를 정리했습니다.`
+    `${state.landInfo.address || buildSelectionLabel(state.selectedLocation)} 기준 토지 정보를 정리했습니다.`
   );
   renderInfoItems(
     landInfoList,
@@ -2417,7 +2461,7 @@ function renderBuildingRegister() {
 
   if (!state.runtimeConfig?.futureSources?.hasBuildingHubKey) {
     buildingRegisterMeta.innerHTML = `
-      <div><dt>조회 상태</dt><dd>키 미설정</dd></div>
+      <div><dt>조회 상태</dt><dd>준비 전</dd></div>
       <div><dt>건물 수</dt><dd>조회 불가</dd></div>
       <div><dt>대표 용도</dt><dd>조회 불가</dd></div>
       <div><dt>대표 연면적</dt><dd>조회 불가</dd></div>
@@ -2426,9 +2470,9 @@ function renderBuildingRegister() {
     `;
     trimMetaGrid(buildingRegisterMeta, 5);
     buildingRegisterNote.textContent =
-      "건축HUB 서비스키를 넣으면 앱 안에서 건축물대장 요약을 불러올 수 있습니다.";
+      "건축물 정보 연결이 아직 준비되지 않았습니다.";
     buildingRegisterList.innerHTML =
-      '<p class="search-results-empty">건축HUB 키를 설정하면 결과가 표시됩니다.</p>';
+      '<p class="search-results-empty">건축물 정보 연결이 준비되면 결과가 표시됩니다.</p>';
     return;
   }
 
@@ -2436,14 +2480,14 @@ function renderBuildingRegister() {
     buildingRegisterMeta.innerHTML = `
       <div><dt>조회 상태</dt><dd>다중 선택</dd></div>
       <div><dt>건물 수</dt><dd>그룹 모델에서 확인</dd></div>
-      <div><dt>대표 용도</dt><dd>단건 조회 비활성</dd></div>
-      <div><dt>대표 연면적</dt><dd>단건 조회 비활성</dd></div>
-      <div><dt>대표 층수</dt><dd>단건 조회 비활성</dd></div>
-      <div><dt>대표 구조</dt><dd>단건 조회 비활성</dd></div>
+      <div><dt>대표 용도</dt><dd>개별 조회 없음</dd></div>
+      <div><dt>대표 연면적</dt><dd>개별 조회 없음</dd></div>
+      <div><dt>대표 층수</dt><dd>개별 조회 없음</dd></div>
+      <div><dt>대표 구조</dt><dd>개별 조회 없음</dd></div>
     `;
     trimMetaGrid(buildingRegisterMeta, 5);
     buildingRegisterNote.textContent =
-      "다중 필지 선택 모드에서는 세움터 단건 요약을 자동으로 묶지 않습니다. 그룹 모델과 대상 건물 배치를 먼저 본 뒤 필요한 필지를 개별 조회하는 흐름으로 두었습니다.";
+      "다중 필지 선택에서는 그룹 기준 건축물 정보를 먼저 확인합니다.";
     buildingRegisterList.innerHTML =
       '<p class="search-results-empty">다중 필지 선택에서는 건축물대장 요약 대신 그룹별 3D 컨텍스트를 우선 표시합니다.</p>';
     return;
@@ -2461,7 +2505,7 @@ function renderBuildingRegister() {
     trimMetaGrid(buildingRegisterMeta, 5);
     buildingRegisterNote.textContent = getRequestAwareNote(
       "buildingRegister",
-      "주소 검색 결과를 선택하거나 대지를 먼저 불러온 뒤 조회하세요. 현재 인쇄는 요약본 기준입니다."
+      "주소를 선택한 뒤 건축물 정보를 불러오면 요약 결과가 이 화면에 표시됩니다."
     );
     buildingRegisterList.innerHTML =
       '<p class="search-results-empty">건축물대장 요약 결과가 여기에 표시됩니다.</p>';
@@ -2481,7 +2525,7 @@ function renderBuildingRegister() {
   trimMetaGrid(buildingRegisterMeta, 5);
   buildingRegisterNote.textContent = getRequestAwareNote(
     "buildingRegister",
-    "건축HUB 표제부 조회 결과를 요약해 보여주고 있습니다. 공식 원본 확인은 세움터 팝업을 이용하세요."
+    "건축물 정보 요약을 표시하고 있습니다. 공식 원본 확인은 세움터를 이용하세요."
   );
 
   if (!items.length) {
@@ -3389,13 +3433,12 @@ function clearSelectionForSearch(options = {}) {
   syncSelectionModeFormState();
   selectionSummary.textContent = DEFAULT_SELECTION_SUMMARY;
   siteContextNote.textContent =
-    "주소를 검색하거나 지도에서 위치를 클릭하면 필지 경계와 건물 외곽선을 미리 볼 수 있습니다.";
-  landInfoNote.textContent =
-    "위치를 선택하면 토지이음 요약을 불러옵니다.";
+    "주소를 검색하거나 지도에서 위치를 선택하면 대지와 주변 맥락을 확인할 수 있습니다.";
+  landInfoNote.textContent = "위치를 선택하면 토지 정보를 불러올 수 있습니다.";
 
   if (state.runtimeConfig?.futureSources?.hasBuildingHubKey) {
     buildingRegisterNote.textContent =
-      "위치를 선택하면 건축물대장 요약을 불러옵니다.";
+      "위치를 선택하면 건축물 정보를 불러올 수 있습니다.";
   }
 
   [
@@ -3578,7 +3621,7 @@ function buildAppliedModelSummary(
   options = collectModelOptions()
 ) {
   if (!options) {
-    return "모델 미리보기를 누르면 현재 반경과 추출 조건이 여기에 표시됩니다.";
+    return "미리보기 후 현재 반경과 출력 조건을 확인할 수 있습니다.";
   }
 
   const requestedInterval = normalizeContourInterval(options.contourInterval);
@@ -3735,10 +3778,10 @@ function showRangeDraftBounds(bounds) {
       [bounds.maxLat, bounds.maxLng],
     ],
     {
-      color: "#c5622e",
+      color: "#2f6fb6",
       weight: 3,
       dashArray: "10 6",
-      fillColor: "#d28845",
+      fillColor: "#5a86c4",
       fillOpacity: 0.12,
     }
   ).addTo(state.map);
@@ -3842,16 +3885,16 @@ function markModelOptionsDirty() {
     return;
   }
 
-  resetModelProgress("모델 미리보기를 누르면 지도에 버퍼가 반영되고 추출 준비 상태가 갱신됩니다.");
+  resetModelProgress("미리보기 후 범위와 준비 상태가 갱신됩니다.");
 
   if (!state.selectedLocation || !state.siteContext) {
     return;
   }
 
   specPreview.textContent =
-    "설정이 바뀌었습니다. 미리보기 또는 다운로드를 누르면 현재 조건으로 대지/건물 컨텍스트를 다시 불러옵니다.";
+    "설정이 바뀌었습니다. 미리보기 또는 다운로드를 누르면 현재 조건으로 다시 불러옵니다.";
   siteContextNote.textContent =
-    "현재 지도 미리보기는 이전 조건 기준입니다. 다시 불러오면 새 범위와 지형 모드가 반영됩니다.";
+    "현재 미리보기는 이전 조건 기준입니다. 다시 불러오면 새 조건이 반영됩니다.";
 }
 
 async function loadSiteContext(
@@ -4097,7 +4140,7 @@ async function printBuildingRegister(printWindow = null) {
       <h1>건축물대장 요약</h1>
       <p class="meta">${escapeHtml(address)}<br />출력 시각: ${escapeHtml(new Date().toLocaleString("ko-KR"))}</p>
       <div class="section">${cards}</div>
-      <p class="notice">이 출력물은 건축HUB 표제부 조회 결과를 바탕으로 정리한 요약본입니다. 정부24 또는 세움터의 공식 발급 문서와는 다를 수 있습니다.</p>
+      <p class="notice">이 출력물은 건축물 정보 조회 결과를 바탕으로 정리한 요약본입니다. 정부24 또는 세움터의 공식 발급 문서와는 다를 수 있습니다.</p>
     `
   );
 }
@@ -4940,8 +4983,7 @@ function prepareModelFormUi() {
     return;
   }
 
-  specPreview.textContent =
-    "모델 미리보기를 누르면 현재 반경, 표고, 포함 건물 수를 먼저 확인할 수 있습니다.";
+  specPreview.textContent = "미리보기 후 반경과 포함 항목을 확인할 수 있습니다.";
 }
 
 function resolveDownloadFilename(response, fallbackFormat) {
@@ -5438,9 +5480,9 @@ async function handleRangeSelectionMapClick(latlng) {
     if (state.map) {
       state.layers.rangeDraft = L.circleMarker([latlng.lat, latlng.lng], {
         radius: 8,
-        color: "#c5622e",
+        color: "#2f6fb6",
         weight: 3,
-        fillColor: "#d28845",
+        fillColor: "#5a86c4",
         fillOpacity: 0.4,
       }).addTo(state.map);
     }
@@ -5472,7 +5514,7 @@ async function handleRangeSelectionMapClick(latlng) {
 
   setSelectedLocation(rangeSelection, false);
   setActionFeedback(
-    "범위가 지정되었습니다. 현재는 선택한 사각형만 지도에 표시됩니다. 모델 미리보기를 누르면 옵션에 따른 전체 컨텍스트를 계산합니다."
+    "범위가 지정되었습니다. 미리보기를 누르면 현재 조건으로 범위를 계산합니다."
   );
 }
 
@@ -5728,11 +5770,8 @@ function setSelectedLocation(location, moveMap = true) {
   state.landInfoDetails = null;
   state.latestSpec = null;
 
-  specPreview.textContent =
-    "모델 미리보기를 누르면 현재 반경, 표고, 포함 건물을 먼저 확인할 수 있습니다.";
-  resetModelProgress(
-    "모델 미리보기를 누르면 지도 버퍼와 3D 추출 범위가 여기에 표시됩니다."
-  );
+  specPreview.textContent = "미리보기 후 반경과 포함 항목을 확인할 수 있습니다.";
+  resetModelProgress("범위와 포함 항목이 여기에 표시됩니다.");
 
   if (state.map) {
     if (rangeMode) {
@@ -5767,27 +5806,25 @@ function setSelectedLocation(location, moveMap = true) {
     openPopup(location);
   }
   siteContextNote.textContent =
-    "현재 위치가 선택되었습니다. 모델 미리보기를 누르면 현재 반경으로 버퍼와 건물 범위를 다시 계산합니다.";
-  landInfoNote.textContent =
-    "선택한 위치 기준으로 토지이음 요약을 자동으로 불러오는 중입니다.";
+    "위치가 선택되었습니다. 미리보기를 누르면 현재 조건으로 다시 계산합니다.";
+  landInfoNote.textContent = "선택한 위치 기준 토지 정보를 불러오는 중입니다.";
 
   if (state.runtimeConfig?.futureSources?.hasBuildingHubKey) {
-    buildingRegisterNote.textContent =
-      "선택한 위치 기준으로 건축물대장 요약을 자동으로 불러오는 중입니다.";
+    buildingRegisterNote.textContent = "선택한 위치 기준 건축물 정보를 불러오는 중입니다.";
   }
 
   if (rangeMode) {
     landInfoNote.textContent =
-      "직접 지정 범위는 특정 필지 토지요약 대신 범위 안의 컨텍스트를 확인합니다.";
+      "직접 지정 범위에서는 개별 토지 요약 대신 범위 안의 필지와 건물을 확인합니다.";
     buildingRegisterNote.textContent =
-      "직접 지정 범위는 특정 건축물대장 대신 범위 안의 건물 컨텍스트를 확인합니다.";
+      "직접 지정 범위에서는 개별 건축물대장 대신 범위 안의 건물을 확인합니다.";
   } else if (multiParcelMode) {
     siteContextNote.textContent =
-      "다중 필지가 선택되었습니다. 모델 미리보기로 그룹별 대지/건물 컨텍스트를 계산할 수 있습니다.";
+      "다중 필지가 선택되었습니다. 미리보기로 그룹 범위를 계산할 수 있습니다.";
     landInfoNote.textContent =
-      "다중 필지 선택은 그룹 모델 검토에 집중하고, 토지이음 단건 조회는 잠시 비활성화합니다.";
+      "다중 필지 선택에서는 개별 토지 정보 조회를 잠시 숨깁니다.";
     buildingRegisterNote.textContent =
-      "다중 필지 선택은 그룹 모델 검토에 집중하고, 세움터 단건 조회는 잠시 비활성화합니다.";
+      "다중 필지 선택에서는 개별 건축물 정보 조회를 잠시 숨깁니다.";
   }
 
   [
@@ -5979,9 +6016,9 @@ async function hydrateSelectedLocationParcelReference(selectionKey) {
     renderBuildingRegister();
     syncPanelStatusChips();
     landInfoNote.textContent =
-      "직접 지정 범위는 토지 요약 대신 범위 안의 필지/건물 컨텍스트를 지도에서 확인합니다.";
+      "직접 지정 범위에서는 개별 토지 요약 대신 범위 안의 필지와 건물을 확인합니다.";
     buildingRegisterNote.textContent =
-      "직접 지정 범위는 특정 건축물대장 대신 범위 안의 건물 컨텍스트를 지도에서 확인합니다.";
+      "직접 지정 범위에서는 개별 건축물대장 대신 범위 안의 건물을 확인합니다.";
     return;
   }
 
@@ -6145,8 +6182,7 @@ async function bootstrap() {
   syncContourIntervalInput();
   syncSelectionModeFormState();
   exposeUiVerificationApi();
-  specPreview.textContent =
-    "모델 미리보기를 누르면 현재 반경, 표고, 포함 건물 수를 먼저 확인할 수 있습니다.";
+  specPreview.textContent = "미리보기 후 반경과 포함 항목을 확인할 수 있습니다.";
   syncPanelStatusChips();
   await loadRuntimeConfig();
   createMap(state.runtimeConfig);
