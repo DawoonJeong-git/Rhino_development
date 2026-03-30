@@ -5651,7 +5651,11 @@ async function geocodeWithPreferredProviders(query, config) {
             ? []
             : remainingJuso.slice(0, searchProfile.jusoHydrationLimit)
         ).map((candidate) =>
-          geocodeJusoCandidate(candidate, config).catch(() => null)
+          geocodeJusoCandidate(candidate, config, {
+            queryHints: hints,
+            sharedVWorldResults: vworldItems,
+            sharedVWorldCategories: vworldCategories,
+          }).catch(() => null)
         )
       )
     ).filter(Boolean);
@@ -5684,7 +5688,11 @@ async function geocodeWithPreferredProviders(query, config) {
     const hydrated = (
       await Promise.all(
         jusoItems.slice(0, searchProfile.jusoHydrationLimit).map((candidate) =>
-          geocodeJusoCandidate(candidate, config).catch(() => null)
+          geocodeJusoCandidate(candidate, config, {
+            queryHints: hints,
+            sharedVWorldResults: vworldItems,
+            sharedVWorldCategories: vworldCategories,
+          }).catch(() => null)
         )
       )
     ).filter(Boolean);
