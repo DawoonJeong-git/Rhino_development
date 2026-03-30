@@ -4579,14 +4579,14 @@ function filterSearchItemsByBestTokenCoverage(items, tokens, minimumMatches = 1)
 }
 
 function buildSearchQueryHints(query) {
-  const normalizedQuery = normalizeAddressKey(query);
-  const parcelReference = parseParcelAddressReference(query);
-  const roadAddressQuery = /(?:로|길|대로)\d/u.test(String(query || "").replace(/\s+/g, ""));
-  const normalizedRoadAddressQuery = /(?:\uB300\uB85C|\uB85C|\uAE38)\d/u.test(
-    String(query || "").replace(/\s+/g, "")
-  );
+  const rawQuery = String(query || "");
+  const normalizedQuery = normalizeAddressKey(rawQuery);
+  const compactQuery = rawQuery.replace(/\s+/g, "");
+  const rawParcelReference = parseParcelAddressReference(rawQuery);
+  const roadAddressQuery = /(?:\uB300\uB85C|\uB85C|\uAE38)\d/u.test(compactQuery);
+  const parcelReference = roadAddressQuery ? null : rawParcelReference;
   const areaQuery = parcelReference
-    ? String(query || "")
+    ? rawQuery
         .replace(/(?:^|\s)(\uC0B0)?\s*\d+(?:-\d+)?\s*$/u, "")
         .trim()
     : "";
@@ -4597,7 +4597,7 @@ function buildSearchQueryHints(query) {
     mainNumber: normalizeDigits(parcelReference?.bun),
     subNumber: normalizeDigits(parcelReference?.ji),
     mtYn: parcelReference?.mtYn || "0",
-    roadAddressQuery: normalizedRoadAddressQuery,
+    roadAddressQuery,
     areaQuery,
     normalizedAreaQuery: normalizeAddressKey(areaQuery),
     textTokens: collectSearchTextTokens(query),
@@ -20520,6 +20520,7 @@ export {
   build3dmFromSiteContext,
   buildClipBoundary,
   buildParcelDataCacheKey,
+  buildSearchQueryHints,
   buildSiteContextCacheKey,
   buildVWorldDomainCandidates,
   buildCumulativeContourBandGroups,
@@ -20552,6 +20553,7 @@ export {
   readOrLoadResponseCache,
   resolveSketchUpTerrainSolidSimplifyTolerance,
   resolveRateLimitBucket,
+  resolveVWorldSearchCategories,
   resolveRawTerrainHeightAtLocalPoint,
   resolveEffectiveContourBandInterval,
   resolveTerrainContourPath,

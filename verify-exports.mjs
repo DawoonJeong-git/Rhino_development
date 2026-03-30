@@ -7,6 +7,7 @@ import {
   buildProviderTimeoutConfig,
   buildParcelDataCacheKey,
   buildExportArtifactCacheKey,
+  buildSearchQueryHints,
   buildSiteContextCacheKey,
   buildVWorldDomainCandidates,
   createApp,
@@ -30,6 +31,7 @@ import {
   resolveRateLimitBucket,
   resolveSketchUpTerrainSolidSimplifyTolerance,
   resolveTerrainContourPath,
+  resolveVWorldSearchCategories,
   selectGeocodedVWorldResultForJusoCandidate,
   selectShortCircuitJusoCandidate,
   selectStrongJusoFastPathCandidates,
@@ -1548,6 +1550,23 @@ async function runBaselineVerification() {
       textTokens: ["서울", "서초구", "서초대로", "411"],
       areaTokens: ["서울", "서초구", "서초대로"],
     };
+    const roadQueryThatMustNotLookLikeParcel = "\uC11C\uC6B8 \uB9C8\uD3EC\uAD6C \uC6D4\uB4DC\uCEF5\uBD81\uB85C 396";
+    const roadOnlyHints = buildSearchQueryHints(roadQueryThatMustNotLookLikeParcel);
+    assert.equal(
+      roadOnlyHints.roadAddressQuery,
+      true,
+      "Road-address queries with trailing building numbers should still be recognized as road searches."
+    );
+    assert.equal(
+      roadOnlyHints.parcelReference,
+      null,
+      "Road-address queries should not be misclassified as parcel references."
+    );
+    assert.deepEqual(
+      resolveVWorldSearchCategories(roadOnlyHints),
+      ["road"],
+      "Road-address queries should stay on the road VWorld search path."
+    );
     const fastRoadCandidates = [
       {
         id: "fast-1",
