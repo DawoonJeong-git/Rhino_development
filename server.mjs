@@ -4477,28 +4477,16 @@ async function geocodeJusoCandidate(item, config) {
   let result = null;
 
   if (config.vworldApiKey) {
-    let roadResults = [];
-    let parcelResults = [];
-
-    if (item.roadAddress) {
-      try {
-        roadResults = await searchVWorldCategory(item.roadAddress, "road", config);
-      } catch {
-        roadResults = [];
-      }
-    }
-
-    if (roadResults.length === 0 && item.parcelAddress) {
-      try {
-        parcelResults = await searchVWorldCategory(
-          item.parcelAddress,
-          "parcel",
-          config
-        );
-      } catch {
-        parcelResults = [];
-      }
-    }
+    const [roadResults, parcelResults] = await Promise.all([
+      item.roadAddress
+        ? searchVWorldCategory(item.roadAddress, "road", config).catch(() => [])
+        : Promise.resolve([]),
+      item.parcelAddress
+        ? searchVWorldCategory(item.parcelAddress, "parcel", config).catch(
+            () => []
+          )
+        : Promise.resolve([]),
+    ]);
 
     result = roadResults[0] || parcelResults[0] || null;
   }
@@ -4535,6 +4523,25 @@ async function geocodeJusoCandidate(item, config) {
     parcelAddress: item.parcelAddress || result.parcelAddress,
     label: item.label || result.label,
   };
+}
+
+function shouldShortCircuitToJusoCandidate(queryHints, jusoItems) {
+  if (!Array.isArray(jusoItems) || jusoItems.length !== 1) {
+    return false;
+  }
+
+  const [candidate] = jusoItems;
+  const matchScore = scoreSearchItemQueryMatch(candidate, queryHints);
+
+  if (hasExactParcelAddressMatch(candidate, queryHints)) {
+    return true;
+  }
+
+  if (queryHints?.roadAddressQuery) {
+    return matchScore >= 4200;
+  }
+
+  return matchScore >= 5000;
 }
 
 function hasSearchParcelReference(item) {
@@ -4772,20 +4779,45 @@ async function finalizeSearchResults(primaryResults, query, config) {
 async function geocodeWithPreferredProviders(query, config) {
   const hints = buildSearchQueryHints(query);
   const providerErrors = [];
-  const [vworldResult, jusoResult] = await Promise.all([
-    config.vworldApiKey
-      ? geocodeWithVWorld(query, config)
-          .then((items) => ({ ok: true, items }))
-          .catch((error) => ({ ok: false, error, items: [] }))
-      : Promise.resolve({ ok: true, items: [] }),
-    config.jusoConfirmKey
-      ? searchJuso(query, config)
-          .then((items) => ({ ok: true, items }))
-          .catch((error) => ({ ok: false, error, items: [] }))
-      : Promise.resolve({ ok: true, items: [] }),
-  ]);
-  const vworldItems = vworldResult.items || [];
+  const vworldPromise = config.vworldApiKey
+    ? geocodeWithVWorld(query, config)
+        .then((items) => ({ ok: true, items }))
+        .catch((error) => ({ ok: false, error, items: [] }))
+    : Promise.resolve({ ok: true, items: [] });
+  const jusoPromise = config.jusoConfirmKey
+    ? searchJuso(query, config)
+        .then((items) => ({ ok: true, items }))
+        .catch((error) => ({ ok: false, error, items: [] }))
+    : Promise.resolve({ ok: true, items: [] });
+  const jusoResult = await jusoPromise;
   const jusoItems = jusoResult.items || [];
+
+  if (
+    jusoResult.ok &&
+    shouldShortCircuitToJusoCandidate(hints, jusoItems)
+  ) {
+    const directJusoResults = (
+      await Promise.all(
+        jusoItems
+          .slice(0, 1)
+          .map((candidate) => geocodeJusoCandidate(candidate, config).catch(() => null))
+      )
+    ).filter(Boolean);
+
+    if (directJusoResults.length) {
+      return {
+        provider: "juso+geocoded",
+        results: await finalizeSearchResults(
+          await hydrateSearchItemsWithReverse(directJusoResults, config, 1),
+          query,
+          config
+        ),
+      };
+    }
+  }
+
+  const vworldResult = await vworldPromise;
+  const vworldItems = vworldResult.items || [];
 
   if (!vworldResult.ok && vworldResult.error) {
     providerErrors.push(vworldResult.error);
