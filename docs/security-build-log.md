@@ -326,7 +326,7 @@ Cleared the real-share runtime blockers in the deployment clone and confirmed th
 ### Changes Completed
 
 - discovered the actual Cloudflare Tunnel hostname from `C:\Users\wjdek\.cloudflared\config.yml`
-- updated `C:\SpaceWork_deploy\config.local.json` to use `https://app.spaceswork.net`
+- updated `C:\SpaceWork_deploy\config.local.json` to use `https://spaceswork.net`
 - updated `C:\SpaceWork_deploy\config.local.json` to use `C:\SpaceWork_deploy\data\contours`
 - hardened the deployment-security verifier to tolerate UTF-8 BOM in JSON files
 - reran strict runtime verification for `C:\SpaceWork_deploy` and confirmed it passes
@@ -342,7 +342,7 @@ Cleared the real-share runtime blockers in the deployment clone and confirmed th
 
 ### Open Items
 
-- run one allowed-user external smoke through `https://app.spaceswork.net`
+- run one allowed-user external smoke through `https://spaceswork.net`
 - confirm blocked access is denied outside the trusted path
 - review provider-specific timeout values against more real parcel runs
 - decide whether an operator-only smoke checklist is still needed before closure
@@ -374,8 +374,8 @@ Extended the release verification flow so the real share origin now checks both 
 
 ### Verification
 
-- `npm run verify:public-origin -- --base-url https://app.spaceswork.net` passed
-- `npm run verify:release -- --base-url http://127.0.0.1:3000 --public-base-url https://app.spaceswork.net` passed
+- `npm run verify:public-origin -- --base-url https://spaceswork.net` passed
+- `npm run verify:release -- --base-url http://127.0.0.1:3000 --public-base-url https://spaceswork.net` passed
 - `C:\SpaceWork_deploy\logs\verify-release\latest.json` now records both `public-security-smoke` and `public-ui-smoke`
 
 ### Open Items

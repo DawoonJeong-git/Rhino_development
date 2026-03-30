@@ -907,6 +907,16 @@ async function runBaselineVerification() {
       "Hub page should not allow inline styles in the default CSP."
     );
     assertDefaultCspShape(hubCsp, "Hub page CSP");
+    assert.match(
+      String(hubCsp),
+      /frame-ancestors[^;]*ads\.google\.com/i,
+      "Hub page CSP should allow Google ad preview ancestors on approved pages."
+    );
+    assert.notEqual(
+      hubResponse.headers.get("x-frame-options"),
+      "DENY",
+      "Hub page should not hard-block iframe embedding when ad preview is enabled."
+    );
     assert.equal(
       isPathInsideDirectory(
         path.join(process.cwd(), "public"),
@@ -1011,6 +1021,16 @@ async function runBaselineVerification() {
       "Handoff route should no longer require inline style allowance."
     );
     assertDefaultCspShape(handoffCsp, "Handoff CSP");
+    assert.match(
+      String(handoffCsp || ""),
+      /frame-ancestors 'none'/,
+      "Handoff route CSP should still deny third-party framing."
+    );
+    assert.equal(
+      handoffResponse.headers.get("x-frame-options"),
+      "DENY",
+      "Non-preview routes should continue sending X-Frame-Options: DENY."
+    );
     const popupStylesResponse = await fetch(`${baseUrl}/popup.css`);
     assert.equal(
       popupStylesResponse.status,
@@ -1040,6 +1060,18 @@ async function runBaselineVerification() {
       leafletScriptResponse.status,
       200,
       "Self-hosted Leaflet script should be served."
+    );
+    const robotsResponse = await fetch(`${baseUrl}/robots.txt`);
+    const robotsText = await robotsResponse.text();
+    assert.equal(
+      robotsResponse.status,
+      200,
+      "robots.txt should be served for crawler-based verification."
+    );
+    assert.match(
+      robotsText,
+      /Mediapartners-Google/i,
+      "robots.txt should explicitly allow the Google publisher crawler."
     );
     const leafletMarkerResponse = await fetch(`${baseUrl}/vendor/leaflet/images/marker-icon.png`);
     assert.equal(

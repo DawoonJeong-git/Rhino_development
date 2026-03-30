@@ -87,7 +87,7 @@ const EXPORT_JOB_DURATION_HISTORY_LIMIT = 8;
 const DEFAULT_MAX_SITE_RADIUS_METERS = 1000;
 const DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS = DEFAULT_MAX_SITE_RADIUS_METERS * 2;
 const DEFAULT_MAX_CONCURRENT_EXPORT_JOBS = 2;
-const DEFAULT_CONTENT_SECURITY_POLICY = [
+const DEFAULT_CONTENT_SECURITY_POLICY_DIRECTIVES = Object.freeze([
   "default-src 'self'",
   "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com",
   "style-src 'self'",
@@ -96,9 +96,26 @@ const DEFAULT_CONTENT_SECURITY_POLICY = [
   "connect-src 'self' https://cloudflareinsights.com https://*.cloudflareinsights.com https://static.cloudflareinsights.com",
   "object-src 'none'",
   "base-uri 'self'",
-  "frame-ancestors 'none'",
   "form-action 'self' https://www.eum.go.kr",
-].join("; ");
+]);
+const DEFAULT_FRAME_ANCESTORS = Object.freeze(["'none'"]);
+const DEFAULT_AD_PREVIEW_ALLOWED_PATHS = Object.freeze([
+  "/",
+  "/contour3dmodel",
+  "/heritage-risk",
+  "/max-mass",
+]);
+const DEFAULT_AD_PREVIEW_FRAME_ANCESTORS = Object.freeze([
+  "'self'",
+  "https://ads.google.com",
+  "https://google.com",
+  "https://*.google.com",
+  "https://*.google.co.kr",
+  "https://*.googleadservices.com",
+  "https://*.doubleclick.net",
+  "https://*.googleusercontent.com",
+]);
+const DEFAULT_ADS_TXT_LINES = Object.freeze([]);
 const ROAD_LAYER_CANDIDATES = [
   {
     layer: "lt_c_upisuq151",
@@ -297,6 +314,135 @@ function normalizeConfigString(value) {
   }
 
   return normalized;
+}
+
+function normalizeConfigList(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => normalizeConfigString(entry))
+      .filter(Boolean);
+  }
+
+  const normalized = normalizeConfigString(value);
+
+  if (!normalized) {
+    return [];
+  }
+
+  if (normalized.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(normalized);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map((entry) => normalizeConfigString(entry))
+          .filter(Boolean);
+      }
+    } catch {
+      // Fall through to delimiter-based parsing.
+    }
+  }
+
+  return normalized
+    .split(/[\r\n,]+/u)
+    .map((entry) => normalizeConfigString(entry))
+    .filter(Boolean);
+}
+
+function normalizePathPrefix(value) {
+  const normalized = normalizeConfigString(value);
+
+  if (!normalized) {
+    return "";
+  }
+
+  if (normalized === "/") {
+    return "/";
+  }
+
+  const prefixed = normalized.startsWith("/") ? normalized : `/${normalized}`;
+  return prefixed.endsWith("/") ? prefixed.slice(0, -1) : prefixed;
+}
+
+function normalizePathPrefixList(value, fallback = DEFAULT_AD_PREVIEW_ALLOWED_PATHS) {
+  const normalizedEntries = normalizeConfigList(value)
+    .map((entry) => normalizePathPrefix(entry))
+    .filter(Boolean);
+
+  if (!normalizedEntries.length) {
+    return [...fallback];
+  }
+
+  return [...new Set(normalizedEntries)];
+}
+
+function normalizeFrameAncestor(value) {
+  const normalized = normalizeConfigString(value);
+
+  if (!normalized) {
+    return "";
+  }
+
+  if (normalized === "'self'" || normalized === "'none'") {
+    return normalized;
+  }
+
+  return /^https?:\/\//iu.test(normalized) ? normalized : "";
+}
+
+function normalizeFrameAncestorList(
+  value,
+  fallback = DEFAULT_AD_PREVIEW_FRAME_ANCESTORS
+) {
+  const normalizedEntries = normalizeConfigList(value)
+    .map((entry) => normalizeFrameAncestor(entry))
+    .filter(Boolean);
+
+  if (!normalizedEntries.length) {
+    return [...fallback];
+  }
+
+  const uniqueEntries = [...new Set(normalizedEntries)];
+  if (uniqueEntries.includes("'none'")) {
+    return ["'none'"];
+  }
+
+  return uniqueEntries;
+}
+
+function matchesPathPrefix(requestPath, pathPrefix) {
+  const normalizedRequestPath = normalizePathPrefix(requestPath || "/") || "/";
+  const normalizedPathPrefix = normalizePathPrefix(pathPrefix);
+
+  if (!normalizedPathPrefix) {
+    return false;
+  }
+
+  if (normalizedPathPrefix === "/") {
+    return normalizedRequestPath === "/";
+  }
+
+  return (
+    normalizedRequestPath === normalizedPathPrefix ||
+    normalizedRequestPath.startsWith(`${normalizedPathPrefix}/`)
+  );
+}
+
+function isAdPreviewAllowedPath(requestPath, config) {
+  return (config?.adPreviewAllowedPaths || []).some((pathPrefix) =>
+    matchesPathPrefix(requestPath, pathPrefix)
+  );
+}
+
+function buildContentSecurityPolicy(frameAncestors = DEFAULT_FRAME_ANCESTORS) {
+  const normalizedFrameAncestors = normalizeFrameAncestorList(
+    frameAncestors,
+    DEFAULT_FRAME_ANCESTORS
+  );
+
+  return [
+    ...DEFAULT_CONTENT_SECURITY_POLICY_DIRECTIVES,
+    `frame-ancestors ${normalizedFrameAncestors.join(" ")}`,
+  ].join("; ");
 }
 
 function normalizeContourInterval(value) {
@@ -1363,6 +1509,21 @@ function buildRuntimeConfig(localConfig) {
         DEFAULT_MAX_PENDING_EXPORT_JOBS_PER_CLIENT,
       DEFAULT_MAX_PENDING_EXPORT_JOBS_PER_CLIENT
     ),
+    adPreviewAllowedPaths: normalizePathPrefixList(
+      process.env.AD_PREVIEW_ALLOWED_PATHS ||
+        localConfig.AD_PREVIEW_ALLOWED_PATHS ||
+        DEFAULT_AD_PREVIEW_ALLOWED_PATHS
+    ),
+    adPreviewFrameAncestors: normalizeFrameAncestorList(
+      process.env.AD_PREVIEW_FRAME_ANCESTORS ||
+        localConfig.AD_PREVIEW_FRAME_ANCESTORS ||
+        DEFAULT_AD_PREVIEW_FRAME_ANCESTORS
+    ),
+    adsTxtLines: normalizeConfigList(
+      process.env.ADS_TXT_LINES ||
+        localConfig.ADS_TXT_LINES ||
+        DEFAULT_ADS_TXT_LINES
+    ),
     providerTimeouts: buildProviderTimeoutConfig(localConfig),
     rateLimits: {
       api: {
@@ -1693,7 +1854,16 @@ async function readJsonBody(request, options = {}) {
   });
 }
 
-async function serveStatic(requestPath, response) {
+async function serveStatic(requestPath, response, config) {
+  if (requestPath === "/ads.txt" && Array.isArray(config?.adsTxtLines) && config.adsTxtLines.length) {
+    sendText(
+      response,
+      200,
+      `${config.adsTxtLines.join("\n")}\n`
+    );
+    return;
+  }
+
   const staticPageAliases = new Map([
     ["/", "hub.html"],
     ["/contour3dmodel", "index.html"],
@@ -1735,6 +1905,11 @@ async function serveStatic(requestPath, response) {
       buildResponseHeaders({
         "Content-Type":
           contentTypes[ext] || "application/octet-stream; charset=utf-8",
+      }, {
+        frameAncestors:
+          ext === ".html" && isAdPreviewAllowedPath(requestPath, config)
+            ? config.adPreviewFrameAncestors
+            : DEFAULT_FRAME_ANCESTORS,
       })
     );
     response.end(body);
@@ -15996,19 +16171,28 @@ async function fetchWithTimeout(resource, init = {}, options = {}) {
   }
 }
 
-function buildSecurityHeaders() {
-  return {
-    "Content-Security-Policy": DEFAULT_CONTENT_SECURITY_POLICY,
+function buildSecurityHeaders(options = {}) {
+  const frameAncestors = normalizeFrameAncestorList(
+    options?.frameAncestors,
+    DEFAULT_FRAME_ANCESTORS
+  );
+  const headers = {
+    "Content-Security-Policy": buildContentSecurityPolicy(frameAncestors),
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
   };
+
+  if (frameAncestors.length === 1 && frameAncestors[0] === "'none'") {
+    headers["X-Frame-Options"] = "DENY";
+  }
+
+  return headers;
 }
 
-function buildResponseHeaders(headers = {}) {
+function buildResponseHeaders(headers = {}, options = {}) {
   return {
-    ...buildSecurityHeaders(),
+    ...buildSecurityHeaders(options),
     ...headers,
   };
 }
@@ -19193,7 +19377,7 @@ async function createApp() {
         return;
       }
 
-      await serveStatic(requestUrl.pathname, response);
+      await serveStatic(requestUrl.pathname, response, config);
     } catch (error) {
       const publicError = normalizePublicError(error);
       const statusCode =

@@ -113,8 +113,10 @@ Fill in:
 - `VWORLD_API_DOMAIN`
 - `PUBLIC_BASE_URL` if your real public HTTPS address is different from the VWorld-registered domain
 - `JUSO_CONFIRM_KEY`
+- `JUSO_COORD_CONFIRM_KEY` if your address search key for `addrCoordApi.do` is separate
 - `BUILDING_HUB_SERVICE_KEY`
 - `LAW_API_OC`
+- `ADS_TXT_LINES` if you want the server to publish `/ads.txt` directly from config
 - `TERRAIN_CONTOUR_PATH`
 - `TERRAIN_CONTOUR_CRS`
 
@@ -126,6 +128,8 @@ Important:
 - production should only read the config inside `C:\SpaceWork_deploy`
 - if VWorld is only registered for `http://localhost:3000`, you can keep `VWORLD_API_DOMAIN=http://localhost:3000` even when the public site uses a Cloudflare Tunnel hostname such as `https://spaceswork.net`
 - set `PUBLIC_BASE_URL` to the real public HTTPS origin when you want `deploy/update-home-prod.ps1` to run the public smoke against the tunnel hostname separately from `VWORLD_API_DOMAIN`
+- if AdSense site preview needs to iframe your pages, keep the preview-safe `AD_PREVIEW_ALLOWED_PATHS` and `AD_PREVIEW_FRAME_ANCESTORS` values
+- if AdSense asks for `ads.txt`, fill `ADS_TXT_LINES` with your publisher line so `/ads.txt` responds from the same origin
 
 ## Step 3. Start the App Locally
 

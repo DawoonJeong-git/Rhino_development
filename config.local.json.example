@@ -4,7 +4,24 @@
   "VWORLD_API_KEY": "__PUT_VWORLD_API_KEY_HERE__",
   "VWORLD_API_DOMAIN": "__PUT_VWORLD_API_DOMAIN_HERE__",
   "PUBLIC_BASE_URL": "",
+  "AD_PREVIEW_ALLOWED_PATHS": [
+    "/",
+    "/contour3dmodel",
+    "/heritage-risk",
+    "/max-mass"
+  ],
+  "AD_PREVIEW_FRAME_ANCESTORS": [
+    "https://ads.google.com",
+    "https://google.com",
+    "https://*.google.com",
+    "https://*.google.co.kr",
+    "https://*.googleadservices.com",
+    "https://*.doubleclick.net",
+    "https://*.googleusercontent.com"
+  ],
+  "ADS_TXT_LINES": [],
   "JUSO_CONFIRM_KEY": "__PUT_JUSO_CONFIRM_KEY_HERE__",
+  "JUSO_COORD_CONFIRM_KEY": "",
   "BUILDING_HUB_SERVICE_KEY": "__PUT_BUILDING_HUB_SERVICE_KEY_HERE__",
   "LAW_API_OC": "__PUT_LAW_API_OC_HERE__",
   "TERRAIN_DEM_PATH": "",
