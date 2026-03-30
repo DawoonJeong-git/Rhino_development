@@ -123,9 +123,9 @@ const FEATURE_PAGE_DEFINITIONS = Object.freeze([
   {
     id: "contour3dmodel",
     routePath: "/contour3dmodel",
-    title: "3D 대지모형 스튜디오",
+    title: "대지·건물 3D 검토",
     summary:
-      "주소 검색과 지도 선택으로 대상지를 정하고, 지형·건물·도로 맥락을 확인한 뒤 3DM, OBJ, DXF, SKP 파일까지 바로 준비할 수 있는 서비스입니다.",
+      "주소 검색과 지도 선택으로 대상지를 정하고, 토지·건축물 정보와 지형·건물·도로 맥락을 확인한 뒤 3DM, OBJ, DXF, SKP 파일까지 바로 준비할 수 있는 서비스입니다.",
     enabledMeta: [
       { label: "바로가기", value: "/contour3dmodel", code: true },
       { label: "출력 형식", value: "OBJ / DXF / SKP / 3DM" },
@@ -662,10 +662,10 @@ function renderHubHtml(config) {
           <h1>대지 검토 도구</h1>
           <p class="hero-lead">
             주소 검색, 지도 선택, 지형·건물·도로 확인, 3DM·OBJ·DXF·SKP 출력을 제공합니다.
-            현재는 3D 대지모형 스튜디오를 사용할 수 있습니다.
+            현재는 대지·건물 3D 검토 기능을 사용할 수 있습니다.
           </p>
           <div class="hero-actions">
-            <a class="feature-link hero-primary" href="/contour3dmodel">3D 대지모형 열기</a>
+            <a class="feature-link hero-primary" href="/contour3dmodel">대지·건물 3D 열기</a>
             <a class="feature-link is-secondary hero-secondary" href="#services">기능 보기</a>
           </div>
         </div>
@@ -681,7 +681,7 @@ function renderHubHtml(config) {
         </div>
         <ul class="service-list">
           <li>주소 검색, 지도 클릭, 다중 필지, 수동 범위 지정</li>
-          <li>주변 건물, 도로, 지형, 토지 정보 확인</li>
+          <li>토지·건축물 정보와 주변 건물, 도로, 지형 확인</li>
           <li>3DM, OBJ, DXF, SKP 출력</li>
         </ul>
       </section>

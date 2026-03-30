@@ -1035,7 +1035,7 @@ async function runBaselineVerification() {
     assert.equal(featureResponse.status, 200, "Feature route should respond.");
     assert.match(
       featureHtml,
-      /3D 대지모형 스튜디오/,
+      /대지·건물 3D 검토/,
       "Feature page heading should remain visible."
     );
     assert.match(featureHtml, /토지이음 열기/, "Land-use CTA should remain visible.");

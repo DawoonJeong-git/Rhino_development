@@ -210,7 +210,7 @@ function applyStudioChrome() {
   }
 
   if (topbarTitle) {
-    topbarTitle.textContent = "3D 대지모형 스튜디오";
+    topbarTitle.textContent = "대지·건물 3D 검토";
   }
 
   if (topbarSubtitle) {
