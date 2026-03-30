@@ -242,11 +242,29 @@ async function runSiteContextPreview(page, timeoutMs = 120000) {
 }
 
 async function loadLandInfo(page, timeoutMs = 60000) {
-  const hookResult = await callUiVerificationMethod(page, "loadLandInfo");
-  assert.ok(
-    hookResult?.parcelReference?.pnu || hookResult?.state?.selectedLocation?.pnu,
-    "Land info UI hook should resolve a parcel reference."
-  );
+  if (await hasUiVerificationMethod(page, "loadLandInfo")) {
+    const hookResult = await callUiVerificationMethod(page, "loadLandInfo");
+    assert.ok(
+      hookResult?.parcelReference?.pnu || hookResult?.state?.selectedLocation?.pnu,
+      "Land info UI hook should resolve a parcel reference."
+    );
+  } else {
+    await waitForButtonEnabled(page, "#loadLandInfoButton", timeoutMs);
+    const landInfoResponsePromise = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/land-info") &&
+        response.request().method() === "POST",
+      { timeout: timeoutMs }
+    );
+    await page.locator("#loadLandInfoButton").click();
+    const landInfoResponse = await landInfoResponsePromise;
+
+    assert.equal(
+      landInfoResponse.ok(),
+      true,
+      "Land info request should complete successfully."
+    );
+  }
 
   return {
     landInfoSummary: await waitForStableText(
@@ -265,8 +283,32 @@ async function loadLandInfo(page, timeoutMs = 60000) {
 }
 
 async function loadBuildingRegister(page, timeoutMs = 60000) {
-  const hookResult = await callUiVerificationMethod(page, "loadBuildingRegister");
-  assert.ok(hookResult && typeof hookResult === "object", "Building-register UI hook should return a result envelope.");
+  if (await hasUiVerificationMethod(page, "loadBuildingRegister")) {
+    const hookResult = await callUiVerificationMethod(
+      page,
+      "loadBuildingRegister"
+    );
+    assert.ok(
+      hookResult && typeof hookResult === "object",
+      "Building-register UI hook should return a result envelope."
+    );
+  } else {
+    await waitForButtonEnabled(page, "#loadBuildingRegisterButton", timeoutMs);
+    const buildingRegisterResponsePromise = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/building-register") &&
+        response.request().method() === "POST",
+      { timeout: timeoutMs }
+    );
+    await page.locator("#loadBuildingRegisterButton").click();
+    const buildingRegisterResponse = await buildingRegisterResponsePromise;
+
+    assert.equal(
+      buildingRegisterResponse.ok(),
+      true,
+      "Building-register request should complete successfully."
+    );
+  }
 
   return {
     buildingRegisterSummary: await waitForStableText(
@@ -337,6 +379,13 @@ async function downloadModel(page, format, timeoutMs = 120000) {
   return {
     downloadFilename: download.suggestedFilename(),
   };
+}
+
+async function hasUiVerificationMethod(page, methodName) {
+  return page.evaluate((nextMethodName) => {
+    const api = window.__SPACEWORK_UI_TEST__;
+    return Boolean(api && typeof api[nextMethodName] === "function");
+  }, methodName);
 }
 
 async function callUiVerificationMethod(page, methodName, payload) {
