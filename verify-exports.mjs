@@ -27,7 +27,9 @@ import {
   readOrLoadResponseCache,
   resolveEffectiveContourBandInterval,
   resolveRateLimitBucket,
+  resolveSketchUpTerrainSolidSimplifyTolerance,
   resolveTerrainContourPath,
+  simplifySketchUpSolidRegion,
 } from "./server.mjs";
 
 const BASE_URL = process.env.SITE_CONTEXT_BASE_URL || "http://127.0.0.1:3000";
@@ -1551,6 +1553,91 @@ async function runBaselineVerification() {
     assert.ok(
       refinedContourCurves.every(Boolean),
       "SKP contour polylines should be exported as curves."
+    );
+    const stairStepSketchUpSource = cloneJsonValue({
+      ...syntheticContourSiteContext,
+      contourLines: {
+        type: "FeatureCollection",
+        features: [],
+      },
+      terrainGrid: {
+        step: 1,
+        xValues: [0, 1, 2, 3, 4],
+        yValues: [0, 1, 2, 3, 4],
+        elevations: [
+          [10, 10, 10, 10, 10],
+          [10, 11, 11, 11, 11],
+          [10, 11, 12, 12, 12],
+          [10, 11, 12, 13, 13],
+          [10, 11, 12, 13, 14],
+        ],
+        minElevation: 10,
+        maxElevation: 14,
+      },
+      options: {
+        ...syntheticContourSiteContext.options,
+        radius: 120,
+        contourInterval: 1,
+      },
+      dataSources: {
+        contours: {
+          provider: "synthetic-test",
+          mode: "derived",
+          interval: 1,
+        },
+      },
+    });
+    const stairStepSketchUpSiteContext = prepareSiteContextForExport(
+      stairStepSketchUpSource,
+      stairStepSketchUpSource.options,
+      "skp"
+    );
+    const stairStepTolerance = resolveSketchUpTerrainSolidSimplifyTolerance(
+      stairStepSketchUpSiteContext
+    );
+    assert.ok(
+      stairStepTolerance >= 0.5,
+      "SKP contour terrain should apply a meaningful loop simplification tolerance."
+    );
+    const rawStairStepRegion = {
+      outerPoints: [
+        [0, 0],
+        [5, 0],
+        [5, 1],
+        [4, 1],
+        [4, 2],
+        [3, 2],
+        [3, 3],
+        [2, 3],
+        [2, 4],
+        [1, 4],
+        [1, 5],
+        [0, 5],
+      ],
+      holePoints: [],
+    };
+    const simplifiedStairStepRegion = simplifySketchUpSolidRegion(
+      rawStairStepRegion,
+      stairStepTolerance
+    );
+    assert.ok(
+      simplifiedStairStepRegion?.outerPoints?.length > 0,
+      "SKP region simplifier should keep a valid outer loop."
+    );
+    assert.ok(
+      simplifiedStairStepRegion.outerPoints.length <
+        rawStairStepRegion.outerPoints.length,
+      "SKP region simplifier should reduce stair-step terrace edge vertices."
+    );
+    const stairStepSketchUpPayload = buildSketchUpPayloadFromSiteContext(
+      stairStepSketchUpSiteContext
+    );
+    assert.ok(
+      (stairStepSketchUpPayload?.groups || []).some(
+        (group) =>
+          group?.layer === "terrain" && Number(group?.solids?.length || 0) > 0
+      ),
+      "Synthetic stair-step SKP terrain should still generate terrain solids."
     );
     const refinedDxfSiteContext = prepareSiteContextForExport(
       syntheticContourSiteContext,

@@ -118,6 +118,7 @@ const ROAD_LAYER_CANDIDATES = [
 ];
 const openMeteoElevationCache = new Map();
 const geocodeCache = new Map();
+const geocodeInFlight = new Map();
 const siteContextCache = new Map();
 const eumLandPageCache = new Map();
 const eumLandRelationDetailsCache = new Map();
@@ -4563,28 +4564,25 @@ async function hydrateSearchItemsWithReverse(items, config, limit = 5) {
     return items;
   }
 
-  const hydrated = [];
+  return Promise.all(
+    items.map(async (item, index) => {
+      if (
+        index >= limit ||
+        hasSearchParcelReference(item) ||
+        !Number.isFinite(item?.lat) ||
+        !Number.isFinite(item?.lng)
+      ) {
+        return item;
+      }
 
-  for (const item of items) {
-    if (
-      hydrated.length >= limit ||
-      hasSearchParcelReference(item) ||
-      !Number.isFinite(item?.lat) ||
-      !Number.isFinite(item?.lng)
-    ) {
-      hydrated.push(item);
-      continue;
-    }
-
-    try {
-      const reverseResult = await reverseWithVWorld(item.lat, item.lng, config);
-      hydrated.push(mergeSearchReference(item, reverseResult));
-    } catch {
-      hydrated.push(item);
-    }
-  }
-
-  return hydrated;
+      try {
+        const reverseResult = await reverseWithVWorld(item.lat, item.lng, config);
+        return mergeSearchReference(item, reverseResult);
+      } catch {
+        return item;
+      }
+    })
+  );
 }
 
 function sortSearchItemsByParcelConfidence(items, query = "") {
@@ -4773,31 +4771,37 @@ async function finalizeSearchResults(primaryResults, query, config) {
 
 async function geocodeWithPreferredProviders(query, config) {
   const hints = buildSearchQueryHints(query);
-  let vworldItems = [];
-  let jusoItems = [];
   const providerErrors = [];
+  const [vworldResult, jusoResult] = await Promise.all([
+    config.vworldApiKey
+      ? geocodeWithVWorld(query, config)
+          .then((items) => ({ ok: true, items }))
+          .catch((error) => ({ ok: false, error, items: [] }))
+      : Promise.resolve({ ok: true, items: [] }),
+    config.jusoConfirmKey
+      ? searchJuso(query, config)
+          .then((items) => ({ ok: true, items }))
+          .catch((error) => ({ ok: false, error, items: [] }))
+      : Promise.resolve({ ok: true, items: [] }),
+  ]);
+  const vworldItems = vworldResult.items || [];
+  const jusoItems = jusoResult.items || [];
 
-  if (config.vworldApiKey) {
-    try {
-      vworldItems = await geocodeWithVWorld(query, config);
-    } catch (error) {
-      providerErrors.push(error);
-      if (!config.useNominatimFallback) {
-        throw error;
-      }
-    }
+  if (!vworldResult.ok && vworldResult.error) {
+    providerErrors.push(vworldResult.error);
   }
 
-  if (config.jusoConfirmKey) {
-    try {
-      jusoItems = await searchJuso(query, config);
-    } catch (error) {
-      providerErrors.push(error);
+  if (!jusoResult.ok && jusoResult.error) {
+    providerErrors.push(jusoResult.error);
+  }
 
-      if (!config.useNominatimFallback) {
-        throw error;
-      }
-    }
+  if (
+    providerErrors.length &&
+    !config.useNominatimFallback &&
+    !vworldItems.length &&
+    !jusoItems.length
+  ) {
+    throw providerErrors[0];
   }
 
   if (hints.parcelReference && !vworldItems.length && !jusoItems.length) {
@@ -4823,15 +4827,13 @@ async function geocodeWithPreferredProviders(query, config) {
 
   if (vworldItems.length && jusoItems.length) {
     const { merged, remainingJuso } = mergeVWorldAndJuso(vworldItems, jusoItems);
-    const hydrated = [];
-
-    for (const candidate of remainingJuso.slice(0, 4)) {
-      const item = await geocodeJusoCandidate(candidate, config);
-
-      if (item) {
-        hydrated.push(item);
-      }
-    }
+    const hydrated = (
+      await Promise.all(
+        remainingJuso.slice(0, 4).map((candidate) =>
+          geocodeJusoCandidate(candidate, config).catch(() => null)
+        )
+      )
+    ).filter(Boolean);
 
     const combined = await hydrateSearchItemsWithReverse(
       [...merged, ...hydrated],
@@ -4853,15 +4855,13 @@ async function geocodeWithPreferredProviders(query, config) {
   }
 
   if (jusoItems.length) {
-    const hydrated = [];
-
-    for (const candidate of jusoItems.slice(0, 5)) {
-      const item = await geocodeJusoCandidate(candidate, config);
-
-      if (item) {
-        hydrated.push(item);
-      }
-    }
+    const hydrated = (
+      await Promise.all(
+        jusoItems.slice(0, 5).map((candidate) =>
+          geocodeJusoCandidate(candidate, config).catch(() => null)
+        )
+      )
+    ).filter(Boolean);
 
     return {
       provider: hydrated.length ? "juso+geocoded" : "juso",
@@ -10586,6 +10586,159 @@ function simplifyLocalPolygon(points, toleranceMeters = 0.001) {
   return simplified.length >= 3 ? simplified : polygon;
 }
 
+function distancePointToLocalSegment(point, segmentStart, segmentEnd) {
+  const [px, py] = point || [];
+  const [x1, y1] = segmentStart || [];
+  const [x2, y2] = segmentEnd || [];
+
+  if (
+    !Number.isFinite(px) ||
+    !Number.isFinite(py) ||
+    !Number.isFinite(x1) ||
+    !Number.isFinite(y1) ||
+    !Number.isFinite(x2) ||
+    !Number.isFinite(y2)
+  ) {
+    return 0;
+  }
+
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const squaredLength = dx * dx + dy * dy;
+
+  if (squaredLength <= 1e-12) {
+    return Math.hypot(px - x1, py - y1);
+  }
+
+  const ratio = Math.max(
+    0,
+    Math.min(1, ((px - x1) * dx + (py - y1) * dy) / squaredLength)
+  );
+  const projectedX = x1 + dx * ratio;
+  const projectedY = y1 + dy * ratio;
+
+  return Math.hypot(px - projectedX, py - projectedY);
+}
+
+function simplifyLocalPolylineDouglasPeucker(points, toleranceMeters = 0.001) {
+  const tolerance = Math.max(0.001, Number(toleranceMeters) || 0);
+  const normalized = [];
+
+  for (const point of points || []) {
+    if (
+      !Array.isArray(point) ||
+      point.length < 2 ||
+      !Number.isFinite(point[0]) ||
+      !Number.isFinite(point[1])
+    ) {
+      continue;
+    }
+
+    if (
+      !normalized.length ||
+      !pointsMatchInMeters(
+        normalized[normalized.length - 1],
+        point,
+        Math.max(0.001, tolerance * 0.25)
+      )
+    ) {
+      normalized.push([Number(point[0]), Number(point[1])]);
+    }
+  }
+
+  if (normalized.length <= 2) {
+    return normalized;
+  }
+
+  const keep = new Array(normalized.length).fill(false);
+  keep[0] = true;
+  keep[normalized.length - 1] = true;
+  const ranges = [[0, normalized.length - 1]];
+
+  while (ranges.length) {
+    const [startIndex, endIndex] = ranges.pop();
+    let farthestIndex = -1;
+    let farthestDistance = -1;
+
+    for (let index = startIndex + 1; index < endIndex; index += 1) {
+      const distance = distancePointToLocalSegment(
+        normalized[index],
+        normalized[startIndex],
+        normalized[endIndex]
+      );
+
+      if (distance > farthestDistance) {
+        farthestDistance = distance;
+        farthestIndex = index;
+      }
+    }
+
+    if (farthestIndex !== -1 && farthestDistance > tolerance) {
+      keep[farthestIndex] = true;
+      ranges.push([startIndex, farthestIndex], [farthestIndex, endIndex]);
+    }
+  }
+
+  const simplified = normalized.filter((_, index) => keep[index]);
+  return simplified.length >= 2 ? simplified : normalized;
+}
+
+function simplifyLocalPolygonDouglasPeucker(points, toleranceMeters = 0.001) {
+  const polygon = dedupeLocalPolygonPoints(
+    points,
+    Math.max(0.001, (Number(toleranceMeters) || 0) * 0.2)
+  );
+
+  if (polygon.length < 3) {
+    return polygon;
+  }
+
+  const tolerance = Math.max(0.001, Number(toleranceMeters) || 0);
+  let anchorIndex = 0;
+  let farthestDistance = -1;
+  const centroid = polygon.reduce(
+    (accumulator, [xMeters, yMeters]) => {
+      accumulator.x += xMeters;
+      accumulator.y += yMeters;
+      return accumulator;
+    },
+    { x: 0, y: 0 }
+  );
+  centroid.x /= polygon.length;
+  centroid.y /= polygon.length;
+
+  for (let index = 0; index < polygon.length; index += 1) {
+    const point = polygon[index];
+    const distance = Math.hypot(point[0] - centroid.x, point[1] - centroid.y);
+
+    if (distance > farthestDistance) {
+      farthestDistance = distance;
+      anchorIndex = index;
+    }
+  }
+
+  const rotated = polygon
+    .slice(anchorIndex)
+    .concat(polygon.slice(0, anchorIndex));
+  const simplifiedOpen = simplifyLocalPolylineDouglasPeucker(
+    [...rotated, rotated[0]],
+    tolerance
+  );
+
+  if (
+    simplifiedOpen.length >= 2 &&
+    pointsMatchInMeters(
+      simplifiedOpen[0],
+      simplifiedOpen[simplifiedOpen.length - 1],
+      Math.max(0.001, tolerance * 0.25)
+    )
+  ) {
+    simplifiedOpen.pop();
+  }
+
+  return simplifiedOpen.length >= 3 ? simplifiedOpen : polygon;
+}
+
 function buildLocalPointKey(point, decimals = 3) {
   return `${point[0].toFixed(decimals)},${point[1].toFixed(decimals)}`;
 }
@@ -13678,6 +13831,60 @@ function buildSketchUpPrismSolidDefinition(
   );
 }
 
+function resolveSketchUpTerrainSolidSimplifyTolerance(siteContext) {
+  if (
+    !isSketchUpExportFormat(siteContext) ||
+    siteContext?.options?.terrainMode !== "contour"
+  ) {
+    return 0;
+  }
+
+  const terrainStep = Number(siteContext?.terrainGrid?.step || 0);
+  const sourceContourInterval = resolveSourceContourInterval(siteContext);
+  const radiusMeters = Math.max(30, Number(siteContext?.options?.radius) || 120);
+  const baseTolerance = Math.max(
+    0.15,
+    terrainStep > 0 ? terrainStep * 0.9 : 0,
+    sourceContourInterval > 0 ? sourceContourInterval * 0.2 : 0
+  );
+  const scaledTolerance =
+    radiusMeters <= 120
+      ? baseTolerance
+      : radiusMeters <= 220
+        ? baseTolerance * 1.15
+        : baseTolerance * 1.3;
+
+  return Number(Math.max(0.15, Math.min(1.2, scaledTolerance)).toFixed(3));
+}
+
+function simplifySketchUpSolidRegion(region, toleranceMeters = 0) {
+  const tolerance = Number(toleranceMeters) || 0;
+
+  if (!region || tolerance <= 0.05) {
+    return region;
+  }
+
+  const outerPoints = simplifyLocalPolygonDouglasPeucker(
+    region.outerPoints || [],
+    tolerance
+  );
+
+  if (outerPoints.length < 3) {
+    return region;
+  }
+
+  const holeTolerance = Math.max(0.08, Math.min(0.9, tolerance * 0.8));
+  const holePoints = (region.holePoints || [])
+    .map((ring) => simplifyLocalPolygonDouglasPeucker(ring, holeTolerance))
+    .filter((ring) => ring.length >= 3);
+
+  return {
+    ...region,
+    outerPoints,
+    holePoints,
+  };
+}
+
 function buildSketchUpPrismGroup(
   layer,
   objectName,
@@ -13745,7 +13952,15 @@ function createSketchUpSegmentSolidBuckets() {
   };
 }
 
-function appendSketchUpTerrainSegmentSolids(buckets, segments, topElevation, bottomElevation) {
+function appendSketchUpTerrainSegmentSolids(
+  buckets,
+  segments,
+  topElevation,
+  bottomElevation,
+  siteContext = null
+) {
+  const simplifyTolerance = resolveSketchUpTerrainSolidSimplifyTolerance(siteContext);
+
   for (const segment of segments || []) {
     const groupIndex =
       segment?.kind === "parcel" && Number.isInteger(segment?.groupIndex)
@@ -13763,8 +13978,12 @@ function appendSketchUpTerrainSegmentSolids(buckets, segments, topElevation, bot
         : buckets.context;
 
     for (const region of segment.regions || []) {
+      const exportRegion =
+        simplifyTolerance > 0
+          ? simplifySketchUpSolidRegion(region, simplifyTolerance)
+          : region;
       const terrainSolid = buildSketchUpRegionSolidDefinition(
-        region,
+        exportRegion,
         topElevation,
         bottomElevation
       );
@@ -13838,7 +14057,8 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
         terrainSolidBuckets,
         flatSegments,
         flatTopElevation,
-        baseElevation
+        baseElevation,
+        siteContext
       );
     } else {
       if (clipPolygon.length >= 3 && minBandElevation > baseElevation + 0.001) {
@@ -13850,7 +14070,8 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
           terrainSolidBuckets,
           baseSegments,
           minBandElevation,
-          baseElevation
+          baseElevation,
+          siteContext
         );
       }
 
@@ -13868,7 +14089,8 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
           terrainSolidBuckets,
           groupSegments,
           group.topElevation,
-          effectiveBottomElevation
+          effectiveBottomElevation,
+          siteContext
         );
       }
     }
@@ -13957,7 +14179,8 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
           roadSolidBuckets,
           groupSegments,
           topElevation,
-          bottomElevation
+          bottomElevation,
+          siteContext
         );
       }
     }
@@ -18267,21 +18490,42 @@ async function createApp() {
           return;
         }
 
+        const startedAt = Date.now();
         console.log(`[search-api] query="${query}"`);
 
         const cachedResponse = readGeocodeCache(query);
 
         if (cachedResponse) {
+          console.log(
+            `[search-api] query="${query}" provider="${cachedResponse.provider || "unknown"}" results=${Number(
+              cachedResponse.results?.length || 0
+            )} cache=hit ms=${Date.now() - startedAt}`
+          );
           sendJson(response, 200, cachedResponse);
           return;
         }
 
-        const { provider, results } = await geocodeWithPreferredProviders(
-          query,
-          config
+        const payload = await readOrLoadResponseCache(
+          geocodeCache,
+          geocodeInFlight,
+          buildGeocodeCacheKey(query),
+          async () => {
+            const { provider, results } = await geocodeWithPreferredProviders(
+              query,
+              config
+            );
+            return { provider, results };
+          },
+          {
+            ttlMs: GEOCODE_CACHE_TTL_MS,
+            maxEntries: GEOCODE_CACHE_MAX_ENTRIES,
+          }
         );
-        const payload = { provider, results };
-        writeGeocodeCache(query, payload);
+        console.log(
+          `[search-api] query="${query}" provider="${payload.provider || "unknown"}" results=${Number(
+            payload.results?.length || 0
+          )} cache=miss ms=${Date.now() - startedAt}`
+        );
         sendJson(response, 200, payload);
         return;
       }
@@ -18895,11 +19139,14 @@ export {
   prepareSiteContextForExport,
   pruneCacheEntries,
   readOrLoadResponseCache,
+  resolveSketchUpTerrainSolidSimplifyTolerance,
   resolveRateLimitBucket,
   resolveRawTerrainHeightAtLocalPoint,
   resolveEffectiveContourBandInterval,
   resolveTerrainContourPath,
   siteHeightAtLocalPoint,
+  simplifyLocalPolygonDouglasPeucker,
+  simplifySketchUpSolidRegion,
 };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
