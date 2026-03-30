@@ -256,6 +256,12 @@ h2 {
   border: 1px solid rgba(77, 102, 72, 0.16);
 }
 
+.feature-link.is-disabled {
+  cursor: default;
+  opacity: 0.82;
+  pointer-events: none;
+}
+
 .roadmap-card {
   display: grid;
   gap: 12px;

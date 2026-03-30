@@ -884,6 +884,16 @@ async function runBaselineVerification() {
       /\/contour3dmodel/,
       "Hub page should link to the feature route."
     );
+    assert.match(
+      hubHtml,
+      /문화재 발굴 위험도 지도/,
+      "Hub page should still introduce the heritage-risk feature on the public roadmap."
+    );
+    assert.match(
+      hubHtml,
+      /법규 기반 최대 매스 생성/,
+      "Hub page should still introduce the max-mass feature on the public roadmap."
+    );
     assert.doesNotMatch(
       hubHtml,
       /\/heritage-risk/,
