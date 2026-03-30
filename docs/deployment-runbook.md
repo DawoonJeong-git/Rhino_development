@@ -6,7 +6,7 @@ Use this exact sequence right before release:
 
 1. Copy `.env.production.example` to `.env.production` and fill in real keys.
 2. Keep `HOST_BIND_IP=127.0.0.1` unless you intentionally expose the app behind a trusted reverse proxy or access layer.
-3. Confirm `VWORLD_API_DOMAIN` matches the real HTTPS origin.
+3. Confirm `VWORLD_API_DOMAIN` is valid for the registered VWorld origin, and set `PUBLIC_BASE_URL` when the real public HTTPS origin is different.
 4. Copy the contour dataset to the server and set `TERRAIN_CONTOUR_HOST_PATH`, `TERRAIN_CONTOUR_PATH`, and `TERRAIN_CONTOUR_CRS`.
 5. If you need server-side `.skp`, provide a real standalone exporter binary and set `SKP_EXPORTER_CLI`. Otherwise leave it blank and use OBJ/3DM or `skp-payload`.
 6. Run `npm run verify:deployment-security`.

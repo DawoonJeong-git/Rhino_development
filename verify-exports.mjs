@@ -824,10 +824,10 @@ async function runBaselineVerification() {
 
     assert.deepEqual(
       buildVWorldDomainCandidates({
-        vworldApiDomain: "https://app.spaceswork.net",
+        vworldApiDomain: "https://spaceswork.net",
         port: 3012,
       }),
-      ["https://app.spaceswork.net", "http://localhost:3012"],
+      ["https://spaceswork.net", "http://localhost:3012"],
       "VWorld requests should keep the configured domain first but also retain localhost as a fallback candidate."
     );
     const appSource = await readFile(

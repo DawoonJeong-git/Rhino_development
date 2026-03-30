@@ -8,6 +8,20 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Get-NormalizedHttpsUrl {
+  param(
+    [string]$Value
+  )
+
+  $normalizedValue = [string]$Value
+
+  if ($normalizedValue -match '^https://') {
+    return $normalizedValue.TrimEnd('/')
+  }
+
+  return ""
+}
+
 function Get-ServerPort {
   param(
     [string]$RepoRoot
@@ -39,9 +53,9 @@ function Get-PublicBaseUrl {
     [string]$RepoRoot
   )
 
-  $overrideUrl = [string]$env:VERIFY_RELEASE_PUBLIC_BASE_URL
-  if ($overrideUrl -match '^https://') {
-    return $overrideUrl.TrimEnd('/')
+  $overrideUrl = Get-NormalizedHttpsUrl -Value ([string]$env:VERIFY_RELEASE_PUBLIC_BASE_URL)
+  if ($overrideUrl) {
+    return $overrideUrl
   }
 
   $configPath = Join-Path $RepoRoot "config.local.json"
@@ -51,10 +65,16 @@ function Get-PublicBaseUrl {
 
   try {
     $config = Get-Content $configPath -Raw | ConvertFrom-Json
-    $resolvedUrl = [string]$config.VWORLD_API_DOMAIN
+    $resolvedPublicBaseUrl = Get-NormalizedHttpsUrl -Value ([string]$config.PUBLIC_BASE_URL)
 
-    if ($resolvedUrl -match '^https://') {
-      return $resolvedUrl.TrimEnd('/')
+    if ($resolvedPublicBaseUrl) {
+      return $resolvedPublicBaseUrl
+    }
+
+    $resolvedUrl = Get-NormalizedHttpsUrl -Value ([string]$config.VWORLD_API_DOMAIN)
+
+    if ($resolvedUrl) {
+      return $resolvedUrl
     }
   } catch {
     return ""

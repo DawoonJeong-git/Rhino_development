@@ -111,6 +111,7 @@ Fill in:
 
 - `VWORLD_API_KEY`
 - `VWORLD_API_DOMAIN`
+- `PUBLIC_BASE_URL` if your real public HTTPS address is different from the VWorld-registered domain
 - `JUSO_CONFIRM_KEY`
 - `BUILDING_HUB_SERVICE_KEY`
 - `LAW_API_OC`
@@ -123,6 +124,8 @@ Important:
 
 - keep separate `config.local.json` files in `C:\SpaceWork_develop` and `C:\SpaceWork_deploy`
 - production should only read the config inside `C:\SpaceWork_deploy`
+- if VWorld is only registered for `http://localhost:3000`, you can keep `VWORLD_API_DOMAIN=http://localhost:3000` even when the public site uses a Cloudflare Tunnel hostname such as `https://spaceswork.net`
+- set `PUBLIC_BASE_URL` to the real public HTTPS origin when you want `deploy/update-home-prod.ps1` to run the public smoke against the tunnel hostname separately from `VWORLD_API_DOMAIN`
 
 ## Step 3. Start the App Locally
 
@@ -269,14 +272,15 @@ If the home PC is the same machine you use for development, keep the public app 
 powershell -ExecutionPolicy Bypass -File deploy\update-home-prod.ps1
 ```
 
-That update script now does four things in order:
+That update script now does the following in order:
 
 1. pulls the latest Git commit into `C:\SpaceWork_deploy`
 2. refreshes `node_modules`
 3. restarts the managed production server
 4. runs `node scripts/verify-release.mjs --base-url http://127.0.0.1:3000`
-5. if `config.local.json` has an HTTPS `VWORLD_API_DOMAIN`, also runs a public smoke against that real share origin
-6. that public smoke confirms the share origin serves `/api/health` and still blocks `/api/runtime-stats` with `403`
+5. if `config.local.json` has an HTTPS `PUBLIC_BASE_URL`, also runs a public smoke against that real share origin
+6. otherwise, if `config.local.json` has an HTTPS `VWORLD_API_DOMAIN`, uses that as the public smoke origin
+7. that public smoke confirms the share origin serves `/api/health` and still blocks `/api/runtime-stats` with `403`
 
 Each run now leaves a timestamped report and `latest.json` in `C:\SpaceWork_deploy\logs\verify-release`, so you can trace which commit passed or failed after each update.
 

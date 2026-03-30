@@ -7,6 +7,7 @@ Set these in the deployment environment instead of committing real values:
 - `PORT`
 - `VWORLD_API_KEY`
 - `VWORLD_API_DOMAIN`
+- `PUBLIC_BASE_URL`
 - `JUSO_CONFIRM_KEY`
 - `BUILDING_HUB_SERVICE_KEY`
 - `LAW_API_OC`
@@ -19,7 +20,8 @@ Set these in the deployment environment instead of committing real values:
 
 Recommended:
 
-- Set `VWORLD_API_DOMAIN` to the real production origin.
+- Keep `VWORLD_API_DOMAIN` aligned with the VWorld-registered origin.
+- Set `PUBLIC_BASE_URL` to the real public HTTPS share origin when it differs from `VWORLD_API_DOMAIN`.
 - Keep `USE_NOMINATIM_FALLBACK=true` only as a safety net, not as the main search path.
 - Do not expose service keys in frontend code.
 - Leave `SKP_EXPORTER_CLI` empty unless the deployed host actually includes a standalone SKP exporter binary.
