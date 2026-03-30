@@ -530,6 +530,10 @@ async function runBaselineVerification() {
       "Runtime stats should expose a recent slow API request list."
     );
     assert.ok(
+      Array.isArray(runtimeStatsPayload?.telemetry?.recentGeocodeEvents),
+      "Runtime stats should expose a recent geocode event list."
+    );
+    assert.ok(
       Array.isArray(runtimeStatsPayload?.telemetry?.recentUpstreamEvents),
       "Runtime stats should expose a recent upstream event list."
     );

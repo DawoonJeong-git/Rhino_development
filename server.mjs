@@ -210,6 +210,7 @@ const roadContourSurfaceGroupCache = new WeakMap();
 const siteContextGeometrySignatureCache = new WeakMap();
 const recentSlowApiRequestEvents = [];
 const recentUpstreamEvents = [];
+const recentGeocodeEvents = [];
 const eumLandPageInFlight = new Map();
 const eumLandRelationDetailsInFlight = new Map();
 const buildingRegisterSummaryInFlight = new Map();
@@ -330,6 +331,41 @@ function recordUpstreamTelemetry(event = {}) {
     timeoutMs: Math.max(0, Math.round(Number(event?.timeoutMs) || 0)) || null,
     durationMs: normalizedDurationMs,
     error: truncateTelemetryText(event?.error || ""),
+  });
+}
+
+function appendGeocodeTraceStage(trace, stage = {}) {
+  if (!trace || !Array.isArray(trace.stages) || !stage) {
+    return;
+  }
+
+  trace.stages.push({
+    name: truncateTelemetryText(stage?.name || "geocode", 80),
+    outcome: truncateTelemetryText(stage?.outcome || "ok", 40),
+    durationMs: Math.max(0, Math.round(Number(stage?.durationMs) || 0)),
+    count: Number.isFinite(stage?.count) ? Number(stage.count) : null,
+    note: truncateTelemetryText(stage?.note || "", 120),
+  });
+}
+
+function recordGeocodeTelemetry(event = {}) {
+  pushTelemetryEvent(recentGeocodeEvents, {
+    query: truncateTelemetryText(event?.query || "", 120),
+    provider: truncateTelemetryText(event?.provider || "", 60),
+    branch: truncateTelemetryText(event?.branch || "", 60),
+    cacheStatus: truncateTelemetryText(event?.cacheStatus || "", 20),
+    resultCount: Math.max(0, Math.round(Number(event?.resultCount) || 0)),
+    totalMs: Math.max(0, Math.round(Number(event?.totalMs) || 0)),
+    error: truncateTelemetryText(event?.error || "", 160),
+    stages: Array.isArray(event?.stages)
+      ? event.stages.slice(-12).map((stage) => ({
+          name: truncateTelemetryText(stage?.name || "geocode", 80),
+          outcome: truncateTelemetryText(stage?.outcome || "ok", 40),
+          durationMs: Math.max(0, Math.round(Number(stage?.durationMs) || 0)),
+          count: Number.isFinite(stage?.count) ? Number(stage.count) : null,
+          note: truncateTelemetryText(stage?.note || "", 120),
+        }))
+      : [],
   });
 }
 
@@ -5517,26 +5553,81 @@ async function finalizeSearchResults(primaryResults, query, config) {
   }
 }
 
-async function geocodeWithPreferredProviders(query, config) {
+async function geocodeWithPreferredProviders(query, config, trace = null) {
   const hints = buildSearchQueryHints(query);
   const searchProfile = buildSearchResponseProfile(hints);
   const vworldCategories = resolveVWorldSearchCategories(hints);
   const sharedVworldBudgetMs = hints.roadAddressQuery ? 700 : 500;
   const providerErrors = [];
+  const vworldSearchStartedAt = Date.now();
   const vworldPromise = config.vworldApiKey
     ? geocodeWithVWorld(query, config, {
         resultLimit: searchProfile.providerResultLimit,
       })
-        .then((items) => ({ ok: true, items }))
-        .catch((error) => ({ ok: false, error, items: [] }))
-    : Promise.resolve({ ok: true, items: [] });
+        .then((items) => {
+          appendGeocodeTraceStage(trace, {
+            name: "vworld-search",
+            outcome: "ok",
+            durationMs: Date.now() - vworldSearchStartedAt,
+            count: items.length,
+            note: vworldCategories.join("+"),
+          });
+          return { ok: true, items };
+        })
+        .catch((error) => {
+          appendGeocodeTraceStage(trace, {
+            name: "vworld-search",
+            outcome: "error",
+            durationMs: Date.now() - vworldSearchStartedAt,
+            count: 0,
+            note: error?.message || error,
+          });
+          return { ok: false, error, items: [] };
+        })
+    : (() => {
+        appendGeocodeTraceStage(trace, {
+          name: "vworld-search",
+          outcome: "skipped",
+          durationMs: 0,
+          count: 0,
+          note: "no-key",
+        });
+        return Promise.resolve({ ok: true, items: [] });
+      })();
+  const jusoSearchStartedAt = Date.now();
   const jusoPromise = config.jusoConfirmKey
     ? searchJuso(query, config, {
         resultLimit: searchProfile.providerResultLimit,
       })
-        .then((items) => ({ ok: true, items }))
-        .catch((error) => ({ ok: false, error, items: [] }))
-    : Promise.resolve({ ok: true, items: [] });
+        .then((items) => {
+          appendGeocodeTraceStage(trace, {
+            name: "juso-search",
+            outcome: "ok",
+            durationMs: Date.now() - jusoSearchStartedAt,
+            count: items.length,
+          });
+          return { ok: true, items };
+        })
+        .catch((error) => {
+          appendGeocodeTraceStage(trace, {
+            name: "juso-search",
+            outcome: "error",
+            durationMs: Date.now() - jusoSearchStartedAt,
+            count: 0,
+            note: error?.message || error,
+          });
+          return { ok: false, error, items: [] };
+        })
+    : (() => {
+        appendGeocodeTraceStage(trace, {
+          name: "juso-search",
+          outcome: "skipped",
+          durationMs: 0,
+          count: 0,
+          note: "no-key",
+        });
+        return Promise.resolve({ ok: true, items: [] });
+      })();
   const jusoResult = await jusoPromise;
   const jusoItems = jusoResult.items || [];
   let resolvedVworldResult = null;
@@ -5558,6 +5649,7 @@ async function geocodeWithPreferredProviders(query, config) {
       return { ...resolvedVworldResult, timedOut: false };
     }
 
+    const waitStartedAt = Date.now();
     const outcome = await Promise.race([
       readVWorldResult().then((result) => ({ timedOut: false, result })),
       waitForRetryDelay(timeoutMs).then(() => ({
@@ -5566,10 +5658,29 @@ async function geocodeWithPreferredProviders(query, config) {
       })),
     ]);
 
-    return {
+    const result = {
       ...outcome.result,
       timedOut: outcome.timedOut,
     };
+
+    appendGeocodeTraceStage(trace, {
+      name: "vworld-shared-wait",
+      outcome: outcome.timedOut ? "timeout" : "ok",
+      durationMs: Date.now() - waitStartedAt,
+      count: Array.isArray(result?.items) ? result.items.length : 0,
+      note: outcome.timedOut ? `budget=${timeoutMs}` : "",
+    });
+
+    return result;
+  }
+
+  function buildGeocodeOutcome(provider, results, branch = provider) {
+    if (trace && typeof trace === "object") {
+      trace.provider = provider;
+      trace.branch = branch;
+    }
+
+    return { provider, results };
   }
 
   const jusoFastPathCandidates =
@@ -5582,6 +5693,7 @@ async function geocodeWithPreferredProviders(query, config) {
     const fastVworldResult = config.vworldApiKey
       ? await readVWorldResultWithinBudget()
       : { ok: true, items: [], timedOut: false };
+    const fastPathStartedAt = Date.now();
     const fastJusoResults = (
       await Promise.all(
         jusoFastPathCandidates.map((candidate) =>
@@ -5598,6 +5710,13 @@ async function geocodeWithPreferredProviders(query, config) {
         )
       )
     ).filter(Boolean);
+    appendGeocodeTraceStage(trace, {
+      name: "juso-fast-path",
+      outcome: fastJusoResults.length ? "ok" : "empty",
+      durationMs: Date.now() - fastPathStartedAt,
+      count: fastJusoResults.length,
+      note: `candidates=${jusoFastPathCandidates.length}`,
+    });
 
     if (fastJusoResults.length) {
       const fastProvider =
@@ -5610,10 +5729,11 @@ async function geocodeWithPreferredProviders(query, config) {
           : fastJusoResults[0]?.provider === "juso+coord"
             ? "juso+coord-fast"
             : fastJusoResults[0]?.provider || "juso-fast";
-      return {
-        provider: fastProvider,
-        results: normalizeSearchResultsForQuery(fastJusoResults, query),
-      };
+      return buildGeocodeOutcome(
+        fastProvider,
+        normalizeSearchResultsForQuery(fastJusoResults, query),
+        "juso-fast-path"
+      );
     }
   }
 
@@ -5625,6 +5745,7 @@ async function geocodeWithPreferredProviders(query, config) {
     const sharedVworldResult = config.vworldApiKey
       ? await readVWorldResultWithinBudget()
       : { ok: true, items: [], timedOut: false };
+    const shortCircuitStartedAt = Date.now();
     const directJusoResults = (
       await Promise.all(
         [shortCircuitJusoCandidate].map((candidate) =>
@@ -5638,16 +5759,23 @@ async function geocodeWithPreferredProviders(query, config) {
         )
       )
     ).filter(Boolean);
+    appendGeocodeTraceStage(trace, {
+      name: "juso-short-circuit",
+      outcome: directJusoResults.length ? "ok" : "empty",
+      durationMs: Date.now() - shortCircuitStartedAt,
+      count: directJusoResults.length,
+    });
 
     if (directJusoResults.length) {
-      return {
-        provider: directJusoResults[0]?.provider || "juso+geocoded",
-        results: await finalizeSearchResults(
+      return buildGeocodeOutcome(
+        directJusoResults[0]?.provider || "juso+geocoded",
+        await finalizeSearchResults(
           await hydrateSearchItemsWithReverse(directJusoResults, config, 1),
           query,
           config
         ),
-      };
+        "juso-short-circuit"
+      );
     }
   }
 
@@ -5680,10 +5808,11 @@ async function geocodeWithPreferredProviders(query, config) {
       );
 
       if (parcelFallbackResults.length) {
-        return {
-          provider: "vworld-data",
-          results: normalizeSearchResultsForQuery(parcelFallbackResults, query),
-        };
+        return buildGeocodeOutcome(
+          "vworld-data",
+          normalizeSearchResultsForQuery(parcelFallbackResults, query),
+          "parcel-data-fallback"
+        );
       }
     } catch (error) {
       console.warn(
@@ -5721,10 +5850,11 @@ async function geocodeWithPreferredProviders(query, config) {
       searchProfile.reverseHydrationLimit
     );
 
-    return {
-      provider: hydrated.length ? "vworld+juso" : "vworld",
-      results: await finalizeSearchResults(combined, query, config),
-    };
+    return buildGeocodeOutcome(
+      hydrated.length ? "vworld+juso" : "vworld",
+      await finalizeSearchResults(combined, query, config),
+      "vworld-juso-merge"
+    );
   }
 
   if (vworldItems.length) {
@@ -5733,13 +5863,15 @@ async function geocodeWithPreferredProviders(query, config) {
       config,
       searchProfile.reverseHydrationLimit
     );
-    return {
-      provider: "vworld",
-      results: await finalizeSearchResults(hydrated, query, config),
-    };
+    return buildGeocodeOutcome(
+      "vworld",
+      await finalizeSearchResults(hydrated, query, config),
+      "vworld-only"
+    );
   }
 
   if (jusoItems.length) {
+    const jusoHydrationStartedAt = Date.now();
     const hydrated = (
       await Promise.all(
         jusoItems.slice(0, searchProfile.jusoHydrationLimit).map((candidate) =>
@@ -5751,11 +5883,19 @@ async function geocodeWithPreferredProviders(query, config) {
         )
       )
     ).filter(Boolean);
+    appendGeocodeTraceStage(trace, {
+      name: "juso-hydration",
+      outcome: hydrated.length ? "ok" : "empty",
+      durationMs: Date.now() - jusoHydrationStartedAt,
+      count: hydrated.length,
+      note: `limit=${searchProfile.jusoHydrationLimit}`,
+    });
 
-    return {
-      provider: hydrated.length ? "juso+geocoded" : "juso",
-      results: await finalizeSearchResults(hydrated, query, config),
-    };
+    return buildGeocodeOutcome(
+      hydrated.length ? "juso+geocoded" : "juso",
+      await finalizeSearchResults(hydrated, query, config),
+      "juso-only"
+    );
   }
 
   if (config.useNominatimFallback) {
@@ -5781,13 +5921,14 @@ async function geocodeWithPreferredProviders(query, config) {
       );
     }
 
-    return {
-      provider: parcelFallbackResults.length ? "nominatim+vworld-data" : "nominatim",
-      results: normalizeSearchResultsForQuery(
+    return buildGeocodeOutcome(
+      parcelFallbackResults.length ? "nominatim+vworld-data" : "nominatim",
+      normalizeSearchResultsForQuery(
         parcelFallbackResults.length ? parcelFallbackResults : fallbackResults,
         query
       ),
-    };
+      "nominatim-fallback"
+    );
   }
 
   if (providerErrors.length) {
@@ -5796,10 +5937,7 @@ async function geocodeWithPreferredProviders(query, config) {
     );
   }
 
-  return {
-    provider: "none",
-    results: [],
-  };
+  return buildGeocodeOutcome("none", [], "none");
 }
 
 function extractPnuFromValue(value) {
@@ -17048,6 +17186,12 @@ function buildRuntimeStatsPayload() {
     },
     telemetry: {
       recentSlowApiRequests: recentSlowApiRequestEvents.map((entry) => ({ ...entry })),
+      recentGeocodeEvents: recentGeocodeEvents.map((entry) => ({
+        ...entry,
+        stages: Array.isArray(entry?.stages)
+          ? entry.stages.map((stage) => ({ ...stage }))
+          : [],
+      })),
       recentUpstreamEvents: recentUpstreamEvents.map((entry) => ({ ...entry })),
     },
   };
@@ -19528,11 +19672,21 @@ async function createApp() {
         }
 
         const startedAt = Date.now();
+        const geocodeTrace = { query, stages: [] };
         console.log(`[search-api] query="${query}"`);
 
         const cachedResponse = readGeocodeCache(query);
 
         if (cachedResponse) {
+          recordGeocodeTelemetry({
+            query,
+            provider: cachedResponse.provider || "",
+            branch: "cache-hit",
+            cacheStatus: "hit",
+            resultCount: Number(cachedResponse.results?.length || 0),
+            totalMs: Date.now() - startedAt,
+            stages: [],
+          });
           console.log(
             `[search-api] query="${query}" provider="${cachedResponse.provider || "unknown"}" results=${Number(
               cachedResponse.results?.length || 0
@@ -19542,28 +19696,52 @@ async function createApp() {
           return;
         }
 
-        const payload = await readOrLoadResponseCache(
-          geocodeCache,
-          geocodeInFlight,
-          buildGeocodeCacheKey(query),
-          async () => {
-            const { provider, results } = await geocodeWithPreferredProviders(
-              query,
-              config
-            );
-            return { provider, results };
-          },
-          {
-            ttlMs: GEOCODE_CACHE_TTL_MS,
-            maxEntries: GEOCODE_CACHE_MAX_ENTRIES,
-          }
-        );
-        console.log(
-          `[search-api] query="${query}" provider="${payload.provider || "unknown"}" results=${Number(
-            payload.results?.length || 0
-          )} cache=miss ms=${Date.now() - startedAt}`
-        );
-        sendJson(response, 200, payload);
+        try {
+          const payload = await readOrLoadResponseCache(
+            geocodeCache,
+            geocodeInFlight,
+            buildGeocodeCacheKey(query),
+            async () => {
+              const { provider, results } = await geocodeWithPreferredProviders(
+                query,
+                config,
+                geocodeTrace
+              );
+              return { provider, results };
+            },
+            {
+              ttlMs: GEOCODE_CACHE_TTL_MS,
+              maxEntries: GEOCODE_CACHE_MAX_ENTRIES,
+            }
+          );
+          recordGeocodeTelemetry({
+            query,
+            provider: payload.provider || geocodeTrace.provider || "",
+            branch: geocodeTrace.branch || payload.provider || "",
+            cacheStatus: "miss",
+            resultCount: Number(payload.results?.length || 0),
+            totalMs: Date.now() - startedAt,
+            stages: geocodeTrace.stages,
+          });
+          console.log(
+            `[search-api] query="${query}" provider="${payload.provider || "unknown"}" results=${Number(
+              payload.results?.length || 0
+            )} cache=miss ms=${Date.now() - startedAt}`
+          );
+          sendJson(response, 200, payload);
+        } catch (error) {
+          recordGeocodeTelemetry({
+            query,
+            provider: geocodeTrace.provider || "",
+            branch: geocodeTrace.branch || "error",
+            cacheStatus: "miss",
+            resultCount: 0,
+            totalMs: Date.now() - startedAt,
+            error: error?.message || error,
+            stages: geocodeTrace.stages,
+          });
+          throw error;
+        }
         return;
       }
 
