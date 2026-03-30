@@ -4513,6 +4513,33 @@ function buildSearchQueryHints(query) {
   };
 }
 
+function hasSpecificSearchNumberSignal(hints) {
+  return Boolean(
+    hints?.mainNumber || normalizeDigits(hints?.normalizedQuery || "").length
+  );
+}
+
+function buildSearchResponseProfile(hints) {
+  const hasNumericSignal = hasSpecificSearchNumberSignal(hints);
+  const highSpecificity = Boolean(
+    hints?.parcelReference ||
+      (hints?.roadAddressQuery && hasNumericSignal) ||
+      ((hints?.textTokens?.length || 0) >= 3 && hasNumericSignal)
+  );
+  const addressLikeQuery = Boolean(
+    highSpecificity || hints?.roadAddressQuery || hasNumericSignal
+  );
+
+  return {
+    providerResultLimit: highSpecificity ? 6 : addressLikeQuery ? 8 : 10,
+    jusoHydrationLimit: highSpecificity ? 2 : hints?.roadAddressQuery ? 3 : 5,
+    reverseHydrationLimit: highSpecificity ? 2 : hints?.roadAddressQuery ? 3 : 5,
+    skipRemainingJusoHydrationThreshold: highSpecificity
+      ? 4200
+      : Number.POSITIVE_INFINITY,
+  };
+}
+
 function extractSearchItemParcelReference(item) {
   const pnuReference = decomposePnu(item?.pnu);
 
@@ -4810,11 +4837,15 @@ function buildJusoSearchItem(item, index) {
   };
 }
 
-async function searchJuso(query, config) {
+async function searchJuso(query, config, options = {}) {
+  const resultLimit = Math.max(
+    1,
+    Math.min(10, Number(options?.resultLimit || 10))
+  );
   const params = new URLSearchParams({
     confmKey: config.jusoConfirmKey,
     currentPage: "1",
-    countPerPage: "10",
+    countPerPage: String(resultLimit),
     keyword: query,
     resultType: "json",
     hstryYn: "Y",
@@ -5335,14 +5366,19 @@ async function finalizeSearchResults(primaryResults, query, config) {
 
 async function geocodeWithPreferredProviders(query, config) {
   const hints = buildSearchQueryHints(query);
+  const searchProfile = buildSearchResponseProfile(hints);
   const providerErrors = [];
   const vworldPromise = config.vworldApiKey
-    ? geocodeWithVWorld(query, config)
+    ? geocodeWithVWorld(query, config, {
+        resultLimit: searchProfile.providerResultLimit,
+      })
         .then((items) => ({ ok: true, items }))
         .catch((error) => ({ ok: false, error, items: [] }))
     : Promise.resolve({ ok: true, items: [] });
   const jusoPromise = config.jusoConfirmKey
-    ? searchJuso(query, config)
+    ? searchJuso(query, config, {
+        resultLimit: searchProfile.providerResultLimit,
+      })
         .then((items) => ({ ok: true, items }))
         .catch((error) => ({ ok: false, error, items: [] }))
     : Promise.resolve({ ok: true, items: [] });
@@ -5416,9 +5452,18 @@ async function geocodeWithPreferredProviders(query, config) {
 
   if (vworldItems.length && jusoItems.length) {
     const { merged, remainingJuso } = mergeVWorldAndJuso(vworldItems, jusoItems);
+    const normalizedMerged = normalizeSearchResultsForQuery(merged, query);
+    const skipRemainingJusoHydration =
+      normalizedMerged.length &&
+      scoreSearchItemQueryMatch(normalizedMerged[0], hints) >=
+        searchProfile.skipRemainingJusoHydrationThreshold;
     const hydrated = (
       await Promise.all(
-        remainingJuso.slice(0, 4).map((candidate) =>
+        (
+          skipRemainingJusoHydration
+            ? []
+            : remainingJuso.slice(0, searchProfile.jusoHydrationLimit)
+        ).map((candidate) =>
           geocodeJusoCandidate(candidate, config).catch(() => null)
         )
       )
@@ -5426,7 +5471,8 @@ async function geocodeWithPreferredProviders(query, config) {
 
     const combined = await hydrateSearchItemsWithReverse(
       [...merged, ...hydrated],
-      config
+      config,
+      searchProfile.reverseHydrationLimit
     );
 
     return {
@@ -5436,7 +5482,11 @@ async function geocodeWithPreferredProviders(query, config) {
   }
 
   if (vworldItems.length) {
-    const hydrated = await hydrateSearchItemsWithReverse(vworldItems, config);
+    const hydrated = await hydrateSearchItemsWithReverse(
+      vworldItems,
+      config,
+      searchProfile.reverseHydrationLimit
+    );
     return {
       provider: "vworld",
       results: await finalizeSearchResults(hydrated, query, config),
@@ -5446,7 +5496,7 @@ async function geocodeWithPreferredProviders(query, config) {
   if (jusoItems.length) {
     const hydrated = (
       await Promise.all(
-        jusoItems.slice(0, 5).map((candidate) =>
+        jusoItems.slice(0, searchProfile.jusoHydrationLimit).map((candidate) =>
           geocodeJusoCandidate(candidate, config).catch(() => null)
         )
       )
@@ -7044,8 +7094,12 @@ async function fetchEumLandInfoDetails(parcelReference, location, config) {
   };
 }
 
-async function searchVWorldCategory(query, category, config) {
+async function searchVWorldCategory(query, category, config, options = {}) {
   const domainCandidates = buildVWorldDomainCandidates(config);
+  const resultLimit = Math.max(
+    1,
+    Math.min(10, Number(options?.resultLimit || 10))
+  );
   let lastError = null;
 
   for (const domainCandidate of domainCandidates) {
@@ -7060,7 +7114,7 @@ async function searchVWorldCategory(query, category, config) {
             type: "address",
             category,
             crs: "EPSG:4326",
-            size: "10",
+            size: String(resultLimit),
             format: "json",
             query,
             domain: domainCandidate,
@@ -7116,7 +7170,7 @@ async function searchVWorldCategory(query, category, config) {
   throw lastError || new Error(`VWorld ${category} geocode request failed.`);
 }
 
-async function geocodeWithVWorld(query, config) {
+async function geocodeWithVWorld(query, config, options = {}) {
   const hints = buildSearchQueryHints(query);
   const categories = hints.parcelReference
     ? ["parcel"]
@@ -7124,7 +7178,9 @@ async function geocodeWithVWorld(query, config) {
       ? ["road"]
       : ["road", "parcel"];
   const settledResults = await Promise.allSettled(
-    categories.map((category) => searchVWorldCategory(query, category, config))
+    categories.map((category) =>
+      searchVWorldCategory(query, category, config, options)
+    )
   );
   const recoveredItems = [];
   const errors = [];

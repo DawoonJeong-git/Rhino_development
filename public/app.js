@@ -18,6 +18,8 @@ const state = {
   pendingSearchSelectionId: "",
   runtimeConfig: null,
   searchCache: new Map(),
+  searchPrefetchKey: "",
+  searchPrefetchPromise: null,
   searchProviderLabel: "search",
   searchResultItems: [],
   selectionPreviewCache: new Map(),
@@ -65,6 +67,10 @@ const state = {
 const providerBadge = document.querySelector("#providerBadge");
 const appShell = document.querySelector(".app-shell");
 const topbar = document.querySelector(".topbar");
+const topbarEyebrow = topbar?.querySelector(".eyebrow");
+const topbarTitle = topbar?.querySelector("h1");
+const topbarSubtitle = topbar?.querySelector(".topbar-subtitle");
+const topbarHighlights = Array.from(topbar?.querySelectorAll(".topbar-highlight") || []);
 const toolbar = document.querySelector(".toolbar");
 const workspace = document.querySelector(".workspace");
 const mapPanel = document.querySelector(".map-panel");
@@ -136,6 +142,8 @@ const MODEL_PROGRESS_MIN_ESTIMATE_MS = 1500;
 const MODEL_PROGRESS_MAX_ESTIMATE_MS = 90000;
 const MODEL_PROGRESS_POLL_INTERVAL_MS = 400;
 const REQUEST_UI_DELAY_STEPS_MS = Object.freeze([2500, 8000]);
+const SEARCH_PREFETCH_DEBOUNCE_MS = 450;
+const SEARCH_PREFETCH_MIN_QUERY_LENGTH = 6;
 const MODEL_PROGRESS_DEFAULT_ESTIMATES_MS = Object.freeze({
   preview: 3200,
   "export-obj": 5200,
@@ -197,6 +205,67 @@ function applyStudioChrome() {
   modelCard?.classList.add("model-card-featured");
   selectionSummaryStack?.classList.add("target-site-stack");
 
+  if (topbarEyebrow) {
+    topbarEyebrow.textContent = "Contour + Parcel + Context";
+  }
+
+  if (topbarTitle) {
+    topbarTitle.textContent = "3D 대지모형 스튜디오";
+  }
+
+  if (topbarSubtitle) {
+    topbarSubtitle.textContent =
+      "주소에서 대상지를 확정하고, 지형 · 건물 · 토지/법규를 한 화면에서 검토한 뒤 3DM · DXF · SKP 파일까지 바로 이어서 준비하는 작업 스튜디오입니다.";
+  }
+
+  if (topbarHighlights[0]) {
+    const label = topbarHighlights[0].querySelector(".topbar-highlight-label");
+    const title = topbarHighlights[0].querySelector("strong");
+    const description = topbarHighlights[0].querySelector("p:last-child");
+    if (label) {
+      label.textContent = "Selection";
+    }
+    if (title) {
+      title.textContent = "주소 검색, 대지 선택, 범위 지정";
+    }
+    if (description) {
+      description.textContent =
+        "먼저 대상지를 잡고 작업 범위와 기준 위치를 같은 흐름 안에서 확정합니다.";
+    }
+  }
+
+  if (topbarHighlights[1]) {
+    const label = topbarHighlights[1].querySelector(".topbar-highlight-label");
+    const title = topbarHighlights[1].querySelector("strong");
+    const description = topbarHighlights[1].querySelector("p:last-child");
+    if (label) {
+      label.textContent = "Context";
+    }
+    if (title) {
+      title.textContent = "토지 · 지형 · 건물 · 법규 확인";
+    }
+    if (description) {
+      description.textContent =
+        "필지 경계와 주변 맥락, 핵심 규제 정보를 한 화면에서 이어서 검토합니다.";
+    }
+  }
+
+  if (topbarHighlights[2]) {
+    const label = topbarHighlights[2].querySelector(".topbar-highlight-label");
+    const title = topbarHighlights[2].querySelector("strong");
+    const description = topbarHighlights[2].querySelector("p:last-child");
+    if (label) {
+      label.textContent = "Output";
+    }
+    if (title) {
+      title.textContent = "미리보기 후 3DM · OBJ · DXF · SKP 출력";
+    }
+    if (description) {
+      description.textContent =
+        "모델 범위를 확인한 뒤 필요한 포맷으로 바로 내려받아 후속 설계 작업에 넘길 수 있습니다.";
+    }
+  }
+
   if (searchFormLabel) {
     searchFormLabel.textContent = "주소 검색";
   }
@@ -211,7 +280,7 @@ function applyStudioChrome() {
 
   if (searchFormHelper) {
     searchFormHelper.textContent =
-      "도로명주소, 지번주소, 건물명을 함께 찾을 수 있습니다. 검색 후에는 필지와 대지 맥락이 같은 화면에서 이어집니다.";
+      "도로명주소, 지번주소, 건물명을 함께 찾습니다. 입력을 멈추면 결과를 미리 준비하고, 확정 즉시 지도 미리보기와 토지 맥락으로 이어집니다.";
   }
 
   if (searchFormEmptyState) {
@@ -1400,7 +1469,7 @@ function formatElevationRange(minValue, maxValue) {
 
 function setProviderBadge() {
   if (!state.runtimeConfig) {
-    providerBadge.textContent = "실행 설정 확인 중";
+    providerBadge.textContent = "실데이터 연결 확인 중";
     return;
   }
 
@@ -3179,6 +3248,68 @@ function buildSearchCacheKey(query) {
     .toLowerCase();
 }
 
+function shouldPrefetchSearchQuery(query) {
+  const normalizedQuery = String(query || "").trim();
+
+  if (normalizedQuery.length < SEARCH_PREFETCH_MIN_QUERY_LENGTH) {
+    return false;
+  }
+
+  return (
+    normalizedQuery.includes(" ") ||
+    /\d/u.test(normalizedQuery) ||
+    /(?:대로|로|길|동|읍|면|리|구|시|군)$/u.test(normalizedQuery)
+  );
+}
+
+async function fetchGeocodePayload(query) {
+  const response = await fetch(`/api/geocode?q=${encodeURIComponent(query)}`);
+  const payload = await response.json();
+
+  if (!response.ok) {
+    throw new Error(payload.error || "주소 검색에 실패했습니다.");
+  }
+
+  return payload;
+}
+
+function primeSearchCache(query) {
+  const normalizedQuery = String(query || "").trim();
+
+  if (!shouldPrefetchSearchQuery(normalizedQuery)) {
+    return;
+  }
+
+  const cacheKey = buildSearchCacheKey(normalizedQuery);
+
+  if (state.searchCache.has(cacheKey)) {
+    return;
+  }
+
+  if (state.searchPrefetchKey === cacheKey && state.searchPrefetchPromise) {
+    return;
+  }
+
+  const pendingPromise = fetchGeocodePayload(normalizedQuery)
+    .then((payload) => {
+      if (payload?.results) {
+        state.searchCache.set(cacheKey, payload);
+      }
+
+      return payload;
+    })
+    .catch(() => null)
+    .finally(() => {
+      if (state.searchPrefetchPromise === pendingPromise) {
+        state.searchPrefetchPromise = null;
+        state.searchPrefetchKey = "";
+      }
+    });
+
+  state.searchPrefetchKey = cacheKey;
+  state.searchPrefetchPromise = pendingPromise;
+}
+
 function pruneSelectionPreviewCache(now = Date.now()) {
   for (const [cacheKey, entry] of state.selectionPreviewCache.entries()) {
     if (now - Number(entry?.cachedAt || 0) >= SELECTION_PREVIEW_CACHE_TTL_MS) {
@@ -3210,15 +3341,10 @@ function buildSelectionPreviewCacheKey(location) {
 }
 
 async function geocodeAddress(query, currentRequestId) {
-  const response = await fetch(`/api/geocode?q=${encodeURIComponent(query)}`);
-  const payload = await response.json();
+  const payload = await fetchGeocodePayload(query);
 
   if (currentRequestId !== state.searchRequestId) {
     return;
-  }
-
-  if (!response.ok) {
-    throw new Error(payload.error || "주소 검색에 실패했습니다.");
   }
 
   return payload;
@@ -4325,8 +4451,19 @@ function scheduleSearch() {
     clearPreviewMarker();
     state.pendingSearchSelectionId = "";
     state.searchResultItems = [];
+    state.searchPrefetchKey = "";
+    state.searchPrefetchPromise = null;
     searchResults.innerHTML = "";
     setSearchSelectionCardVisible(false);
+    return;
+  }
+
+  if (shouldPrefetchSearchQuery(query)) {
+    state.searchDebounceId = window.setTimeout(() => {
+      state.searchDebounceId = null;
+      primeSearchCache(query);
+    }, SEARCH_PREFETCH_DEBOUNCE_MS);
+    setActionFeedback("입력을 멈추면 검색 결과를 미리 준비합니다.");
     return;
   }
 
@@ -5012,11 +5149,19 @@ function attachEvents() {
       const currentRequestId = state.searchRequestId;
       const cacheKey = buildSearchCacheKey(query);
       const cachedPayload = state.searchCache.get(cacheKey) || null;
+      const prefetchedPayload =
+        !cachedPayload &&
+        state.searchPrefetchKey === cacheKey &&
+        state.searchPrefetchPromise
+          ? await state.searchPrefetchPromise
+          : null;
       setSearchSelectionCardVisible(true);
       searchResults.innerHTML =
         '<p class="search-results-empty">검색 결과를 불러오는 중입니다...</p>';
       const payload =
-        cachedPayload || (await geocodeAddress(query, currentRequestId));
+        cachedPayload ||
+        prefetchedPayload ||
+        (await geocodeAddress(query, currentRequestId));
 
       if (!cachedPayload && payload?.results) {
         state.searchCache.set(cacheKey, payload);
