@@ -507,7 +507,7 @@ async function runBaselineVerification() {
     );
     assert.deepEqual(
       Object.keys(runtimeStatsPayload.exportJobs || {}).sort(),
-      ["active", "estimatedDurationMs", "queued"],
+      ["active", "activeSearchRequests", "estimatedDurationMs", "queued"],
       "Runtime stats exportJobs payload shape changed."
     );
     assert.deepEqual(

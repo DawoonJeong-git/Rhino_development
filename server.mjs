@@ -84,6 +84,7 @@ const DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS = 1000 * 60 * 8;
 const DEFAULT_MAX_PENDING_EXPORT_JOBS_PER_CLIENT = 2;
 const DEFAULT_EXPORT_JOB_DURATION_ESTIMATE_MS = 1000 * 45;
 const EXPORT_JOB_DURATION_HISTORY_LIMIT = 8;
+const SEARCH_PRIORITY_GRACE_MS = 750;
 const DEFAULT_MAX_SITE_RADIUS_METERS = 1000;
 const DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS = DEFAULT_MAX_SITE_RADIUS_METERS * 2;
 const DEFAULT_MAX_CONCURRENT_EXPORT_JOBS = 2;
@@ -220,6 +221,8 @@ let activeExportJobs = 0;
 const exportJobWaitQueue = [];
 const activeExportJobsByClient = new Map();
 const recentExportDurationsMs = [];
+let activeInteractiveSearchRequests = 0;
+let searchPriorityUntilMs = 0;
 
 proj4.defs(
   "EPSG:5179",
@@ -356,6 +359,9 @@ function recordGeocodeTelemetry(event = {}) {
     cacheStatus: truncateTelemetryText(event?.cacheStatus || "", 20),
     resultCount: Math.max(0, Math.round(Number(event?.resultCount) || 0)),
     totalMs: Math.max(0, Math.round(Number(event?.totalMs) || 0)),
+    activeExportJobs: Math.max(0, Math.round(Number(event?.activeExportJobs) || 0)),
+    queuedExportJobs: Math.max(0, Math.round(Number(event?.queuedExportJobs) || 0)),
+    activeSearchRequests: Math.max(0, Math.round(Number(event?.activeSearchRequests) || 0)),
     error: truncateTelemetryText(event?.error || "", 160),
     stages: Array.isArray(event?.stages)
       ? event.stages.slice(-12).map((stage) => ({
@@ -17222,6 +17228,33 @@ function estimateExportJobDurationMs() {
   );
 }
 
+function resolveMaxConcurrentExportJobs(config) {
+  return Math.max(
+    1,
+    Number(config?.maxConcurrentExportJobs) || DEFAULT_MAX_CONCURRENT_EXPORT_JOBS
+  );
+}
+
+function shouldPrioritizeInteractiveSearches() {
+  return (
+    activeInteractiveSearchRequests > 0 || Date.now() < Number(searchPriorityUntilMs || 0)
+  );
+}
+
+function beginInteractiveSearchPriority() {
+  activeInteractiveSearchRequests += 1;
+  searchPriorityUntilMs = Date.now() + SEARCH_PRIORITY_GRACE_MS;
+}
+
+function endInteractiveSearchPriority(config) {
+  activeInteractiveSearchRequests = Math.max(0, activeInteractiveSearchRequests - 1);
+  searchPriorityUntilMs = Date.now() + SEARCH_PRIORITY_GRACE_MS;
+
+  if (activeInteractiveSearchRequests === 0) {
+    releaseNextQueuedExportJob(resolveMaxConcurrentExportJobs(config));
+  }
+}
+
 function buildRuntimeStatsPayload() {
   return {
     ok: true,
@@ -17231,6 +17264,7 @@ function buildRuntimeStatsPayload() {
       active: activeExportJobs,
       queued: exportJobWaitQueue.length,
       estimatedDurationMs: estimateExportJobDurationMs(),
+      activeSearchRequests: activeInteractiveSearchRequests,
     },
     caches: {
       geocodeEntries: geocodeCache.size,
@@ -17352,6 +17386,10 @@ function notifyQueuedExportJobs(maxConcurrentJobs) {
 }
 
 function releaseNextQueuedExportJob(maxConcurrentJobs) {
+  if (shouldPrioritizeInteractiveSearches()) {
+    return false;
+  }
+
   while (
     activeExportJobs < maxConcurrentJobs &&
     exportJobWaitQueue.length > 0
@@ -17375,10 +17413,7 @@ function releaseNextQueuedExportJob(maxConcurrentJobs) {
 }
 
 async function withExportJobSlot(config, work, options = {}) {
-  const maxConcurrentJobs = Math.max(
-    1,
-    Number(config?.maxConcurrentExportJobs) || DEFAULT_MAX_CONCURRENT_EXPORT_JOBS
-  );
+  const maxConcurrentJobs = resolveMaxConcurrentExportJobs(config);
   const queueTimeoutMs = Math.max(
     1000,
     Number(config?.exportJobQueueTimeoutMs) || DEFAULT_EXPORT_JOB_QUEUE_TIMEOUT_MS
@@ -17404,7 +17439,11 @@ async function withExportJobSlot(config, work, options = {}) {
     );
   }
 
-  if (activeExportJobs < maxConcurrentJobs && exportJobWaitQueue.length === 0) {
+  if (
+    !shouldPrioritizeInteractiveSearches() &&
+    activeExportJobs < maxConcurrentJobs &&
+    exportJobWaitQueue.length === 0
+  ) {
     activeExportJobs += 1;
     incrementActiveExportJobCountForClient(clientIp);
     slotClaimed = true;
@@ -19732,30 +19771,33 @@ async function createApp() {
 
         const startedAt = Date.now();
         const geocodeTrace = { query, stages: [] };
+        beginInteractiveSearchPriority();
         console.log(`[search-api] query="${query}"`);
-
-        const cachedResponse = readGeocodeCache(query);
-
-        if (cachedResponse) {
-          recordGeocodeTelemetry({
-            query,
-            provider: cachedResponse.provider || "",
-            branch: "cache-hit",
-            cacheStatus: "hit",
-            resultCount: Number(cachedResponse.results?.length || 0),
-            totalMs: Date.now() - startedAt,
-            stages: [],
-          });
-          console.log(
-            `[search-api] query="${query}" provider="${cachedResponse.provider || "unknown"}" results=${Number(
-              cachedResponse.results?.length || 0
-            )} cache=hit ms=${Date.now() - startedAt}`
-          );
-          sendJson(response, 200, cachedResponse);
-          return;
-        }
-
         try {
+          const cachedResponse = readGeocodeCache(query);
+
+          if (cachedResponse) {
+            recordGeocodeTelemetry({
+              query,
+              provider: cachedResponse.provider || "",
+              branch: "cache-hit",
+              cacheStatus: "hit",
+              resultCount: Number(cachedResponse.results?.length || 0),
+              totalMs: Date.now() - startedAt,
+              activeExportJobs,
+              queuedExportJobs: exportJobWaitQueue.length,
+              activeSearchRequests: activeInteractiveSearchRequests,
+              stages: [],
+            });
+            console.log(
+              `[search-api] query="${query}" provider="${cachedResponse.provider || "unknown"}" results=${Number(
+                cachedResponse.results?.length || 0
+              )} cache=hit ms=${Date.now() - startedAt}`
+            );
+            sendJson(response, 200, cachedResponse);
+            return;
+          }
+
           const geocodeCacheKey = buildGeocodeCacheKey(query);
           const hadInFlightGeocode = geocodeInFlight.has(geocodeCacheKey);
           const cacheLoadStartedAt = Date.now();
@@ -19789,6 +19831,9 @@ async function createApp() {
             cacheStatus: "miss",
             resultCount: Number(payload.results?.length || 0),
             totalMs: Date.now() - startedAt,
+            activeExportJobs,
+            queuedExportJobs: exportJobWaitQueue.length,
+            activeSearchRequests: activeInteractiveSearchRequests,
             stages: geocodeTrace.stages,
           });
           console.log(
@@ -19805,10 +19850,15 @@ async function createApp() {
             cacheStatus: "miss",
             resultCount: 0,
             totalMs: Date.now() - startedAt,
+            activeExportJobs,
+            queuedExportJobs: exportJobWaitQueue.length,
+            activeSearchRequests: activeInteractiveSearchRequests,
             error: error?.message || error,
             stages: geocodeTrace.stages,
           });
           throw error;
+        } finally {
+          endInteractiveSearchPriority(config);
         }
         return;
       }
