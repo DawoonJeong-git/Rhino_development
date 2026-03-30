@@ -1283,6 +1283,13 @@ function buildRuntimeConfig(localConfig) {
     jusoConfirmKey: normalizeConfigString(
       process.env.JUSO_CONFIRM_KEY || localConfig.JUSO_CONFIRM_KEY || ""
     ),
+    jusoCoordinateConfirmKey: normalizeConfigString(
+      process.env.JUSO_COORD_CONFIRM_KEY ||
+        localConfig.JUSO_COORD_CONFIRM_KEY ||
+        process.env.JUSO_CONFIRM_KEY ||
+        localConfig.JUSO_CONFIRM_KEY ||
+        ""
+    ),
     buildingHubServiceKey: normalizeConfigString(
       process.env.BUILDING_HUB_SERVICE_KEY ||
         localConfig.BUILDING_HUB_SERVICE_KEY ||
@@ -4272,6 +4279,20 @@ function buildPnuFromParts(admCd, mtYn, bun, ji) {
   return `${legalCode}${pnuPlatGbCd}${mainNumber}${subNumber}`;
 }
 
+function normalizeJusoUdrtYn(value, roadAddress = "") {
+  const normalized = String(value ?? "").trim().toLowerCase();
+
+  if (["1", "y", "yes", "true"].includes(normalized)) {
+    return "1";
+  }
+
+  if (["0", "n", "no", "false"].includes(normalized)) {
+    return "0";
+  }
+
+  return String(roadAddress || "").includes("지하") ? "1" : "0";
+}
+
 function getVWorldResponseStatus(payload) {
   return String(payload?.response?.status || payload?.status || "").trim();
 }
@@ -4336,6 +4357,7 @@ function buildJusoSearchItem(item, index) {
       roadAddr: item.roadAddr || "",
       zipNo: item.zipNo || "",
       mtYn: String(item.mtYn ?? "0"),
+      udrtYn: normalizeJusoUdrtYn(item.udrtYn, item.roadAddr || item.roadAddrPart1 || ""),
       lnbrMnnm: normalizeDigits(item.lnbrMnnm, 4),
       lnbrSlno: normalizeDigits(item.lnbrSlno, 4),
       buldMnnm: normalizeDigits(item.buldMnnm, 5),
@@ -4467,6 +4489,90 @@ function mergeVWorldAndJuso(vworldItems, jusoItems) {
   return { merged, remainingJuso };
 }
 
+async function geocodeJusoCandidateWithCoordinateApi(item, config) {
+  const confirmKey = String(
+    config?.jusoCoordinateConfirmKey || config?.jusoConfirmKey || ""
+  ).trim();
+  const admCd = normalizeDigits(item?.juso?.admCd, 10);
+  const rnMgtSn = normalizeDigits(item?.juso?.rnMgtSn, 12);
+  const buldMnnm = normalizeDigits(item?.juso?.buldMnnm, 5);
+  const buldSlno = normalizeDigits(item?.juso?.buldSlno, 5);
+
+  if (!confirmKey || admCd.length !== 10 || rnMgtSn.length !== 12 || !buldMnnm) {
+    return null;
+  }
+
+  const params = new URLSearchParams({
+    confmKey: confirmKey,
+    admCd,
+    rnMgtSn,
+    udrtYn: normalizeJusoUdrtYn(item?.juso?.udrtYn, item?.roadAddress),
+    buldMnnm,
+    buldSlno: buldSlno || "00000",
+    resultType: "json",
+  });
+
+  const payload = await retryUpstreamOperation(
+    async () => {
+      const response = await fetchWithTimeout(
+        `https://business.juso.go.kr/addrlink/addrCoordApi.do?${params}`,
+        {},
+        {
+          requestLabel: "Juso coordinate request",
+          timeoutMs: config?.providerTimeouts?.juso,
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Juso coordinate request failed with ${response.status}`);
+      }
+
+      return response.json();
+    },
+    {
+      attempts: 2,
+      label: "juso-coordinate",
+    }
+  );
+  const errorCode = String(payload?.results?.common?.errorCode || "").trim();
+  const totalCount = Number(payload?.results?.common?.totalCount || 0);
+
+  if ((errorCode && errorCode !== "0") || totalCount <= 0) {
+    return null;
+  }
+
+  const coordItem = Array.isArray(payload?.results?.juso)
+    ? payload.results.juso[0]
+    : payload?.results?.juso;
+  const x = Number(coordItem?.entX ?? coordItem?.x);
+  const y = Number(coordItem?.entY ?? coordItem?.y);
+
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return null;
+  }
+
+  const [lng, lat] = proj4("EPSG:5179", "EPSG:4326", [x, y]);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return null;
+  }
+
+  return {
+    id: item.id,
+    label: item.label,
+    roadAddress: item.roadAddress || coordItem?.roadAddr || item?.juso?.roadAddr || "",
+    parcelAddress:
+      item.parcelAddress || coordItem?.jibunAddr || item?.juso?.jibunAddr || "",
+    lat: Number(lat),
+    lng: Number(lng),
+    provider: "juso+coord",
+    searchType: item.searchType || "road",
+    pnu: item.pnu || "",
+    buildingName: item.buildingName || "",
+    juso: item.juso,
+  };
+}
+
 async function geocodeJusoCandidate(item, config) {
   const query = item.roadAddress || item.parcelAddress || item.label;
 
@@ -4476,7 +4582,15 @@ async function geocodeJusoCandidate(item, config) {
 
   let result = null;
 
-  if (config.vworldApiKey) {
+  if (config.jusoCoordinateConfirmKey || config.jusoConfirmKey) {
+    try {
+      result = await geocodeJusoCandidateWithCoordinateApi(item, config);
+    } catch {
+      result = null;
+    }
+  }
+
+  if (!result && config.vworldApiKey) {
     const [roadResults, parcelResults] = await Promise.all([
       item.roadAddress
         ? searchVWorldCategory(item.roadAddress, "road", config).catch(() => [])
@@ -4515,7 +4629,9 @@ async function geocodeJusoCandidate(item, config) {
 
   return {
     ...result,
-    provider: config.vworldApiKey ? "juso+vworld" : "juso+nominatim",
+    provider:
+      result.provider ||
+      (config.vworldApiKey ? "juso+vworld" : "juso+nominatim"),
     pnu: item.pnu || "",
     buildingName: item.buildingName || result.buildingName || "",
     juso: item.juso,
