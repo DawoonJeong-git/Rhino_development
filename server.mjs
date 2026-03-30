@@ -2438,21 +2438,71 @@ async function readOrLoadResponseCache(
   });
 
   if (cached.hit) {
+    if (typeof options?.onCacheHit === "function") {
+      options.onCacheHit({
+        cacheKey,
+        now,
+      });
+    }
     return cached.payload;
   }
 
   const existingPromise = inFlightStore.get(cacheKey);
 
   if (existingPromise) {
-    return existingPromise;
+    const sharedWaitStartedAt = Date.now();
+    const payload = await existingPromise;
+
+    if (typeof options?.onSharedWaitComplete === "function") {
+      options.onSharedWaitComplete({
+        cacheKey,
+        durationMs: Date.now() - sharedWaitStartedAt,
+        payload,
+      });
+    }
+
+    return payload;
   }
 
   const pendingPromise = (async () => {
+    const loadStartedAt = Date.now();
+
+    if (typeof options?.onLoadStart === "function") {
+      options.onLoadStart({
+        cacheKey,
+        startedAt: loadStartedAt,
+      });
+    }
+
     const payload = await loadPayload();
+    const loadFinishedAt = Date.now();
+
+    if (typeof options?.onLoadComplete === "function") {
+      options.onLoadComplete({
+        cacheKey,
+        startedAt: loadStartedAt,
+        finishedAt: loadFinishedAt,
+        durationMs: loadFinishedAt - loadStartedAt,
+        payload,
+      });
+    }
+
+    const cacheWriteStartedAt = Date.now();
     writeTimedCachePayload(cacheStore, cacheKey, payload, {
       ttlMs: options?.ttlMs,
       maxEntries: options?.maxEntries,
     });
+    const cacheWriteFinishedAt = Date.now();
+
+    if (typeof options?.onCacheWrite === "function") {
+      options.onCacheWrite({
+        cacheKey,
+        startedAt: cacheWriteStartedAt,
+        finishedAt: cacheWriteFinishedAt,
+        durationMs: cacheWriteFinishedAt - cacheWriteStartedAt,
+        payload,
+      });
+    }
     return payload;
   })();
 
@@ -19816,6 +19866,30 @@ async function createApp() {
             {
               ttlMs: GEOCODE_CACHE_TTL_MS,
               maxEntries: GEOCODE_CACHE_MAX_ENTRIES,
+              onSharedWaitComplete: ({ durationMs, payload: sharedPayload }) => {
+                appendGeocodeTraceStage(geocodeTrace, {
+                  name: "geocode-shared-wait",
+                  outcome: "shared",
+                  durationMs,
+                  count: Number(sharedPayload?.results?.length || 0),
+                });
+              },
+              onLoadComplete: ({ durationMs, payload: loadedPayload }) => {
+                appendGeocodeTraceStage(geocodeTrace, {
+                  name: "geocode-loader-run",
+                  outcome: "ok",
+                  durationMs,
+                  count: Number(loadedPayload?.results?.length || 0),
+                });
+              },
+              onCacheWrite: ({ durationMs, payload: writtenPayload }) => {
+                appendGeocodeTraceStage(geocodeTrace, {
+                  name: "geocode-cache-write",
+                  outcome: "ok",
+                  durationMs,
+                  count: Number(writtenPayload?.results?.length || 0),
+                });
+              },
             }
           );
           appendGeocodeTraceStage(geocodeTrace, {
