@@ -112,7 +112,7 @@ Fill in:
 - `VWORLD_API_KEY`
 - `VWORLD_API_DOMAIN`
 - `PUBLIC_BASE_URL` if your real public HTTPS address is different from the VWorld-registered domain
-- `INTERNAL_ONLY_STATIC_PATHS` if you want unfinished pages to stay localhost-only until release
+- `PUBLIC_ENABLED_FEATURES` to decide which feature pages are actually public on the shared site
 - `JUSO_CONFIRM_KEY`
 - `JUSO_COORD_CONFIRM_KEY` if your address search key for `addrCoordApi.do` is separate
 - `BUILDING_HUB_SERVICE_KEY`
@@ -129,7 +129,7 @@ Important:
 - production should only read the config inside `C:\SpaceWork_deploy`
 - if VWorld is only registered for `http://localhost:3000`, you can keep `VWORLD_API_DOMAIN=http://localhost:3000` even when the public site uses a Cloudflare Tunnel hostname such as `https://spaceswork.net`
 - set `PUBLIC_BASE_URL` to the real public HTTPS origin when you want `deploy/update-home-prod.ps1` to run the public smoke against the tunnel hostname separately from `VWORLD_API_DOMAIN`
-- keep `INTERNAL_ONLY_STATIC_PATHS` aligned with unfinished pages so they return `404` for public visitors
+- keep `PUBLIC_ENABLED_FEATURES` limited to released pages so unfinished features stay blocked on the public origin
 - if AdSense site preview needs to iframe your pages, keep the preview-safe `AD_PREVIEW_ALLOWED_PATHS` and `AD_PREVIEW_FRAME_ANCESTORS` values
 - if AdSense asks for `ads.txt`, fill `ADS_TXT_LINES` with your publisher line so `/ads.txt` responds from the same origin
 

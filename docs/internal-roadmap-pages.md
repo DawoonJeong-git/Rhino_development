@@ -1,7 +1,7 @@
 # Internal Roadmap Pages
 
 These routes stay available only from localhost until development is complete.
-They should not be linked from the public hub or exposed on the public origin.
+They should not be included in `PUBLIC_ENABLED_FEATURES` until release.
 
 ## `/heritage-risk`
 

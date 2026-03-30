@@ -550,6 +550,23 @@ async function runBaselineVerification() {
       ["hasVWorldDataKey"],
       "Config data payload shape changed."
     );
+    assert.deepEqual(
+      Object.keys(configPayload?.features || {}).sort(),
+      ["publicEnabledFeatures"],
+      "Config feature-flag payload shape changed."
+    );
+    assert.ok(
+      Array.isArray(configPayload?.features?.publicEnabledFeatures),
+      "Config should expose the public enabled feature list."
+    );
+    assert.ok(
+      configPayload?.features?.publicEnabledFeatures?.includes("contour3dmodel"),
+      "Contour 3D model should stay publicly enabled by default."
+    );
+    assert.ok(
+      !configPayload?.features?.publicEnabledFeatures?.includes("heritage-risk"),
+      "Heritage-risk should stay out of the public enabled list by default."
+    );
     const workspaceContourPath = path.join(process.cwd(), "data", "contours");
     const contourPathFallback = resolveTerrainContourPath(
       "C:\\Rhino_develop\\data\\contours"

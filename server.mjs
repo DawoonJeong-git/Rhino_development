@@ -105,10 +105,8 @@ const DEFAULT_AD_PREVIEW_ALLOWED_PATHS = Object.freeze([
   "/heritage-risk",
   "/max-mass",
 ]);
-const DEFAULT_INTERNAL_ONLY_STATIC_PATHS = Object.freeze([
-  "/heritage-risk",
-  "/max-mass",
-]);
+const DEFAULT_INTERNAL_ONLY_STATIC_PATHS = Object.freeze([]);
+const DEFAULT_PUBLIC_ENABLED_FEATURES = Object.freeze(["contour3dmodel"]);
 const DEFAULT_AD_PREVIEW_FRAME_ANCESTORS = Object.freeze([
   "'self'",
   "https://ads.google.com",
@@ -120,6 +118,57 @@ const DEFAULT_AD_PREVIEW_FRAME_ANCESTORS = Object.freeze([
   "https://*.googleusercontent.com",
 ]);
 const DEFAULT_ADS_TXT_LINES = Object.freeze([]);
+const ADSENSE_CLIENT_ID = "ca-pub-9740772629663258";
+const FEATURE_PAGE_DEFINITIONS = Object.freeze([
+  {
+    id: "contour3dmodel",
+    routePath: "/contour3dmodel",
+    title: "3D 대지모형 스튜디오",
+    summary:
+      "주소 선택, 범위 지정, 다중 필지 선택, 대지/건물 컨텍스트 확인, 3D와 CAD export를 한 화면에서 이어가는 현재 메인 기능입니다.",
+    enabledMeta: [
+      { label: "진입 주소", value: "/contour3dmodel", code: true },
+      { label: "현재 출력", value: "OBJ / DXF / SKP / 3DM" },
+    ],
+    disabledMeta: [
+      { label: "상태", value: "공개 준비 중" },
+      { label: "초점 방향", value: "대지 컨텍스트 + 3D/CAD 출력" },
+    ],
+  },
+  {
+    id: "heritage-risk",
+    routePath: "/heritage-risk",
+    title: "문화재 발굴 위험도 지도",
+    summary:
+      "후보지 주변의 문화재 조사 이력과 발굴 위험도를 지도 중심 흐름으로 검토하는 기능입니다. 메인 대지 검토와 이어지는 다음 단계로 준비 중입니다.",
+    enabledMeta: [
+      { label: "진입 주소", value: "/heritage-risk", code: true },
+      { label: "핵심 방향", value: "지도 중심 위험도 검토" },
+    ],
+    disabledMeta: [
+      { label: "상태", value: "공개 준비 중" },
+      { label: "핵심 방향", value: "지도 중심 위험도 검토" },
+    ],
+  },
+  {
+    id: "max-mass",
+    routePath: "/max-mass",
+    title: "법규 기반 최대 매스 생성",
+    summary:
+      "대지와 법규 조건을 바탕으로 초기 최대 매스를 검토하는 기능입니다. 이후 안별 비교와 후속 설계 검토로 이어가기 좋은 흐름으로 준비 중입니다.",
+    enabledMeta: [
+      { label: "진입 주소", value: "/max-mass", code: true },
+      { label: "핵심 방향", value: "법규 해석 + 초기 매스 검토" },
+    ],
+    disabledMeta: [
+      { label: "상태", value: "공개 준비 중" },
+      { label: "핵심 방향", value: "법규 해석 + 초기 매스 검토" },
+    ],
+  },
+]);
+const FEATURE_PAGE_DEFINITIONS_BY_ID = new Map(
+  FEATURE_PAGE_DEFINITIONS.map((definition) => [definition.id, definition])
+);
 const ROAD_LAYER_CANDIDATES = [
   {
     layer: "lt_c_upisuq151",
@@ -379,6 +428,34 @@ function normalizePathPrefixList(value, fallback = DEFAULT_AD_PREVIEW_ALLOWED_PA
   return [...new Set(normalizedEntries)];
 }
 
+function normalizeFeatureId(value) {
+  const normalized = normalizeConfigString(value)
+    .toLowerCase()
+    .replace(/^\/+/u, "")
+    .replace(/\/+$/u, "");
+
+  if (!normalized || !FEATURE_PAGE_DEFINITIONS_BY_ID.has(normalized)) {
+    return "";
+  }
+
+  return normalized;
+}
+
+function normalizeFeatureIdList(
+  value,
+  fallback = DEFAULT_PUBLIC_ENABLED_FEATURES
+) {
+  const normalizedEntries = normalizeConfigList(value)
+    .map((entry) => normalizeFeatureId(entry))
+    .filter(Boolean);
+
+  if (!normalizedEntries.length) {
+    return [...fallback];
+  }
+
+  return [...new Set(normalizedEntries)];
+}
+
 function normalizeFrameAncestor(value) {
   const normalized = normalizeConfigString(value);
 
@@ -437,10 +514,150 @@ function isAdPreviewAllowedPath(requestPath, config) {
   );
 }
 
+function findFeatureDefinitionByRequestPath(requestPath) {
+  return FEATURE_PAGE_DEFINITIONS.find((definition) =>
+    matchesPathPrefix(requestPath, definition.routePath)
+  );
+}
+
+function buildPublicFeatureCatalog(config) {
+  const enabledFeatureIds = new Set(config?.publicEnabledFeatures || []);
+
+  return FEATURE_PAGE_DEFINITIONS.map((definition) => ({
+    ...definition,
+    publicEnabled: enabledFeatureIds.has(definition.id),
+  }));
+}
+
 function isInternalOnlyStaticPath(requestPath, config) {
+  const featureDefinition = findFeatureDefinitionByRequestPath(requestPath);
+
+  if (
+    featureDefinition &&
+    !(config?.publicEnabledFeatures || []).includes(featureDefinition.id)
+  ) {
+    return true;
+  }
+
   return (config?.internalOnlyStaticPaths || []).some((pathPrefix) =>
     matchesPathPrefix(requestPath, pathPrefix)
   );
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function buildAdSenseVerificationSnippet() {
+  return [
+    "<script",
+    "  async",
+    `  src=\"https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${ADSENSE_CLIENT_ID}\"`,
+    '  crossorigin="anonymous"',
+    "></script>",
+  ].join("\n");
+}
+
+function renderFeatureMetaRow(meta) {
+  const label = escapeHtml(meta?.label || "");
+  const value = escapeHtml(meta?.value || "");
+  const renderedValue = meta?.code ? `<code>${value}</code>` : value;
+
+  return [
+    "<div>",
+    `  <dt>${label}</dt>`,
+    `  <dd>${renderedValue}</dd>`,
+    "</div>",
+  ].join("");
+}
+
+function renderHubFeatureCard(feature) {
+  const cardKicker = feature.publicEnabled ? "Live Now" : "Next Track";
+  const badgeText = feature.publicEnabled ? "사용 가능" : "공개 준비 중";
+  const badgeClass = feature.publicEnabled ? "feature-badge is-live" : "feature-badge";
+  const cardClass = feature.publicEnabled ? "feature-card-live" : "feature-card-plan";
+  const metaRows = (feature.publicEnabled ? feature.enabledMeta : feature.disabledMeta)
+    .map((meta) => renderFeatureMetaRow(meta))
+    .join("");
+  const actionMarkup = feature.publicEnabled
+    ? `<a class="feature-link" href="${escapeHtml(feature.routePath)}">기능 열기</a>`
+    : '<span class="feature-link is-secondary is-disabled" aria-disabled="true">공개 준비 중</span>';
+
+  return [
+    `<article class="feature-card ${cardClass}">`,
+    '  <div class="feature-head">',
+    `    <p class="card-kicker">${cardKicker}</p>`,
+    `    <span class="${badgeClass}">${badgeText}</span>`,
+    "  </div>",
+    `  <h2>${escapeHtml(feature.title)}</h2>`,
+    `  <p class="card-copy">${escapeHtml(feature.summary)}</p>`,
+    `  <dl class="feature-meta">${metaRows}</dl>`,
+    `  <div class="feature-actions">${actionMarkup}</div>`,
+    "</article>",
+  ].join("\n");
+}
+
+function renderHubStatusChip(feature) {
+  const label = feature.publicEnabled ? "운영 중" : "다음 단계";
+
+  return [
+    '<div class="status-chip">',
+    `  <span>${label}</span>`,
+    `  <strong>${escapeHtml(feature.title)}</strong>`,
+    "</div>",
+  ].join("\n");
+}
+
+function renderHubHtml(config) {
+  const features = buildPublicFeatureCatalog(config);
+  const featureCardsMarkup = features.map((feature) => renderHubFeatureCard(feature)).join("\n");
+  const statusChipsMarkup = features.map((feature) => renderHubStatusChip(feature)).join("\n");
+
+  return `<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Space Work Hub</title>
+    ${buildAdSenseVerificationSnippet()}
+    <link rel="stylesheet" href="/hub.css?v=20260326-hub2" />
+  </head>
+  <body>
+    <main class="hub-shell">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Space Work Hub</p>
+          <h1>대지 분석 흐름을 한 허브에서 차례대로 이어갑니다</h1>
+          <p class="hero-lead">
+            메인 허브에서 현재 운영 중인 기능과 다음 단계 기능을 함께 살피고, 실제 작업은 각 단계의 화면에서 이어가도록 정리했습니다. 현재는 3D 대지모형이 운영 중이며, 다음 흐름으로 문화재 위험도 검토와 법규 기반 최대 매스 검토를 준비하고 있습니다.
+          </p>
+        </div>
+        <div class="hero-status">
+          ${statusChipsMarkup}
+        </div>
+      </section>
+
+      <section class="hub-grid" aria-label="기능 목록">
+        ${featureCardsMarkup}
+      </section>
+
+      <section class="roadmap-card" aria-label="확장 메모">
+        <div>
+          <p class="card-kicker">Structure Note</p>
+          <h2>공개 전환은 설정 한 곳에서 관리합니다</h2>
+        </div>
+        <p class="card-copy">
+          허브 노출, 버튼 상태, 실제 공개 접근은 같은 release flag를 기준으로 맞춰집니다. 준비가 끝난 기능만 공개로 전환하고, 나머지는 허브에서 다음 단계로만 소개하는 구조를 유지합니다.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>`;
 }
 
 function buildContentSecurityPolicy(frameAncestors = DEFAULT_FRAME_ANCESTORS) {
@@ -1524,6 +1741,11 @@ function buildRuntimeConfig(localConfig) {
         localConfig.AD_PREVIEW_ALLOWED_PATHS ||
         DEFAULT_AD_PREVIEW_ALLOWED_PATHS
     ),
+    publicEnabledFeatures: normalizeFeatureIdList(
+      process.env.PUBLIC_ENABLED_FEATURES ||
+        localConfig.PUBLIC_ENABLED_FEATURES ||
+        DEFAULT_PUBLIC_ENABLED_FEATURES
+    ),
     internalOnlyStaticPaths: normalizePathPrefixList(
       process.env.INTERNAL_ONLY_STATIC_PATHS ||
         localConfig.INTERNAL_ONLY_STATIC_PATHS ||
@@ -1780,14 +2002,20 @@ function sendBinary(
   response.end(payload);
 }
 
-function sendHtml(response, statusCode, payload, extraHeaders = {}) {
+function sendHtml(
+  response,
+  statusCode,
+  payload,
+  extraHeaders = {},
+  securityOptions = {}
+) {
   response.writeHead(
     statusCode,
     buildResponseHeaders({
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
       ...(extraHeaders && typeof extraHeaders === "object" ? extraHeaders : {}),
-    })
+    }, securityOptions)
   );
   response.end(payload);
 }
@@ -1870,6 +2098,21 @@ async function readJsonBody(request, options = {}) {
 }
 
 async function serveStatic(request, requestPath, response, config) {
+  if (requestPath === "/" || requestPath === "/hub.html") {
+    sendHtml(
+      response,
+      200,
+      renderHubHtml(config),
+      {},
+      {
+        frameAncestors: isAdPreviewAllowedPath(requestPath, config)
+          ? config.adPreviewFrameAncestors
+          : DEFAULT_FRAME_ANCESTORS,
+      }
+    );
+    return;
+  }
+
   if (isInternalOnlyStaticPath(requestPath, config)) {
     const clientIp = getClientIp(request);
 
@@ -1889,7 +2132,6 @@ async function serveStatic(request, requestPath, response, config) {
   }
 
   const staticPageAliases = new Map([
-    ["/", "hub.html"],
     ["/contour3dmodel", "index.html"],
     ["/contour3dmodel/", "index.html"],
     ["/heritage-risk", "heritage-risk/index.html"],
@@ -18752,6 +18994,9 @@ async function createApp() {
           },
           data: {
             hasVWorldDataKey: Boolean(config.vworldApiKey),
+          },
+          features: {
+            publicEnabledFeatures: config.publicEnabledFeatures,
           },
           futureSources: {
             hasBuildingHubKey: Boolean(config.buildingHubServiceKey),

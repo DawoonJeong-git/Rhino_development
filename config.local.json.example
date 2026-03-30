@@ -4,9 +4,8 @@
   "VWORLD_API_KEY": "__PUT_VWORLD_API_KEY_HERE__",
   "VWORLD_API_DOMAIN": "__PUT_VWORLD_API_DOMAIN_HERE__",
   "PUBLIC_BASE_URL": "",
-  "INTERNAL_ONLY_STATIC_PATHS": [
-    "/heritage-risk",
-    "/max-mass"
+  "PUBLIC_ENABLED_FEATURES": [
+    "contour3dmodel"
   ],
   "AD_PREVIEW_ALLOWED_PATHS": [
     "/",
