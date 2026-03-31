@@ -9731,6 +9731,187 @@ function buildAugmentedContourLinesForExport(siteContext, contourInterval) {
   ]);
 }
 
+function resolveContourLineMergeTolerance(siteContext, contourCollection = null) {
+  const clipRect = buildLocalClipRect(siteContext);
+  const inferredInterval = inferSourceContourIntervalFromContourLines(
+    contourCollection || siteContext?.contourLines
+  );
+  const contourInterval =
+    Number.isFinite(inferredInterval) && inferredInterval > 0
+      ? inferredInterval
+      : resolveEffectiveContourBandInterval(siteContext);
+  const terrainStep = Number(siteContext?.terrainGrid?.step || 0);
+
+  return Math.max(
+    0.05,
+    Math.min(
+      0.35,
+      Number.isFinite(terrainStep) && terrainStep > 0 ? terrainStep * 0.45 : 0.2,
+      Number.isFinite(contourInterval) && contourInterval > 0
+        ? contourInterval * 0.08
+        : 0.35,
+      Number(clipRect?.boundarySnapTolerance || 0.35) * 0.25
+    )
+  );
+}
+
+function buildContourMergeBucketKey(feature, elevation) {
+  const properties = feature?.properties || {};
+
+  return [
+    buildContourLevelKey(elevation),
+    properties.generated === true ? "generated" : "native",
+    String(properties.provider || "").trim() || "unknown",
+  ].join("|");
+}
+
+function normalizeContourFeatureCollection(siteContext, contourCollection = null) {
+  const collection = contourCollection || siteContext?.contourLines;
+
+  if (!collection?.features?.length || !siteContext?.location) {
+    return collection || featureCollection([]);
+  }
+
+  const mergeTolerance = resolveContourLineMergeTolerance(siteContext, collection);
+  const openBuckets = new Map();
+  const normalizedEntries = [];
+
+  for (const feature of collection.features || []) {
+    const elevation = Number(feature?.properties?.elevation);
+
+    if (!Number.isFinite(elevation)) {
+      continue;
+    }
+
+    const properties = {
+      ...(feature?.properties || {}),
+      elevation: Number(elevation.toFixed(3)),
+    };
+
+    for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
+      const localPoints = lineString
+        .map((point) => localMetersFromLngLat(point, siteContext.location))
+        .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+
+      if (localPoints.length < 2) {
+        continue;
+      }
+
+      const closed =
+        localPoints.length >= 3 &&
+        pointsMatchInMeters(localPoints[0], localPoints[localPoints.length - 1], 0.001);
+
+      if (closed) {
+        const closedLoop = closeRing(dedupeLocalPolygonPoints(localPoints, 0.001));
+
+        if (closedLoop.length >= 4) {
+          normalizedEntries.push({
+            properties,
+            closed: true,
+            localPoints: closedLoop,
+            originalCoordinates:
+              feature?.geometry?.type === "LineString" ? lineString : null,
+            preserveOriginal:
+              feature?.geometry?.type === "LineString" &&
+              lineString.length >= 4 &&
+              pointsMatchInMeters(
+                localPoints[0],
+                localPoints[localPoints.length - 1],
+                0.001
+              ),
+          });
+        }
+
+        continue;
+      }
+
+      const mergedOpenPoints = mergeContourPolylinePoints(localPoints, 0.001);
+
+      if (mergedOpenPoints.length < 2) {
+        continue;
+      }
+
+      const bucketKey = buildContourMergeBucketKey(feature, elevation);
+
+      if (!openBuckets.has(bucketKey)) {
+        openBuckets.set(bucketKey, {
+          properties,
+          segments: [],
+        });
+      }
+
+      openBuckets.get(bucketKey).segments.push({
+        localPoints: mergedOpenPoints,
+        originalCoordinates: lineString,
+        preserveOriginal: feature?.geometry?.type === "LineString",
+      });
+    }
+  }
+
+  for (const bucket of openBuckets.values()) {
+    const sourcePolylines = bucket.segments.map((segment) => segment.localPoints);
+    const mergedPolylines = mergeContourPolylines(sourcePolylines, mergeTolerance);
+    const didMerge = mergedPolylines.length !== sourcePolylines.length;
+
+    if (!didMerge) {
+      for (const segment of bucket.segments) {
+        if (segment.localPoints.length < 2) {
+          continue;
+        }
+
+        normalizedEntries.push({
+          properties: bucket.properties,
+          closed: false,
+          localPoints: segment.localPoints,
+          originalCoordinates: segment.originalCoordinates,
+          preserveOriginal: segment.preserveOriginal === true,
+        });
+      }
+
+      continue;
+    }
+
+    for (const polyline of mergedPolylines) {
+      if (polyline.length < 2) {
+        continue;
+      }
+
+      normalizedEntries.push({
+        properties: bucket.properties,
+        closed: false,
+        localPoints: polyline,
+        originalCoordinates: null,
+        preserveOriginal: false,
+      });
+    }
+  }
+
+  return featureCollection(
+    normalizedEntries
+      .map((entry) =>
+        lineFeature(
+          entry.preserveOriginal && Array.isArray(entry.originalCoordinates)
+            ? entry.originalCoordinates
+            : entry.localPoints.map(([xMeters, yMeters]) =>
+                lngLatFromMeters(siteContext.location, xMeters, yMeters)
+              ),
+          {
+            ...(entry.properties || {}),
+            merged: true,
+            closedLoop: entry.closed === true,
+          }
+        )
+      )
+      .sort(
+        (left, right) =>
+          Number(left?.properties?.elevation || 0) -
+            Number(right?.properties?.elevation || 0) ||
+          Number(Boolean(left?.properties?.generated)) -
+            Number(Boolean(right?.properties?.generated))
+      )
+  );
+}
+
 async function resolveParcelBoundary(location, config) {
   if (!config.vworldApiKey) {
     const mockParcel = normalizeParcelFeature(createMockParcelFeature(location));
@@ -20881,6 +21062,24 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
       exportSiteContext.stats.effectiveContourDisplayInterval =
         targetContourDisplayInterval;
     }
+  }
+
+  if (
+    isContourModelExport &&
+    exportSiteContext.options?.includeContours !== false &&
+    exportSiteContext.contourLines?.features?.length
+  ) {
+    const contourFeatureCountBeforeNormalize =
+      Number(exportSiteContext.contourLines.features.length || 0);
+    exportSiteContext.contourLines = normalizeContourFeatureCollection(
+      exportSiteContext,
+      exportSiteContext.contourLines
+    );
+    exportSiteContext.stats.contourFeatureCountBeforeNormalize =
+      contourFeatureCountBeforeNormalize;
+    exportSiteContext.stats.contourFeatureCountAfterNormalize = Number(
+      exportSiteContext?.contourLines?.features?.length || 0
+    );
   }
 
   console.log(

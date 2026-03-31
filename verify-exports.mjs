@@ -95,6 +95,22 @@ const CASES = [
   },
 ].filter((testCase) => CASE_FILTER.size === 0 || CASE_FILTER.has(testCase.name));
 
+function getLineStringsFromGeometry(geometry) {
+  if (!geometry) {
+    return [];
+  }
+
+  if (geometry.type === "LineString") {
+    return Array.isArray(geometry.coordinates) ? [geometry.coordinates] : [];
+  }
+
+  if (geometry.type === "MultiLineString") {
+    return Array.isArray(geometry.coordinates) ? geometry.coordinates : [];
+  }
+
+  return [];
+}
+
 function assertDefaultCspShape(csp, label) {
   const value = String(csp || "");
 
@@ -1920,6 +1936,51 @@ async function runBaselineVerification() {
       refined3dmSiteContext?.stats?.effectiveContourDisplayInterval,
       1,
       "3DM contour curve export should match the terrain band interval so curves and terraces stay aligned."
+    );
+    const fragmentedContourSiteContext = cloneJsonValue({
+      ...syntheticContourSiteContext,
+      contourLines: {
+        type: "FeatureCollection",
+        features: [
+          syntheticContourSiteContext.contourLines.features[0],
+          {
+            type: "Feature",
+            properties: { provider: "official-contours", elevation: 12 },
+            geometry: {
+              type: "MultiLineString",
+              coordinates: [
+                [
+                  [126.97802, 37.56655],
+                  [126.97821, 37.56655],
+                ],
+                [
+                  [126.97821, 37.56655],
+                  [126.9784, 37.56655],
+                ],
+              ],
+            },
+          },
+          syntheticContourSiteContext.contourLines.features[2],
+        ],
+      },
+    });
+    const fragmented3dmSiteContext = prepareSiteContextForExport(
+      fragmentedContourSiteContext,
+      fragmentedContourSiteContext.options,
+      "3dm"
+    );
+    const normalized12Contours = (fragmented3dmSiteContext?.contourLines?.features || [])
+      .filter((feature) => Number(feature?.properties?.elevation) === 12)
+      .flatMap((feature) => getLineStringsFromGeometry(feature?.geometry || null));
+    assert.equal(
+      normalized12Contours.length,
+      1,
+      "Fragmented native contour segments at the same elevation should merge into one export curve."
+    );
+    assert.equal(
+      normalized12Contours[0]?.length,
+      3,
+      "Merged contour export should keep the original shape while removing duplicate breakpoints."
     );
     const refined3dmTerrainPlan = resolveContourTerrainRenderPlan(refined3dmSiteContext);
     assert.equal(
