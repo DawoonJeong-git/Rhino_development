@@ -14629,9 +14629,7 @@ function buildCumulativeContourBandGroups(siteContext) {
       }
     }
 
-    const regions = stripRegionHoles(
-      buildContourBandRegionsFromMultiPolygon(nextMultiPolygon)
-    );
+    const regions = buildContourBandRegionsFromMultiPolygon(nextMultiPolygon);
 
     if (!regions.length) {
       cumulativeMultiPolygon = nextMultiPolygon;
