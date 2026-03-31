@@ -31,6 +31,7 @@ import {
   endInteractiveSearchPriority,
   resetExportQueueStateForTests,
   resolveEffectiveContourBandInterval,
+  resolveContourTerrainRenderPlan,
   resolveRateLimitBucket,
   resolveSketchUpTerrainSolidSimplifyTolerance,
   resolveTerrainContourPath,
@@ -41,6 +42,7 @@ import {
   selectStrongJusoFastPathCandidates,
   sanitizeSketchUpSolidRegion,
   simplifySketchUpSolidRegion,
+  localMetersFromLngLat,
 } from "./server.mjs";
 
 const BASE_URL = process.env.SITE_CONTEXT_BASE_URL || "http://127.0.0.1:3000";
@@ -1898,10 +1900,69 @@ async function runBaselineVerification() {
         Number(refined3dmSiteContext?.terrainGrid?.step || 0) < 1.25,
       "3DM refined terrain grid should also use a tighter sample step than the source grid."
     );
+    const refined3dmContourElevations = [...new Set(
+      (refined3dmSiteContext?.contourLines?.features || [])
+        .map((feature) => Number(feature?.properties?.elevation))
+        .filter((value) => Number.isFinite(value))
+        .sort((left, right) => left - right)
+    )];
     assert.deepEqual(
-      refined3dmSiteContext?.contourLines,
-      syntheticContourSiteContext.contourLines,
-      "3DM export should keep the native contour geometries while refining the terrain grid."
+      refined3dmContourElevations,
+      [10, 11, 12, 13, 14],
+      "3DM export should keep native contour levels and add interpolated levels between them."
+    );
+    assert.ok(
+      Number(refined3dmSiteContext?.contourLines?.features?.length || 0) >
+        Number(syntheticContourSiteContext?.contourLines?.features?.length || 0),
+      "3DM export should augment native contour curves instead of replacing them when a finer interval is requested."
+    );
+    assert.equal(
+      refined3dmSiteContext?.stats?.effectiveContourDisplayInterval,
+      1,
+      "3DM contour curve export should match the terrain band interval so curves and terraces stay aligned."
+    );
+    const refined3dmTerrainPlan = resolveContourTerrainRenderPlan(refined3dmSiteContext);
+    assert.equal(
+      refined3dmSiteContext?.stats?.rawAnchoredContourTerrainUsed,
+      true,
+      "3DM contour terrain should use the raw-contour-anchored band planner when native contours are available."
+    );
+    const raw12ContourFeature = syntheticContourSiteContext.contourLines.features.find(
+      (feature) => Number(feature?.properties?.elevation) === 12
+    );
+    const raw12ContourLocalPoints = (raw12ContourFeature?.geometry?.coordinates || []).map(
+      (point) => localMetersFromLngLat(point, syntheticContourSiteContext.location)
+    );
+    const rawAnchored12Band = (refined3dmTerrainPlan?.bandGroups || []).find(
+      (group) => Math.abs(Number(group?.bottomElevation || 0) - 12) <= 1e-9
+    );
+    assert.ok(
+      rawAnchored12Band,
+      "3DM terrain plan should contain the band whose lower boundary is the raw 12m contour."
+    );
+    const raw12ContourY = raw12ContourLocalPoints[0]?.[1];
+    const raw12ContourMinX = Math.min(...raw12ContourLocalPoints.map((point) => point[0]));
+    const raw12ContourMaxX = Math.max(...raw12ContourLocalPoints.map((point) => point[0]));
+    assert.ok(
+      (rawAnchored12Band?.boundaryLoops || []).some((loop) =>
+        (loop || []).some((point, index) => {
+          const nextPoint = loop[(index + 1) % loop.length];
+
+          if (!nextPoint) {
+            return false;
+          }
+
+          const segmentMinX = Math.min(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
+          const segmentMaxX = Math.max(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
+          return (
+            Math.abs(Number(point?.[1] || 0) - raw12ContourY) <= 0.5 &&
+            Math.abs(Number(nextPoint?.[1] || 0) - raw12ContourY) <= 0.5 &&
+            segmentMinX <= raw12ContourMinX + 0.5 &&
+            segmentMaxX >= raw12ContourMaxX - 0.5
+          );
+        })
+      ),
+      "The raw 12m contour should lie directly on a terrain-band boundary edge."
     );
     const refinedSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       refinedSketchUpSiteContext
@@ -2138,15 +2199,33 @@ async function runBaselineVerification() {
       syntheticContourSiteContext.options,
       "dxf"
     );
+    const refinedDxfContourElevations = [...new Set(
+      (refinedDxfSiteContext?.contourLines?.features || [])
+        .map((feature) => Number(feature?.properties?.elevation))
+        .filter((value) => Number.isFinite(value))
+        .sort((left, right) => left - right)
+    )];
     assert.equal(
       refinedDxfSiteContext?.stats?.effectiveContourDisplayInterval,
-      2,
-      "DXF export should preserve the native official contour display interval."
+      1,
+      "DXF export should align contour curve display with the actual terrain band interval."
     );
     assert.deepEqual(
-      refinedDxfSiteContext?.contourLines,
-      syntheticContourSiteContext.contourLines,
-      "DXF export should preserve official contour geometries instead of regenerating grid contours."
+      refinedDxfContourElevations,
+      [10, 11, 12, 13, 14],
+      "DXF export should keep native contour levels and add interpolated levels between them."
+    );
+    assert.ok(
+      syntheticContourSiteContext.contourLines.features.every((sourceFeature) =>
+        (refinedDxfSiteContext?.contourLines?.features || []).some(
+          (refinedFeature) =>
+            Number(refinedFeature?.properties?.elevation) ===
+              Number(sourceFeature?.properties?.elevation) &&
+            JSON.stringify(refinedFeature?.geometry || null) ===
+              JSON.stringify(sourceFeature?.geometry || null)
+        )
+      ),
+      "DXF export should preserve the native official contour geometries while adding only the missing intermediate contours."
     );
     const exportMutationSourceSiteContext = cloneJsonValue({
       ...syntheticContourSiteContext,
