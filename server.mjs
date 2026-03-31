@@ -14426,15 +14426,38 @@ function buildRoadFeatureFootprintMultiPolygon(feature, center) {
     feature?.geometry?.type === "Polygon" ||
     feature?.geometry?.type === "MultiPolygon"
   ) {
-    for (const ring of getOuterRings(feature)) {
-      const localRing = ring.map((point) => localMetersFromLngLat(point, center));
-      const polygonRing = buildPolygonClippingRing(
-        orientLocalPolygonCounterClockwise(localRing)
+    for (const polygonRings of getGeometryPolygonCoordinateSets(feature.geometry)) {
+      const outerLocalRing = (polygonRings[0] || [])
+        .map((point) => localMetersFromLngLat(point, center))
+        .filter(
+          (point) => Number.isFinite(point?.[0]) && Number.isFinite(point?.[1])
+        );
+      const outerRing = buildPolygonClippingRing(
+        orientLocalPolygonCounterClockwise(outerLocalRing)
       );
 
-      if (polygonRing) {
-        multiPolygon.push([polygonRing]);
+      if (!outerRing) {
+        continue;
       }
+
+      const polygon = [outerRing];
+
+      for (const holeRingPoints of polygonRings.slice(1)) {
+        const localHoleRing = (holeRingPoints || [])
+          .map((point) => localMetersFromLngLat(point, center))
+          .filter(
+            (point) => Number.isFinite(point?.[0]) && Number.isFinite(point?.[1])
+          );
+        const holeRing = buildPolygonClippingRing(
+          orientLocalPolygonClockwise(localHoleRing)
+        );
+
+        if (holeRing) {
+          polygon.push(holeRing);
+        }
+      }
+
+      multiPolygon.push(polygon);
     }
 
     return multiPolygon;
@@ -15379,24 +15402,7 @@ function resolveSketchUpTerrainSolidSimplifyTolerance(siteContext) {
     return 0;
   }
 
-  const terrainStep = Number(siteContext?.terrainGrid?.step || 0);
-  const sourceContourInterval = resolveSourceContourInterval(siteContext);
-  const radiusMeters = Math.max(30, Number(siteContext?.options?.radius) || 120);
-  const baseTolerance = Math.max(
-    0.28,
-    terrainStep > 0 ? terrainStep * 1.45 : 0,
-    sourceContourInterval > 0 ? sourceContourInterval * 0.45 : 0
-  );
-  const scaledTolerance =
-    radiusMeters <= 120
-      ? baseTolerance
-      : radiusMeters <= 220
-        ? baseTolerance * 1.22
-        : radiusMeters <= 420
-          ? baseTolerance * 1.42
-          : baseTolerance * 1.62;
-
-  return Number(Math.max(0.28, Math.min(2.4, scaledTolerance)).toFixed(3));
+  return 0;
 }
 
 function simplifySketchUpSolidRegion(region, toleranceMeters = 0) {

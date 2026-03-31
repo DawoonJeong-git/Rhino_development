@@ -1445,6 +1445,44 @@ async function runBaselineVerification() {
       1,
       "Adjacent road polygons should be merged into one preview surface."
     );
+    const roadSurfaceWithHole = buildRoadSurfaceFeatureCollection(
+      [
+        {
+          type: "Feature",
+          properties: { sourceLayer: "raw-road-hole" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [
+              [
+                [126.98020, 37.56700],
+                [126.98060, 37.56700],
+                [126.98060, 37.56740],
+                [126.98020, 37.56740],
+                [126.98020, 37.56700],
+              ],
+              [
+                [126.98032, 37.56712],
+                [126.98048, 37.56712],
+                [126.98048, 37.56728],
+                [126.98032, 37.56728],
+                [126.98032, 37.56712],
+              ],
+            ],
+          },
+        },
+      ],
+      { lat: 37.56720, lng: 126.98040 }
+    );
+    assert.equal(
+      roadSurfaceWithHole?.features?.length,
+      1,
+      "Derived road preview should keep single polygon road surfaces intact."
+    );
+    assert.equal(
+      roadSurfaceWithHole?.features?.[0]?.geometry?.coordinates?.length,
+      2,
+      "Derived road preview should preserve source polygon holes instead of filling them in."
+    );
 
     const rankedRoadResults = normalizeSearchResultsForQuery(
       [
@@ -1839,9 +1877,10 @@ async function runBaselineVerification() {
     const stairStepTolerance = resolveSketchUpTerrainSolidSimplifyTolerance(
       stairStepSketchUpSiteContext
     );
-    assert.ok(
-      stairStepTolerance >= 0.5,
-      "SKP contour terrain should apply a meaningful loop simplification tolerance."
+    assert.equal(
+      stairStepTolerance,
+      0,
+      "SKP contour terrain should preserve original terrace loops and only sanitize invalid solids."
     );
     const rawStairStepRegion = {
       outerPoints: [
@@ -1868,10 +1907,10 @@ async function runBaselineVerification() {
       simplifiedStairStepRegion?.outerPoints?.length > 0,
       "SKP region simplifier should keep a valid outer loop."
     );
-    assert.ok(
-      simplifiedStairStepRegion.outerPoints.length <
-        rawStairStepRegion.outerPoints.length,
-      "SKP region simplifier should reduce stair-step terrace edge vertices."
+    assert.deepEqual(
+      simplifiedStairStepRegion,
+      rawStairStepRegion,
+      "SKP contour terrain should preserve stair-step terrace vertices when the loop is already valid."
     );
     const rawStairStepBounds = rawStairStepRegion.outerPoints.reduce(
       (bounds, [xMeters, yMeters]) => ({
@@ -1929,14 +1968,12 @@ async function runBaselineVerification() {
     };
     const simplifiedRectilinearBoundary = simplifySketchUpSolidRegion(
       rectilinearBoundaryRegion,
-      Math.max(stairStepTolerance, 1)
+      stairStepTolerance
     );
     assert.deepEqual(
-      (simplifiedRectilinearBoundary?.outerPoints || [])
-        .map(([xMeters, yMeters]) => `${xMeters},${yMeters}`)
-        .sort(),
-      ["0,0", "0,8", "10,0", "10,8"],
-      "SKP region simplifier should preserve sharp rectangular range boundaries."
+      simplifiedRectilinearBoundary,
+      rectilinearBoundaryRegion,
+      "SKP contour terrain should preserve the full rectilinear range boundary instead of collapsing it."
     );
     const stairStepSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       stairStepSketchUpSiteContext
