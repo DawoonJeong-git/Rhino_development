@@ -1873,20 +1873,70 @@ async function runBaselineVerification() {
         rawStairStepRegion.outerPoints.length,
       "SKP region simplifier should reduce stair-step terrace edge vertices."
     );
-    assert.ok(
-      simplifiedStairStepRegion.outerPoints.length <=
-        Math.floor(rawStairStepRegion.outerPoints.length * 0.65),
-      "SKP region simplifier should aggressively collapse staircase terrace edges into smoother loops."
+    const rawStairStepBounds = rawStairStepRegion.outerPoints.reduce(
+      (bounds, [xMeters, yMeters]) => ({
+        minX: Math.min(bounds.minX, xMeters),
+        maxX: Math.max(bounds.maxX, xMeters),
+        minY: Math.min(bounds.minY, yMeters),
+        maxY: Math.max(bounds.maxY, yMeters),
+      }),
+      {
+        minX: Number.POSITIVE_INFINITY,
+        maxX: Number.NEGATIVE_INFINITY,
+        minY: Number.POSITIVE_INFINITY,
+        maxY: Number.NEGATIVE_INFINITY,
+      }
+    );
+    const simplifiedStairStepBounds = simplifiedStairStepRegion.outerPoints.reduce(
+      (bounds, [xMeters, yMeters]) => ({
+        minX: Math.min(bounds.minX, xMeters),
+        maxX: Math.max(bounds.maxX, xMeters),
+        minY: Math.min(bounds.minY, yMeters),
+        maxY: Math.max(bounds.maxY, yMeters),
+      }),
+      {
+        minX: Number.POSITIVE_INFINITY,
+        maxX: Number.NEGATIVE_INFINITY,
+        minY: Number.POSITIVE_INFINITY,
+        maxY: Number.NEGATIVE_INFINITY,
+      }
+    );
+    assert.deepEqual(
+      simplifiedStairStepBounds,
+      rawStairStepBounds,
+      "SKP region simplifier should preserve the original loop bounds."
     );
     assert.ok(
-      simplifiedStairStepRegion.outerPoints.some(
+      simplifiedStairStepRegion.outerPoints.every(
         ([xMeters, yMeters]) =>
-          Math.abs(xMeters - Math.round(xMeters)) > 0.001 ||
-          Math.abs(yMeters - Math.round(yMeters)) > 0.001
-      ) ||
-        simplifiedStairStepRegion.outerPoints.length <=
-          Math.floor(rawStairStepRegion.outerPoints.length * 0.5),
-      "SKP region simplifier should either round staircase corners or collapse them into a much cleaner reduced loop."
+          Math.abs(xMeters - Math.round(xMeters)) <= 0.001 &&
+          Math.abs(yMeters - Math.round(yMeters)) <= 0.001
+      ),
+      "SKP region simplifier should not invent rounded corner coordinates for rectilinear loops."
+    );
+    const rectilinearBoundaryRegion = {
+      outerPoints: [
+        [0, 0],
+        [10, 0],
+        [10, 4],
+        [10, 8],
+        [6, 8],
+        [2, 8],
+        [0, 8],
+        [0, 4],
+      ],
+      holePoints: [],
+    };
+    const simplifiedRectilinearBoundary = simplifySketchUpSolidRegion(
+      rectilinearBoundaryRegion,
+      Math.max(stairStepTolerance, 1)
+    );
+    assert.deepEqual(
+      (simplifiedRectilinearBoundary?.outerPoints || [])
+        .map(([xMeters, yMeters]) => `${xMeters},${yMeters}`)
+        .sort(),
+      ["0,0", "0,8", "10,0", "10,8"],
+      "SKP region simplifier should preserve sharp rectangular range boundaries."
     );
     const stairStepSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       stairStepSketchUpSiteContext

@@ -12157,12 +12157,6 @@ function sanitizeSketchUpSolidLoop(
       simplifyLocalPolygon(candidate, Math.max(0.01, attemptTolerance * 0.2))
     );
 
-    if (attemptTolerance > 0.08 && candidate.length >= 4) {
-      candidate = orient(
-        smoothSketchUpSolidLoop(candidate, Math.max(attemptTolerance, repairTolerance))
-      );
-    }
-
     const area = Math.abs(computeLocalPolygonSignedArea(candidate));
 
     if (!(area >= Math.max(0.0001, minAreaMeters))) {
@@ -15423,9 +15417,14 @@ function simplifySketchUpSolidRegion(region, toleranceMeters = 0) {
           region.outerPoints || [],
           Math.max(0.12, tolerance * 0.55)
         );
-  const smoothedOuterPoints = smoothSketchUpSolidLoop(outerSeedPoints, tolerance);
+  const normalizedOuterPoints = simplifyLocalPolygon(
+    outerSeedPoints,
+    Math.max(0.01, tolerance * 0.08)
+  );
+  const exportOuterPoints =
+    normalizedOuterPoints.length >= 3 ? normalizedOuterPoints : outerSeedPoints;
 
-  if (smoothedOuterPoints.length < 3) {
+  if (exportOuterPoints.length < 3) {
     return region;
   }
 
@@ -15440,13 +15439,19 @@ function simplifySketchUpSolidRegion(region, toleranceMeters = 0) {
               ring,
               Math.max(0.08, holeTolerance * 0.55)
             );
-      return smoothSketchUpSolidLoop(holeSeedPoints, holeTolerance);
+      const normalizedHolePoints = simplifyLocalPolygon(
+        holeSeedPoints,
+        Math.max(0.01, holeTolerance * 0.08)
+      );
+      return normalizedHolePoints.length >= 3
+        ? normalizedHolePoints
+        : holeSeedPoints;
     })
     .filter((ring) => ring.length >= 3);
 
   return {
     ...region,
-    outerPoints: smoothedOuterPoints,
+    outerPoints: exportOuterPoints,
     holePoints,
   };
 }
