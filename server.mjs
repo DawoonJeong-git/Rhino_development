@@ -630,21 +630,9 @@ function renderHubFeatureCard(feature) {
   ].join("\n");
 }
 
-function renderHubStatusChip(feature) {
-  const label = feature.publicEnabled ? "현재 제공" : "곧 제공";
-
-  return [
-    '<div class="status-chip">',
-    `  <span>${label}</span>`,
-    `  <strong>${escapeHtml(feature.title)}</strong>`,
-    "</div>",
-  ].join("\n");
-}
-
 function renderHubHtml(config) {
   const features = buildPublicFeatureCatalog(config);
   const featureCardsMarkup = features.map((feature) => renderHubFeatureCard(feature)).join("\n");
-  const statusChipsMarkup = features.map((feature) => renderHubStatusChip(feature)).join("\n");
 
   return `<!doctype html>
 <html lang="ko">
@@ -659,18 +647,27 @@ function renderHubHtml(config) {
       <section class="hero">
         <div class="hero-copy">
           <p class="eyebrow">Spaceswork</p>
-          <h1>대지 검토 도구</h1>
+          <h1>대지·건물 검토 서비스</h1>
           <p class="hero-lead">
-            주소 검색, 지도 선택, 지형·건물·도로 확인, 3DM·OBJ·DXF·SKP 출력을 제공합니다.
-            현재는 대지·건물 3D 검토 기능을 사용할 수 있습니다.
+            주소 검색, 토지·건축물 정보 확인, 3D 파일 출력과 검토 기능을 이곳에서 확인할 수 있습니다.
           </p>
           <div class="hero-actions">
-            <a class="feature-link hero-primary" href="/contour3dmodel">대지·건물 3D 열기</a>
-            <a class="feature-link is-secondary hero-secondary" href="#services">기능 보기</a>
+            <a class="feature-link hero-primary" href="#services">서비스 보기</a>
           </div>
         </div>
         <div class="hero-status">
-          ${statusChipsMarkup}
+          <div class="status-chip">
+            <span>현재 제공</span>
+            <strong>주소 검색 · 정보 조회</strong>
+          </div>
+          <div class="status-chip">
+            <span>현재 제공</span>
+            <strong>3D 파일 출력</strong>
+          </div>
+          <div class="status-chip">
+            <span>추가 예정</span>
+            <strong>검토 기능 확장</strong>
+          </div>
         </div>
       </section>
 
