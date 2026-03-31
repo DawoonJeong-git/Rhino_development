@@ -13705,6 +13705,23 @@ function differenceLocalMultiPolygon(baseMultiPolygon, subtractMultiPolygon) {
   }
 }
 
+function intersectLocalMultiPolygon(baseMultiPolygon, clipMultiPolygon) {
+  if (!baseMultiPolygon?.length || !clipMultiPolygon?.length) {
+    return [];
+  }
+
+  try {
+    return polygonClipping.intersection(baseMultiPolygon, clipMultiPolygon) || [];
+  } catch (error) {
+    console.warn(
+      `[terrain-band] raw-contour intersection fallback error=${formatErrorForLog(
+        error
+      )}`
+    );
+    return [];
+  }
+}
+
 function buildOpenContourSideMultiPolygons(localPoints, clipRect) {
   const contourPoints = mergeContourPolylinePoints(localPoints, 0.001);
 
@@ -13869,14 +13886,18 @@ function selectHigherContourSideMultiPolygon(
   return scoredCandidates[0].multiPolygon;
 }
 
-function buildRawAnchoredContourEntries(siteContext, clipRect) {
+function buildRawAnchoredContourEntries(
+  siteContext,
+  clipRect,
+  contourCollection = null
+) {
   const seed = Math.round(
     Math.abs(Number(siteContext?.location?.lat) * 1000) +
       Math.abs(Number(siteContext?.location?.lng) * 1000)
   );
   const entries = [];
 
-  for (const feature of siteContext?.contourLines?.features || []) {
+  for (const feature of contourCollection?.features || siteContext?.contourLines?.features || []) {
     const elevation = Number(feature?.properties?.elevation);
 
     if (!Number.isFinite(elevation)) {
@@ -13942,10 +13963,20 @@ function buildRawAnchoredContourBandGroups(siteContext) {
   }
 
   const interval = resolveEffectiveContourBandInterval(siteContext);
+  const sourceContourInterval = resolveSourceContourInterval(siteContext);
   const minElevation = Number(terrainGrid.minElevation || 0);
   const maxElevation = Number(terrainGrid.maxElevation || 0);
   const startLevel = Math.floor(minElevation / interval) * interval;
-  const contourEntries = buildRawAnchoredContourEntries(siteContext, clipRect);
+  const nativeContourCollection = featureCollection(
+    (siteContext?.contourLines?.features || []).filter(
+      (feature) => feature?.properties?.generated !== true
+    )
+  );
+  const contourEntries = buildRawAnchoredContourEntries(
+    siteContext,
+    clipRect,
+    nativeContourCollection
+  );
 
   if (!contourEntries.length) {
     return [];
@@ -13963,24 +13994,13 @@ function buildRawAnchoredContourBandGroups(siteContext) {
     entriesByLevel.get(levelKey).push(entry.multiPolygon);
   }
 
-  for (
-    let level = Number((startLevel + interval).toFixed(3));
-    level < maxElevation - 0.001;
-    level = Number((level + interval).toFixed(3))
-  ) {
-    if (level <= minElevation + 0.001 || level >= maxElevation - 0.001) {
-      continue;
-    }
-
-    if (!entriesByLevel.has(buildContourLevelKey(level))) {
-      return [];
-    }
-  }
-
   const cumulativeByLevel = new Map();
   let cumulativeMultiPolygon = [];
+  const anchorLevels = [...entriesByLevel.keys()]
+    .map(Number)
+    .sort((left, right) => left - right);
 
-  for (const level of [...entriesByLevel.keys()].map(Number).sort((left, right) => right - left)) {
+  for (const level of [...anchorLevels].sort((left, right) => right - left)) {
     const levelPolygons = entriesByLevel.get(buildContourLevelKey(level)) || [];
     cumulativeMultiPolygon = unionLocalMultiPolygons([
       ...levelPolygons,
@@ -13992,7 +14012,33 @@ function buildRawAnchoredContourBandGroups(siteContext) {
     }
   }
 
-  const resolveAreaAboveLevel = (level) => {
+  const gridBandGroups = buildGridContourBandGroups(siteContext);
+  const gridAreaAboveByLevel = new Map();
+  let cumulativeGridMultiPolygon = [];
+
+  for (let index = gridBandGroups.length - 1; index >= 0; index -= 1) {
+    const group = gridBandGroups[index];
+    const groupMultiPolygon = buildPolygonClippingMultiPolygonFromRegions(
+      group?.regions || []
+    );
+
+    if (!groupMultiPolygon.length) {
+      continue;
+    }
+
+    cumulativeGridMultiPolygon = cumulativeGridMultiPolygon.length
+      ? unionLocalMultiPolygons([groupMultiPolygon, cumulativeGridMultiPolygon])
+      : groupMultiPolygon;
+
+    if (cumulativeGridMultiPolygon.length) {
+      gridAreaAboveByLevel.set(
+        buildContourLevelKey(group.bottomElevation),
+        cumulativeGridMultiPolygon
+      );
+    }
+  }
+
+  const resolveRawAreaAboveLevel = (level) => {
     if (level <= minElevation + 0.001) {
       return clipRect.multiPolygon;
     }
@@ -14003,6 +14049,63 @@ function buildRawAnchoredContourBandGroups(siteContext) {
 
     return cumulativeByLevel.get(buildContourLevelKey(level)) || null;
   };
+  const resolveConstrainedAreaAboveLevel = (level) => {
+    const normalizedLevel = Number(Number(level || 0).toFixed(3));
+
+    if (normalizedLevel <= minElevation + 0.001) {
+      return clipRect.multiPolygon;
+    }
+
+    if (normalizedLevel >= maxElevation - 0.001) {
+      return [];
+    }
+
+    const levelKey = buildContourLevelKey(normalizedLevel);
+
+    if (cumulativeByLevel.has(levelKey)) {
+      return cumulativeByLevel.get(levelKey) || [];
+    }
+
+    const lowerAnchorLevel =
+      [...anchorLevels]
+        .reverse()
+        .find((anchorLevel) => anchorLevel < normalizedLevel - 0.001) ?? null;
+    const upperAnchorLevel =
+      anchorLevels.find((anchorLevel) => anchorLevel > normalizedLevel + 0.001) ?? null;
+    const lowerAnchorArea =
+      lowerAnchorLevel === null
+        ? clipRect.multiPolygon
+        : resolveRawAreaAboveLevel(lowerAnchorLevel) || clipRect.multiPolygon;
+    const upperAnchorArea =
+      upperAnchorLevel === null
+        ? []
+        : resolveRawAreaAboveLevel(upperAnchorLevel) || [];
+    const gridAreaAbove = gridAreaAboveByLevel.get(levelKey) || [];
+    let constrainedAreaAbove =
+      gridAreaAbove.length && lowerAnchorArea?.length
+        ? intersectLocalMultiPolygon(gridAreaAbove, lowerAnchorArea)
+        : lowerAnchorArea;
+
+    if (!constrainedAreaAbove.length && lowerAnchorArea?.length) {
+      constrainedAreaAbove = lowerAnchorArea;
+    }
+
+    if (upperAnchorArea.length) {
+      constrainedAreaAbove = unionLocalMultiPolygons([
+        upperAnchorArea,
+        constrainedAreaAbove,
+      ]);
+
+      if (lowerAnchorArea?.length) {
+        constrainedAreaAbove = intersectLocalMultiPolygon(
+          constrainedAreaAbove,
+          lowerAnchorArea
+        );
+      }
+    }
+
+    return constrainedAreaAbove;
+  };
   const bandGroups = [];
 
   for (
@@ -14011,18 +14114,16 @@ function buildRawAnchoredContourBandGroups(siteContext) {
     bottomElevation = Number((bottomElevation + interval).toFixed(3))
   ) {
     const topElevation = Number(Math.min(bottomElevation + interval, maxElevation).toFixed(3));
-    const bottomArea = resolveAreaAboveLevel(bottomElevation);
+    const bottomArea = resolveConstrainedAreaAboveLevel(bottomElevation);
 
     if (!bottomArea?.length) {
       continue;
     }
 
     const topArea =
-      topElevation >= maxElevation - 0.001 ? [] : resolveAreaAboveLevel(topElevation);
-
-    if (topElevation < maxElevation - 0.001 && topArea === null) {
-      return [];
-    }
+      topElevation >= maxElevation - 0.001
+        ? []
+        : resolveConstrainedAreaAboveLevel(topElevation);
 
     const bandMultiPolygon =
       topArea?.length
@@ -14058,6 +14159,8 @@ function buildRawAnchoredContourBandGroups(siteContext) {
       rawAnchoredContourTerrainUsed: true,
       rawAnchoredContourBandCount: bandGroups.length,
       rawAnchoredContourEntryCount: contourEntries.length,
+      rawAnchoredNativeContourLevelCount: anchorLevels.length,
+      rawAnchoredSourceContourInterval: sourceContourInterval,
     };
   }
 
@@ -14266,16 +14369,31 @@ function mergeBandSlicePolygons(polygons, precision = 3) {
   return mergedPolygons;
 }
 
-function buildContourBandGroups(siteContext) {
-  // Build cumulative terrain bands from clipped terrain-grid slices so
-  // closed contours remain self-contained and only the true clip boundary
-  // participates in the final solid.
-  const rawAnchoredBandGroups = buildRawAnchoredContourBandGroups(siteContext);
+function buildContourBandGroupFromMultiPolygon(
+  bottomElevation,
+  topElevation,
+  multiPolygon
+) {
+  const regions = buildContourBandRegionsFromMultiPolygon(multiPolygon);
 
-  if (rawAnchoredBandGroups.length) {
-    return rawAnchoredBandGroups;
+  if (!regions.length) {
+    return null;
   }
 
+  return {
+    bottomElevation,
+    topElevation,
+    boundaryLoops: regions.flatMap((region) => [
+      region.outerPoints,
+      ...(region.holePoints || []),
+    ]),
+    regions,
+    multiPolygon,
+    bounds: computeRegionBounds(regions),
+  };
+}
+
+function buildGridContourBandGroups(siteContext) {
   const rawSlices = buildContourBandSlices(siteContext);
 
   if (!rawSlices.length) {
@@ -14304,30 +14422,36 @@ function buildContourBandGroups(siteContext) {
     );
     const regions = buildContourBandRegionsForSlices(slices, interval);
     const multiPolygon = buildPolygonClippingMultiPolygonFromRegions(regions);
-    const bounds = computeRegionBounds(regions);
-    const boundaryLoops = regions.flatMap((region) => [
-      region.outerPoints,
-      ...(region.holePoints || []),
-    ]);
+    const bandGroup = buildContourBandGroupFromMultiPolygon(
+      bottomElevation,
+      topElevation,
+      multiPolygon
+    );
 
-    if (!regions.length) {
+    if (!bandGroup) {
       console.warn(
         `[terrain-band] skipped empty band bottom=${bottomElevation} top=${topElevation} slices=${slices.length}`
       );
       continue;
     }
 
-    bandGroups.push({
-      bottomElevation,
-      topElevation,
-      boundaryLoops,
-      regions,
-      multiPolygon,
-      bounds,
-    });
+    bandGroups.push(bandGroup);
   }
 
   return bandGroups;
+}
+
+function buildContourBandGroups(siteContext) {
+  // Build cumulative terrain bands from clipped terrain-grid slices so
+  // closed contours remain self-contained and only the true clip boundary
+  // participates in the final solid.
+  const rawAnchoredBandGroups = buildRawAnchoredContourBandGroups(siteContext);
+
+  if (rawAnchoredBandGroups.length) {
+    return rawAnchoredBandGroups;
+  }
+
+  return buildGridContourBandGroups(siteContext);
 }
 
 function getCachedContourBandGroups(siteContext) {

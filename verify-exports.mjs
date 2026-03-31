@@ -1988,6 +1988,11 @@ async function runBaselineVerification() {
       true,
       "3DM contour terrain should use the raw-contour-anchored band planner when native contours are available."
     );
+    assert.equal(
+      refined3dmSiteContext?.stats?.rawAnchoredNativeContourLevelCount,
+      3,
+      "Raw-contour terrain anchoring should use only the native contour levels as hard terrain anchors."
+    );
     const raw12ContourFeature = syntheticContourSiteContext.contourLines.features.find(
       (feature) => Number(feature?.properties?.elevation) === 12
     );
