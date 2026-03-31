@@ -12009,6 +12009,262 @@ function smoothSketchUpSolidLoop(points, toleranceMeters = 0) {
   return candidate;
 }
 
+function computeLocalPolygonMinSegmentLength(points) {
+  const polygon = dedupeLocalPolygonPoints(points, 0.001);
+
+  if (polygon.length < 2) {
+    return 0;
+  }
+
+  let minLength = Number.POSITIVE_INFINITY;
+
+  for (let index = 0; index < polygon.length; index += 1) {
+    const current = polygon[index];
+    const next = polygon[(index + 1) % polygon.length];
+    minLength = Math.min(
+      minLength,
+      Math.hypot(Number(next[0]) - Number(current[0]), Number(next[1]) - Number(current[1]))
+    );
+  }
+
+  return Number.isFinite(minLength) ? Number(minLength.toFixed(6)) : 0;
+}
+
+function orientationOfLocalPoints(a, b, c) {
+  const value =
+    (Number(b[1]) - Number(a[1])) * (Number(c[0]) - Number(b[0])) -
+    (Number(b[0]) - Number(a[0])) * (Number(c[1]) - Number(b[1]));
+
+  if (Math.abs(value) <= 1e-9) {
+    return 0;
+  }
+
+  return value > 0 ? 1 : 2;
+}
+
+function isLocalPointOnSegment(a, b, c) {
+  return (
+    Number(b[0]) <= Math.max(Number(a[0]), Number(c[0])) + 1e-9 &&
+    Number(b[0]) + 1e-9 >= Math.min(Number(a[0]), Number(c[0])) &&
+    Number(b[1]) <= Math.max(Number(a[1]), Number(c[1])) + 1e-9 &&
+    Number(b[1]) + 1e-9 >= Math.min(Number(a[1]), Number(c[1]))
+  );
+}
+
+function doLocalSegmentsIntersect(a1, a2, b1, b2) {
+  const o1 = orientationOfLocalPoints(a1, a2, b1);
+  const o2 = orientationOfLocalPoints(a1, a2, b2);
+  const o3 = orientationOfLocalPoints(b1, b2, a1);
+  const o4 = orientationOfLocalPoints(b1, b2, a2);
+
+  if (o1 !== o2 && o3 !== o4) {
+    return true;
+  }
+
+  if (o1 === 0 && isLocalPointOnSegment(a1, b1, a2)) {
+    return true;
+  }
+  if (o2 === 0 && isLocalPointOnSegment(a1, b2, a2)) {
+    return true;
+  }
+  if (o3 === 0 && isLocalPointOnSegment(b1, a1, b2)) {
+    return true;
+  }
+  if (o4 === 0 && isLocalPointOnSegment(b1, a2, b2)) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasLocalPolygonSelfIntersection(points, toleranceMeters = 0.001) {
+  const polygon = dedupeLocalPolygonPoints(points, Math.max(0.001, toleranceMeters));
+
+  if (polygon.length < 4) {
+    return false;
+  }
+
+  for (let leftIndex = 0; leftIndex < polygon.length; leftIndex += 1) {
+    const leftStart = polygon[leftIndex];
+    const leftEnd = polygon[(leftIndex + 1) % polygon.length];
+
+    for (let rightIndex = leftIndex + 1; rightIndex < polygon.length; rightIndex += 1) {
+      const sameEdge = leftIndex === rightIndex;
+      const adjacentEdge =
+        (leftIndex + 1) % polygon.length === rightIndex ||
+        leftIndex === (rightIndex + 1) % polygon.length;
+      const wrapEdge = leftIndex === 0 && rightIndex === polygon.length - 1;
+
+      if (sameEdge || adjacentEdge || wrapEdge) {
+        continue;
+      }
+
+      const rightStart = polygon[rightIndex];
+      const rightEnd = polygon[(rightIndex + 1) % polygon.length];
+
+      if (
+        pointsMatchInMeters(leftStart, rightStart, toleranceMeters) ||
+        pointsMatchInMeters(leftStart, rightEnd, toleranceMeters) ||
+        pointsMatchInMeters(leftEnd, rightStart, toleranceMeters) ||
+        pointsMatchInMeters(leftEnd, rightEnd, toleranceMeters)
+      ) {
+        continue;
+      }
+
+      if (doLocalSegmentsIntersect(leftStart, leftEnd, rightStart, rightEnd)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function sanitizeSketchUpSolidLoop(
+  points,
+  {
+    orientation = "ccw",
+    minAreaMeters = 0.02,
+    minSegmentMeters = 0.04,
+    repairTolerance = 0.12,
+  } = {}
+) {
+  const orient =
+    orientation === "cw"
+      ? orientLocalPolygonClockwise
+      : orientLocalPolygonCounterClockwise;
+  const baseLoop = orient(points || []);
+
+  if (baseLoop.length < 3) {
+    return null;
+  }
+
+  const attemptTolerances = [
+    0,
+    Math.max(0.04, repairTolerance),
+    Math.max(0.06, repairTolerance * 1.35),
+    Math.max(0.08, repairTolerance * 1.8),
+  ];
+
+  for (const attemptTolerance of attemptTolerances) {
+    let candidate =
+      attemptTolerance <= 0
+        ? baseLoop
+        : simplifyLocalPolygonDouglasPeucker(baseLoop, attemptTolerance);
+
+    candidate = orient(
+      simplifyLocalPolygon(candidate, Math.max(0.01, attemptTolerance * 0.2))
+    );
+
+    if (attemptTolerance > 0.08 && candidate.length >= 4) {
+      candidate = orient(
+        smoothSketchUpSolidLoop(candidate, Math.max(attemptTolerance, repairTolerance))
+      );
+    }
+
+    const area = Math.abs(computeLocalPolygonSignedArea(candidate));
+
+    if (!(area >= Math.max(0.0001, minAreaMeters))) {
+      continue;
+    }
+
+    const minSegmentLength = computeLocalPolygonMinSegmentLength(candidate);
+
+    if (
+      minSegmentLength < Math.max(0.001, minSegmentMeters * 0.72) &&
+      area < Math.max(minAreaMeters * 18, 1.5)
+    ) {
+      continue;
+    }
+
+    if (hasLocalPolygonSelfIntersection(candidate, Math.max(0.001, minSegmentMeters * 0.2))) {
+      continue;
+    }
+
+    return candidate;
+  }
+
+  return null;
+}
+
+function sanitizeSketchUpSolidRegion(
+  region,
+  {
+    minAreaMeters = 0.02,
+    minSegmentMeters = 0.04,
+    minHoleAreaMeters = 0.03,
+    minHoleSegmentMeters = 0.05,
+    repairTolerance = 0.12,
+  } = {}
+) {
+  if (!region) {
+    return null;
+  }
+
+  const outerPoints = sanitizeSketchUpSolidLoop(region.outerPoints || [], {
+    orientation: "ccw",
+    minAreaMeters,
+    minSegmentMeters,
+    repairTolerance,
+  });
+
+  if (!outerPoints) {
+    return null;
+  }
+
+  const holePoints = (region.holePoints || [])
+    .map((holeLoop) =>
+      sanitizeSketchUpSolidLoop(holeLoop, {
+        orientation: "cw",
+        minAreaMeters: minHoleAreaMeters,
+        minSegmentMeters: minHoleSegmentMeters,
+        repairTolerance: Math.max(0.08, repairTolerance * 0.75),
+      })
+    )
+    .filter(Boolean);
+
+  return {
+    outerPoints,
+    holePoints,
+  };
+}
+
+function resolveSketchUpSolidSanitizeOptions(layerKind, simplifyTolerance = 0, heightMeters = 0) {
+  const tolerance = Math.max(0.08, Number(simplifyTolerance) || 0);
+  const normalizedLayerKind = String(layerKind || "").trim().toLowerCase();
+
+  if (normalizedLayerKind === "roads") {
+    return {
+      minAreaMeters: 0.08,
+      minSegmentMeters: 0.08,
+      minHoleAreaMeters: 0.12,
+      minHoleSegmentMeters: 0.08,
+      repairTolerance: Math.max(0.14, tolerance),
+      minHeightMeters: Math.max(0.008, Number(heightMeters) || 0),
+    };
+  }
+
+  if (normalizedLayerKind === "buildings" || normalizedLayerKind === "target-building") {
+    return {
+      minAreaMeters: 0.04,
+      minSegmentMeters: 0.02,
+      minHoleAreaMeters: 0.05,
+      minHoleSegmentMeters: 0.02,
+      repairTolerance: Math.max(0.08, tolerance * 0.7),
+      minHeightMeters: 0.1,
+    };
+  }
+
+  return {
+    minAreaMeters: 0.02,
+    minSegmentMeters: 0.04,
+    minHoleAreaMeters: 0.03,
+    minHoleSegmentMeters: 0.05,
+    repairTolerance: Math.max(0.1, tolerance),
+    minHeightMeters: Math.max(0.02, Number(heightMeters) || 0),
+  };
+}
+
 function buildLocalPointKey(point, decimals = 3) {
   return `${point[0].toFixed(decimals)},${point[1].toFixed(decimals)}`;
 }
@@ -15057,16 +15313,35 @@ function buildSketchUpRegionSolidGroup(
   };
 }
 
-function buildSketchUpRegionSolidDefinition(region, topElevation, bottomElevation) {
+function buildSketchUpRegionSolidDefinition(
+  region,
+  topElevation,
+  bottomElevation,
+  sanitizeOptions = null
+) {
   if (!region || topElevation <= bottomElevation) {
     return null;
   }
 
-  const outerPoints = orientLocalPolygonCounterClockwise(
-    region.outerPoints || []
-  );
+  const heightMeters = Number((topElevation - bottomElevation).toFixed(6));
+  const cleanedRegion = sanitizeOptions
+    ? sanitizeSketchUpSolidRegion(region, sanitizeOptions)
+    : {
+        outerPoints: orientLocalPolygonCounterClockwise(region.outerPoints || []),
+        holePoints: (region.holePoints || [])
+          .map((ring) => orientLocalPolygonClockwise(ring))
+          .filter((ring) => ring.length >= 3),
+      };
+  const outerPoints = cleanedRegion?.outerPoints || [];
 
   if (outerPoints.length < 3) {
+    return null;
+  }
+
+  if (
+    sanitizeOptions?.minHeightMeters &&
+    heightMeters < Number(sanitizeOptions.minHeightMeters || 0)
+  ) {
     return null;
   }
 
@@ -15074,22 +15349,21 @@ function buildSketchUpRegionSolidDefinition(region, topElevation, bottomElevatio
     outerLoop: outerPoints.map(([xMeters, yMeters]) =>
       buildSketchUpFacePoint(xMeters, yMeters, bottomElevation)
     ),
-    holeLoops: (region.holePoints || [])
-      .map((ring) => orientLocalPolygonClockwise(ring))
-      .filter((ring) => ring.length >= 3)
+    holeLoops: (cleanedRegion?.holePoints || [])
       .map((ring) =>
         ring.map(([xMeters, yMeters]) =>
           buildSketchUpFacePoint(xMeters, yMeters, bottomElevation)
         )
       ),
-    heightMeters: Number((topElevation - bottomElevation).toFixed(6)),
+    heightMeters,
   };
 }
 
 function buildSketchUpPrismSolidDefinition(
   polygonPoints,
   topElevation,
-  bottomElevation
+  bottomElevation,
+  sanitizeOptions = null
 ) {
   return buildSketchUpRegionSolidDefinition(
     {
@@ -15097,7 +15371,8 @@ function buildSketchUpPrismSolidDefinition(
       holePoints: [],
     },
     topElevation,
-    bottomElevation
+    bottomElevation,
+    sanitizeOptions
   );
 }
 
@@ -15247,9 +15522,15 @@ function appendSketchUpTerrainSegmentSolids(
   segments,
   topElevation,
   bottomElevation,
-  siteContext = null
+  siteContext = null,
+  layerKind = "terrain"
 ) {
   const simplifyTolerance = resolveSketchUpTerrainSolidSimplifyTolerance(siteContext);
+  const sanitizeOptions = resolveSketchUpSolidSanitizeOptions(
+    layerKind,
+    simplifyTolerance,
+    Number(topElevation) - Number(bottomElevation)
+  );
 
   for (const segment of segments || []) {
     const groupIndex =
@@ -15275,7 +15556,8 @@ function appendSketchUpTerrainSegmentSolids(
       const terrainSolid = buildSketchUpRegionSolidDefinition(
         exportRegion,
         topElevation,
-        bottomElevation
+        bottomElevation,
+        sanitizeOptions
       );
 
       if (terrainSolid) {
@@ -15348,7 +15630,8 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
         flatSegments,
         flatTopElevation,
         baseElevation,
-        siteContext
+        siteContext,
+        "terrain"
       );
     } else {
       if (clipPolygon.length >= 3 && minBandElevation > baseElevation + 0.001) {
@@ -15361,7 +15644,8 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
           baseSegments,
           minBandElevation,
           baseElevation,
-          siteContext
+          siteContext,
+          "terrain"
         );
       }
 
@@ -15380,7 +15664,8 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
           groupSegments,
           group.topElevation,
           effectiveBottomElevation,
-          siteContext
+          siteContext,
+          "terrain"
         );
       }
     }
@@ -15441,7 +15726,8 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
             buildSketchUpPrismSolidDefinition(
               ring.map((point) => localMetersFromLngLat(point, center)),
               resolvedBaseElevation + heightMeters,
-              resolvedBaseElevation
+              resolvedBaseElevation,
+              resolveSketchUpSolidSanitizeOptions(layer, 0, heightMeters)
             ),
           ].filter(Boolean),
         }
@@ -15470,7 +15756,8 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
           groupSegments,
           topElevation,
           bottomElevation,
-          siteContext
+          siteContext,
+          "roads"
         );
       }
     }
@@ -16000,6 +16287,11 @@ begin
     add_solids_to_group(group, group_data['solids'] || [])
     add_faces_to_group(group, group_data['faces'] || [])
     add_polylines_to_group(group, group_data['polylines'] || [])
+  end
+
+  begin
+    model.active_view.zoom_extents
+  rescue
   end
 
   model.commit_operation
@@ -20577,6 +20869,7 @@ export {
   resolveSketchUpTerrainSolidSimplifyTolerance,
   resolveRateLimitBucket,
   resolveVWorldSearchCategories,
+  sanitizeSketchUpSolidRegion,
   resolveRawTerrainHeightAtLocalPoint,
   resolveEffectiveContourBandInterval,
   resolveTerrainContourPath,

@@ -35,6 +35,7 @@ import {
   selectGeocodedVWorldResultForJusoCandidate,
   selectShortCircuitJusoCandidate,
   selectStrongJusoFastPathCandidates,
+  sanitizeSketchUpSolidRegion,
   simplifySketchUpSolidRegion,
 } from "./server.mjs";
 
@@ -1893,6 +1894,62 @@ async function runBaselineVerification() {
           group?.layer === "terrain" && Number(group?.solids?.length || 0) > 0
       ),
       "Synthetic stair-step SKP terrain should still generate terrain solids."
+    );
+    const sketchUpDirtyRegion = {
+      outerPoints: [
+        [0, 0],
+        [2, 0],
+        [2, 0.01],
+        [2, 2],
+        [0, 2],
+      ],
+      holePoints: [
+        [
+          [0.5, 0.5],
+          [0.58, 0.5],
+          [0.58, 0.56],
+          [0.5, 0.56],
+        ],
+      ],
+    };
+    const cleanedSketchUpRegion = sanitizeSketchUpSolidRegion(sketchUpDirtyRegion, {
+      minAreaMeters: 0.02,
+      minSegmentMeters: 0.04,
+      minHoleAreaMeters: 0.03,
+      minHoleSegmentMeters: 0.05,
+      repairTolerance: 0.12,
+    });
+    assert.ok(
+      cleanedSketchUpRegion?.outerPoints?.length >= 3,
+      "SKP solid sanitizer should keep a valid outer loop for mildly noisy regions."
+    );
+    assert.equal(
+      cleanedSketchUpRegion?.holePoints?.length || 0,
+      0,
+      "SKP solid sanitizer should drop tiny hole loops that often trigger SketchUp cleanup."
+    );
+    const tinySketchUpSliver = sanitizeSketchUpSolidRegion(
+      {
+        outerPoints: [
+          [0, 0],
+          [0.05, 0],
+          [0.05, 0.01],
+          [0, 0.01],
+        ],
+        holePoints: [],
+      },
+      {
+        minAreaMeters: 0.02,
+        minSegmentMeters: 0.04,
+        minHoleAreaMeters: 0.03,
+        minHoleSegmentMeters: 0.05,
+        repairTolerance: 0.12,
+      }
+    );
+    assert.equal(
+      tinySketchUpSliver,
+      null,
+      "SKP solid sanitizer should drop tiny sliver regions before they reach SketchUp."
     );
     const refinedDxfSiteContext = prepareSiteContextForExport(
       syntheticContourSiteContext,
