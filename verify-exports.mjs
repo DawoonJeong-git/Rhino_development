@@ -10,6 +10,7 @@ import {
   buildSearchQueryHints,
   buildSiteContextCacheKey,
   buildVWorldDomainCandidates,
+  beginInteractiveSearchPriority,
   createApp,
   prepareSiteContextForExport,
   build3dmFromSiteContext,
@@ -27,6 +28,8 @@ import {
   normalizeSearchResultsForQuery,
   pruneCacheEntries,
   readOrLoadResponseCache,
+  endInteractiveSearchPriority,
+  resetExportQueueStateForTests,
   resolveEffectiveContourBandInterval,
   resolveRateLimitBucket,
   resolveSketchUpTerrainSolidSimplifyTolerance,
@@ -2221,6 +2224,8 @@ async function runBaselineVerification() {
       "Export requests should rely on the export queue instead of a time-window rate-limit bucket."
     );
 
+    resetExportQueueStateForTests();
+
     const queueProbeConfig = {
       maxConcurrentExportJobs: 1,
       exportJobQueueTimeoutMs: 5000,
@@ -2337,6 +2342,111 @@ async function runBaselineVerification() {
 
     await Promise.all([perClientPendingProbe, sameClientQueuedProbe]);
 
+    resetExportQueueStateForTests();
+
+    const graceReleaseConfig = {
+      maxConcurrentExportJobs: 1,
+      exportJobQueueTimeoutMs: 2000,
+      maxPendingExportJobsPerClient: 1,
+    };
+    beginInteractiveSearchPriority();
+    endInteractiveSearchPriority(graceReleaseConfig);
+    const graceQueuedAt = Date.now();
+    const graceReleasedResult = await withExportJobSlot(
+      graceReleaseConfig,
+      async () => "released-after-search-grace",
+      {
+        clientIp: "198.51.100.90",
+      }
+    );
+    const graceWaitMs = Date.now() - graceQueuedAt;
+    assert.equal(
+      graceReleasedResult,
+      "released-after-search-grace",
+      "A queued export should resume automatically after the search-priority grace period."
+    );
+    assert.ok(
+      graceWaitMs >= 600,
+      "A queued export should remain paused briefly during the search-priority grace period."
+    );
+    assert.ok(
+      graceWaitMs < 1800,
+      "A queued export should resume before the queue timeout once the grace period ends."
+    );
+
+    resetExportQueueStateForTests();
+
+    const queuedAbortConfig = {
+      maxConcurrentExportJobs: 1,
+      exportJobQueueTimeoutMs: 5000,
+      maxPendingExportJobsPerClient: 1,
+    };
+    const slotHolder = withExportJobSlot(
+      queuedAbortConfig,
+      async () => {
+        await delay(120);
+        return "slot-holder";
+      },
+      {
+        clientIp: "198.51.100.200",
+      }
+    );
+    await delay(20);
+
+    let abortedQueuedJobRan = false;
+    const queuedAbortController = new AbortController();
+    const abortedQueuedJob = withExportJobSlot(
+      queuedAbortConfig,
+      async () => {
+        abortedQueuedJobRan = true;
+        return "should-not-run";
+      },
+      {
+        clientIp: "203.0.113.99",
+        signal: queuedAbortController.signal,
+      }
+    );
+    await delay(20);
+    queuedAbortController.abort();
+
+    let abortedQueuedError = null;
+    try {
+      await abortedQueuedJob;
+    } catch (error) {
+      abortedQueuedError = error;
+    }
+
+    const normalizedQueuedAbortError = normalizePublicError(abortedQueuedError);
+    assert.equal(
+      normalizedQueuedAbortError?.statusCode,
+      499,
+      "A queued export should be removed immediately when the client disconnects."
+    );
+    assert.equal(
+      abortedQueuedJobRan,
+      false,
+      "A disconnected queued export should never start work after it has been aborted."
+    );
+
+    const replacementQueuedJob = withExportJobSlot(
+      queuedAbortConfig,
+      async () => "replacement-after-abort",
+      {
+        clientIp: "203.0.113.99",
+      }
+    );
+    const [, replacementQueuedResult] = await Promise.all([
+      slotHolder,
+      replacementQueuedJob,
+    ]);
+    assert.equal(
+      replacementQueuedResult,
+      "replacement-after-abort",
+      "A replacement export from the same client should be allowed once the aborted queued job is cleaned up."
+    );
+
+    resetExportQueueStateForTests();
+
     console.log(
       JSON.stringify(
         {
@@ -2388,6 +2498,8 @@ async function runBaselineVerification() {
             "export-cache-hit",
             "export-queue-progress-updates",
             "export-pending-per-client-limit",
+            "export-search-priority-grace-release",
+            "export-queued-client-abort-cleanup",
           ],
         },
         null,

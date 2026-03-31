@@ -223,6 +223,7 @@ const activeExportJobsByClient = new Map();
 const recentExportDurationsMs = [];
 let activeInteractiveSearchRequests = 0;
 let searchPriorityUntilMs = 0;
+let queuedExportReleaseTimer = null;
 
 proj4.defs(
   "EPSG:5179",
@@ -17202,6 +17203,41 @@ function createHttpError(statusCode, message, headers = {}) {
   return new HttpError(statusCode, message, headers);
 }
 
+function createClientDisconnectController(request, response) {
+  const controller = new AbortController();
+
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(
+        createHttpError(
+          499,
+          "The client disconnected before the export request completed."
+        )
+      );
+    }
+  };
+
+  const handleRequestAborted = () => {
+    abort();
+  };
+  const handleResponseClose = () => {
+    if (!response.writableEnded) {
+      abort();
+    }
+  };
+
+  request.once("aborted", handleRequestAborted);
+  response.once("close", handleResponseClose);
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      request.removeListener("aborted", handleRequestAborted);
+      response.removeListener("close", handleResponseClose);
+    },
+  };
+}
+
 function normalizePublicError(error) {
   if (error instanceof HttpError) {
     return error;
@@ -17600,6 +17636,95 @@ function resolveMaxConcurrentExportJobs(config) {
   );
 }
 
+function clearQueuedExportReleaseTimer() {
+  if (queuedExportReleaseTimer) {
+    clearTimeout(queuedExportReleaseTimer);
+    queuedExportReleaseTimer = null;
+  }
+}
+
+function detachQueuedExportAbortHandler(queuedJob) {
+  if (!queuedJob?.signal || typeof queuedJob.abortHandler !== "function") {
+    return;
+  }
+
+  queuedJob.signal.removeEventListener("abort", queuedJob.abortHandler);
+  queuedJob.signal = null;
+  queuedJob.abortHandler = null;
+}
+
+function finalizeQueuedExportJob(queuedJob) {
+  if (!queuedJob) {
+    return;
+  }
+
+  clearTimeout(queuedJob.timeoutHandle);
+  queuedJob.timeoutHandle = null;
+  detachQueuedExportAbortHandler(queuedJob);
+}
+
+function buildExportJobAbortError(reason) {
+  const reasonMessage =
+    reason instanceof Error ? reason.message : String(reason || "").trim();
+
+  return createHttpError(
+    499,
+    reasonMessage || "The client disconnected before the export could start."
+  );
+}
+
+function removeQueuedExportJob(queuedJob, maxConcurrentJobs, error = null) {
+  if (!queuedJob || queuedJob.released === true) {
+    return false;
+  }
+
+  queuedJob.released = true;
+  finalizeQueuedExportJob(queuedJob);
+  const index = exportJobWaitQueue.indexOf(queuedJob);
+
+  if (index !== -1) {
+    exportJobWaitQueue.splice(index, 1);
+  }
+
+  if (exportJobWaitQueue.length === 0) {
+    clearQueuedExportReleaseTimer();
+  }
+
+  notifyQueuedExportJobs(maxConcurrentJobs);
+
+  if (error) {
+    queuedJob.reject(error);
+  }
+
+  return true;
+}
+
+function scheduleQueuedExportRelease(maxConcurrentJobs) {
+  if (
+    activeInteractiveSearchRequests > 0 ||
+    exportJobWaitQueue.length === 0
+  ) {
+    return false;
+  }
+
+  const waitMs = Math.max(
+    0,
+    Number(searchPriorityUntilMs || 0) - Date.now()
+  );
+
+  if (waitMs <= 0) {
+    clearQueuedExportReleaseTimer();
+    return releaseNextQueuedExportJob(maxConcurrentJobs);
+  }
+
+  clearQueuedExportReleaseTimer();
+  queuedExportReleaseTimer = setTimeout(() => {
+    queuedExportReleaseTimer = null;
+    releaseNextQueuedExportJob(maxConcurrentJobs);
+  }, waitMs);
+  return true;
+}
+
 function shouldPrioritizeInteractiveSearches() {
   return (
     activeInteractiveSearchRequests > 0 || Date.now() < Number(searchPriorityUntilMs || 0)
@@ -17609,6 +17734,7 @@ function shouldPrioritizeInteractiveSearches() {
 function beginInteractiveSearchPriority() {
   activeInteractiveSearchRequests += 1;
   searchPriorityUntilMs = Date.now() + SEARCH_PRIORITY_GRACE_MS;
+  clearQueuedExportReleaseTimer();
 }
 
 function endInteractiveSearchPriority(config) {
@@ -17616,7 +17742,7 @@ function endInteractiveSearchPriority(config) {
   searchPriorityUntilMs = Date.now() + SEARCH_PRIORITY_GRACE_MS;
 
   if (activeInteractiveSearchRequests === 0) {
-    releaseNextQueuedExportJob(resolveMaxConcurrentExportJobs(config));
+    scheduleQueuedExportRelease(resolveMaxConcurrentExportJobs(config));
   }
 }
 
@@ -17752,6 +17878,9 @@ function notifyQueuedExportJobs(maxConcurrentJobs) {
 
 function releaseNextQueuedExportJob(maxConcurrentJobs) {
   if (shouldPrioritizeInteractiveSearches()) {
+    if (activeInteractiveSearchRequests === 0) {
+      scheduleQueuedExportRelease(maxConcurrentJobs);
+    }
     return false;
   }
 
@@ -17766,7 +17895,7 @@ function releaseNextQueuedExportJob(maxConcurrentJobs) {
     }
 
     queuedJob.released = true;
-    clearTimeout(queuedJob.timeoutHandle);
+    finalizeQueuedExportJob(queuedJob);
     activeExportJobs += 1;
     incrementActiveExportJobCountForClient(queuedJob.clientIp);
     queuedJob.resolve();
@@ -17789,8 +17918,13 @@ async function withExportJobSlot(config, work, options = {}) {
       DEFAULT_MAX_PENDING_EXPORT_JOBS_PER_CLIENT
   );
   const clientIp = normalizeIpAddress(options?.clientIp);
+  const abortSignal = options?.signal;
   let slotClaimed = false;
   let jobStartedAt = 0;
+
+  if (abortSignal?.aborted) {
+    throw buildExportJobAbortError(abortSignal.reason);
+  }
 
   if (clientIp && countPendingExportJobsForClient(clientIp) >= maxPendingJobsPerClient) {
     throw createHttpError(
@@ -17821,6 +17955,8 @@ async function withExportJobSlot(config, work, options = {}) {
         onQueued: typeof options?.onQueued === "function" ? options.onQueued : null,
         queueTimeoutMs,
         released: false,
+        signal: null,
+        abortHandler: null,
         timeoutHandle: null,
         resolve: () => {
           slotClaimed = true;
@@ -17831,6 +17967,19 @@ async function withExportJobSlot(config, work, options = {}) {
       };
 
       queuedJob.timeoutHandle = setTimeout(() => {
+        removeQueuedExportJob(
+          queuedJob,
+          maxConcurrentJobs,
+          createHttpError(
+            429,
+            "紐⑤뜽 ?대낫?닿린 ?湲곗뿴??湲몄뼱???쒓컙 ?댁뿉 ?묒뾽???쒖옉?섏? 紐삵뻽?듬땲?? ?좎떆 ???ㅼ떆 ?쒕룄?댁＜?몄슂.",
+            {
+              "Retry-After": "30",
+            }
+          )
+        );
+        return;
+
         if (queuedJob.released) {
           return;
         }
@@ -17854,12 +18003,42 @@ async function withExportJobSlot(config, work, options = {}) {
         );
       }, queueTimeoutMs);
 
+      if (abortSignal) {
+        queuedJob.signal = abortSignal;
+        queuedJob.abortHandler = () => {
+          removeQueuedExportJob(
+            queuedJob,
+            maxConcurrentJobs,
+            buildExportJobAbortError(abortSignal.reason)
+          );
+        };
+        abortSignal.addEventListener("abort", queuedJob.abortHandler, {
+          once: true,
+        });
+
+        if (abortSignal.aborted) {
+          queuedJob.abortHandler();
+          return;
+        }
+      }
+
       exportJobWaitQueue.push(queuedJob);
       notifyQueuedExportJobs(maxConcurrentJobs);
+
+      if (
+        activeInteractiveSearchRequests === 0 &&
+        Date.now() < Number(searchPriorityUntilMs || 0)
+      ) {
+        scheduleQueuedExportRelease(maxConcurrentJobs);
+      }
     });
   }
 
   try {
+    if (abortSignal?.aborted) {
+      throw buildExportJobAbortError(abortSignal.reason);
+    }
+
     return await work();
   } finally {
     if (slotClaimed) {
@@ -17869,6 +18048,19 @@ async function withExportJobSlot(config, work, options = {}) {
       releaseNextQueuedExportJob(maxConcurrentJobs);
     }
   }
+}
+
+function resetExportQueueStateForTests() {
+  clearQueuedExportReleaseTimer();
+
+  while (exportJobWaitQueue.length > 0) {
+    finalizeQueuedExportJob(exportJobWaitQueue.pop());
+  }
+
+  activeExportJobs = 0;
+  activeExportJobsByClient.clear();
+  activeInteractiveSearchRequests = 0;
+  searchPriorityUntilMs = 0;
 }
 
 function appendDxfPolylineEntity(
@@ -20439,6 +20631,10 @@ async function createApp() {
         );
 
         updateRequestProgress(progressToken, { clientIp });
+        const clientDisconnect = createClientDisconnectController(
+          request,
+          response
+        );
 
         try {
           const body = await readJsonBody(request, {
@@ -20736,6 +20932,7 @@ async function createApp() {
             );
           }, {
             clientIp,
+            signal: clientDisconnect.signal,
             onQueued: ({
               position,
               estimatedWaitMs,
@@ -20763,6 +20960,8 @@ async function createApp() {
             );
           }
           throw error;
+        } finally {
+          clientDisconnect.cleanup();
         }
         return;
       }
@@ -20842,6 +21041,7 @@ export {
   buildContourBandGroups,
   buildDxfFromSiteContext,
   buildExportArtifactCacheKey,
+  beginInteractiveSearchPriority,
   buildObjFromSiteContext,
   buildRoadSurfaceFeatureCollection,
   buildSketchUpPayloadFromSiteContext,
@@ -20860,12 +21060,14 @@ export {
   localMetersFromLngLat,
   normalizePublicError,
   normalizeSearchResultsForQuery,
+  endInteractiveSearchPriority,
   selectGeocodedVWorldResultForJusoCandidate,
   selectShortCircuitJusoCandidate,
   selectStrongJusoFastPathCandidates,
   prepareSiteContextForExport,
   pruneCacheEntries,
   readOrLoadResponseCache,
+  resetExportQueueStateForTests,
   resolveSketchUpTerrainSolidSimplifyTolerance,
   resolveRateLimitBucket,
   resolveVWorldSearchCategories,
