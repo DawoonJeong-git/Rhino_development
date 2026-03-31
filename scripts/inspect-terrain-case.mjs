@@ -3,6 +3,8 @@ import path from "node:path";
 import process from "node:process";
 import {
   build3dmFromSiteContext,
+  buildContourBandGroups,
+  buildCumulativeContourBandGroups,
   buildRoadContourSurfaceGroups,
   buildRoadSurfaceFeatureCollection,
   buildSketchUpPayloadFromSiteContext,
@@ -193,6 +195,153 @@ function summarizeContours(contourCollection) {
             max: roundNumber(Math.max(...elevations), 3),
           }
         : null,
+  };
+}
+
+function summarizeContourStages(contourCollection) {
+  const features = contourCollection?.features || [];
+  const lineStrings = features.flatMap((feature) =>
+    getLineStringsFromGeometry(feature?.geometry).map((lineString) => ({
+      elevation: Number(feature?.properties?.elevation),
+      generated: feature?.properties?.generated === true,
+      closedLoop:
+        feature?.properties?.closedLoop === true ||
+        (Array.isArray(lineString) &&
+          lineString.length >= 3 &&
+          JSON.stringify(lineString[0]) === JSON.stringify(lineString[lineString.length - 1])),
+      pointCount: Array.isArray(lineString) ? lineString.length : 0,
+    }))
+  );
+  const elevations = features
+    .map((feature) => Number(feature?.properties?.elevation))
+    .filter(Number.isFinite);
+  const elevationCounts = Object.fromEntries(
+    [...new Map(
+      elevations
+        .sort((left, right) => left - right)
+        .map((elevation) => [elevation, elevations.filter((value) => value === elevation).length])
+    ).entries()]
+  );
+
+  return {
+    featureCount: features.length,
+    lineStringCount: lineStrings.length,
+    nativeFeatureCount: features.filter((feature) => feature?.properties?.generated !== true).length,
+    generatedFeatureCount: features.filter((feature) => feature?.properties?.generated === true).length,
+    closedLoopFeatureCount: features.filter((feature) => feature?.properties?.closedLoop === true).length,
+    closedLineStringCount: lineStrings.filter((line) => line.closedLoop === true).length,
+    totalPointCount: lineStrings.reduce((sum, line) => sum + Number(line.pointCount || 0), 0),
+    elevationCounts,
+    elevationRange:
+      elevations.length > 0
+        ? {
+            min: roundNumber(Math.min(...elevations), 3),
+            max: roundNumber(Math.max(...elevations), 3),
+          }
+        : null,
+  };
+}
+
+function summarizeBandGroupsDetailed(bandGroups) {
+  const groups = bandGroups || [];
+  const bottoms = groups
+    .map((group) => Number(group?.bottomElevation))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  const tops = groups
+    .map((group) => Number(group?.topElevation))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+
+  return {
+    groupCount: groups.length,
+    totalRegionCount: groups.reduce(
+      (sum, group) => sum + Number(group?.regions?.length || 0),
+      0
+    ),
+    totalBoundaryLoopCount: groups.reduce(
+      (sum, group) => sum + Number(group?.boundaryLoops?.length || 0),
+      0
+    ),
+    totalHoleCount: groups.reduce(
+      (sum, group) =>
+        sum +
+        (group?.regions || []).reduce(
+          (inner, region) => inner + Number(region?.holePoints?.length || 0),
+          0
+        ),
+      0
+    ),
+    bottomElevations: bottoms,
+    topElevations: tops,
+    bottomElevationRange:
+      bottoms.length > 0
+        ? {
+            min: roundNumber(Math.min(...bottoms), 3),
+            max: roundNumber(Math.max(...bottoms), 3),
+          }
+        : null,
+    topElevationRange:
+      tops.length > 0
+        ? {
+            min: roundNumber(Math.min(...tops), 3),
+            max: roundNumber(Math.max(...tops), 3),
+          }
+        : null,
+  };
+}
+
+function summarizeTerrainPipeline(exportSiteContext) {
+  const sourceContourCollection = exportSiteContext?.contourLines || null;
+  const exportContourCollection =
+    exportSiteContext?.exportContourLines || exportSiteContext?.contourLines || null;
+  const rawBandGroups = buildContourBandGroups(exportSiteContext);
+  const cumulativeBandGroups = buildCumulativeContourBandGroups(exportSiteContext);
+  const terrainPlan = resolveContourTerrainRenderPlan(exportSiteContext);
+  const renderableBandGroups = terrainPlan?.bandGroups || [];
+  const nativeElevations = [
+    ...new Set(
+      (sourceContourCollection?.features || [])
+        .filter((feature) => feature?.properties?.generated !== true)
+        .map((feature) => Number(feature?.properties?.elevation))
+        .filter(Number.isFinite)
+        .sort((left, right) => left - right)
+    ),
+  ];
+  const exportElevations = new Set(
+    (exportContourCollection?.features || [])
+      .map((feature) => Number(feature?.properties?.elevation))
+      .filter(Number.isFinite)
+  );
+  const renderableBottoms = new Set(
+    renderableBandGroups
+      .map((group) => Number(group?.bottomElevation))
+      .filter(Number.isFinite)
+  );
+
+  return {
+    sourceContours: summarizeContourStages(sourceContourCollection),
+    exportContours: summarizeContourStages(exportContourCollection),
+    rawBandGroups: summarizeBandGroupsDetailed(rawBandGroups),
+    cumulativeBandGroups: summarizeBandGroupsDetailed(cumulativeBandGroups),
+    renderableBandGroups: summarizeBandGroupsDetailed(renderableBandGroups),
+    terrainPlan: terrainPlan
+      ? {
+          terrainGridStep: roundNumber(exportSiteContext?.terrainGrid?.step || 0, 3),
+          interval: roundNumber(terrainPlan.interval || 0, 3),
+          baseElevation: roundNumber(terrainPlan.baseElevation || 0, 3),
+          minBandElevation: roundNumber(terrainPlan.minBandElevation || 0, 3),
+          flatTopElevation: roundNumber(terrainPlan.flatTopElevation || 0, 3),
+          useFlatFallback: terrainPlan.useFlatFallback === true,
+        }
+      : null,
+    nativeElevations,
+    exportMissingNativeElevations: nativeElevations.filter(
+      (elevation) => !exportElevations.has(elevation)
+    ),
+    renderableMissingNativeBottomElevations: nativeElevations.filter(
+      (elevation) => !renderableBottoms.has(elevation)
+    ),
   };
 }
 
@@ -631,6 +780,7 @@ async function main() {
   );
   const derivedRoadSurfaces = summarizeDerivedRoadSurfaces(siteContext);
   const terrainPlan = summarizeTerrainPlan(skpExportSiteContext);
+  const terrainPipeline = summarizeTerrainPipeline(threeDmExportSiteContext);
   const roadContourSurfaceGroups = summarizeRoadContourSurfaceGroups(skpExportSiteContext);
   const threeDmSummary = await summarize3dm(
     await build3dmFromSiteContext(threeDmExportSiteContext)
@@ -676,6 +826,7 @@ async function main() {
         payload: skpPayloadSummary,
       },
     },
+    terrainPipeline,
     comparisons: summarizeComparison(contourSummary, threeDmSummary, skpPayloadSummary),
   };
 

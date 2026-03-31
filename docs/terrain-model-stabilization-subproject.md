@@ -239,6 +239,36 @@ Deliverables:
 - UI state checklist
 - regression test for real preview failure mode
 
+## End-to-End verification rule
+
+Terrain changes must now be checked as one connected pipeline, not as isolated hotfixes.
+
+For every failing case, we should capture and compare these stages together:
+
+1. source `siteContext.contourLines`
+2. export-prepared `contourLines`
+3. export-only `exportContourLines`
+4. raw contour band groups
+5. cumulative contour band groups
+6. renderable terrain band groups
+7. final `3dm` contour layer
+8. final `skp` contour/terrain payload
+
+The practical tool for this is:
+
+- `node scripts/inspect-terrain-case.mjs --site-context <path>`
+
+The output must answer at least these questions:
+
+- Which native contour elevations exist in the source?
+- Which native contour elevations survive into export contours?
+- Which native contour elevations survive into renderable terrain band bottoms?
+- How many internal holes exist in raw, cumulative, and renderable band stages?
+- Does `3dm` keep the same contour coverage as the export contour plan?
+- Does `skp` preserve the same contour coverage while avoiding terrain over-fragmentation?
+
+If a change improves one format but breaks one of the stages above, the change is not complete.
+
 ### Workstream 2. Road provenance audit
 
 Deliverables:
