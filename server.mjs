@@ -125,10 +125,10 @@ const FEATURE_PAGE_DEFINITIONS = Object.freeze([
     routePath: "/contour3dmodel",
     title: "대지·건물 3D 검토",
     summary:
-      "주소 검색과 지도 선택으로 대상지를 정하고, 토지·건축물 정보와 지형·건물·도로 맥락을 확인한 뒤 3DM, OBJ, DXF, SKP 파일까지 바로 준비할 수 있는 서비스입니다.",
+      "주소 검색과 지도 선택으로 대상지를 정하고, 토지·건축물 정보와 주변 맥락을 확인한 뒤 3D 파일로 이어집니다.",
     enabledMeta: [
-      { label: "바로가기", value: "/contour3dmodel", code: true },
-      { label: "출력 형식", value: "OBJ / DXF / SKP / 3DM" },
+      { label: "주요 기능", value: "주소 검색 · 정보 조회 · 지형/건물 확인" },
+      { label: "출력 형식", value: "3DM · OBJ · DXF · SKP" },
     ],
     disabledMeta: [
       { label: "상태", value: "곧 공개" },
@@ -605,16 +605,16 @@ function renderFeatureMetaRow(meta) {
 }
 
 function renderHubFeatureCard(feature) {
-  const cardKicker = feature.publicEnabled ? "Available Now" : "Coming Soon";
-  const badgeText = feature.publicEnabled ? "지금 사용 가능" : "곧 제공";
+  const cardKicker = feature.publicEnabled ? "현재 제공" : "준비 중";
+  const badgeText = feature.publicEnabled ? "사용 가능" : "준비 중";
   const badgeClass = feature.publicEnabled ? "feature-badge is-live" : "feature-badge";
   const cardClass = feature.publicEnabled ? "feature-card-live" : "feature-card-plan";
   const metaRows = (feature.publicEnabled ? feature.enabledMeta : feature.disabledMeta)
     .map((meta) => renderFeatureMetaRow(meta))
     .join("");
   const actionMarkup = feature.publicEnabled
-    ? `<a class="feature-link" href="${escapeHtml(feature.routePath)}">바로 시작하기</a>`
-    : '<span class="feature-link is-secondary is-disabled" aria-disabled="true">곧 공개됩니다</span>';
+    ? `<a class="feature-link" href="${escapeHtml(feature.routePath)}">기능 열기</a>`
+    : '<span class="feature-link is-secondary is-disabled" aria-disabled="true">준비 중</span>';
 
   return [
     `<article class="feature-card ${cardClass}">`,
@@ -640,7 +640,7 @@ function renderHubHtml(config) {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Spaceswork</title>
-    <link rel="stylesheet" href="/hub.css?v=20260331-blue1" />
+    <link rel="stylesheet" href="/hub.css?v=20260331-rose1" />
   </head>
   <body>
     <main class="hub-shell">
@@ -649,11 +649,8 @@ function renderHubHtml(config) {
           <p class="eyebrow">Spaceswork</p>
           <h1>대지·건물 검토 서비스</h1>
           <p class="hero-lead">
-            주소 검색, 토지·건축물 정보 확인, 3D 파일 출력과 검토 기능을 이곳에서 확인할 수 있습니다.
+            주소 검색, 토지·건축물 정보 확인, 3D 파일 출력과 검토 기능을 한 화면에서 살펴볼 수 있습니다.
           </p>
-          <div class="hero-actions">
-            <a class="feature-link hero-primary" href="#services">서비스 보기</a>
-          </div>
         </div>
         <div class="hero-status">
           <div class="status-chip">
@@ -671,15 +668,15 @@ function renderHubHtml(config) {
         </div>
       </section>
 
-      <section class="service-note" aria-label="서비스 소개">
+      <section class="service-note" aria-label="서비스 구성">
         <div>
-          <p class="card-kicker">Services</p>
-          <h2>제공 기능</h2>
+          <p class="card-kicker">구성</p>
+          <h2>현재 제공 범위</h2>
         </div>
         <ul class="service-list">
-          <li>주소 검색, 지도 클릭, 다중 필지, 수동 범위 지정</li>
-          <li>토지·건축물 정보와 주변 건물, 도로, 지형 확인</li>
-          <li>3DM, OBJ, DXF, SKP 출력</li>
+          <li>주소 검색과 지도 선택</li>
+          <li>토지·건축물 정보 확인</li>
+          <li>3D 파일 출력과 후속 검토</li>
         </ul>
       </section>
 
