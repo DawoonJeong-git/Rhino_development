@@ -640,7 +640,7 @@ function renderHubHtml(config) {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Spaceswork</title>
-    <link rel="stylesheet" href="/hub.css?v=20260331-rose1" />
+    <link rel="stylesheet" href="/hub.css?v=20260331-rose2" />
   </head>
   <body>
     <main class="hub-shell">

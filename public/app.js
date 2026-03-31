@@ -2027,14 +2027,14 @@ function updateContextLayers(siteContext) {
   const isRangeMode = siteContext?.selectionMode === "range";
   const isSelectionPreview = siteContext?.layerMode === "selection-preview";
   const targetParcelGroups = siteContext?.targetParcelGroups?.features || [];
-  const targetParcelPalette = ["#1f4f8a", "#2f6fb6", "#4a86c5", "#5f93cf", "#3d739b"];
+  const targetParcelPalette = ["#8f2148", "#c13f68", "#d35a7d", "#b85b78", "#a14261"];
 
   if (!isSelectionPreview && siteContext.clipBoundary) {
     state.layers.clipBoundary = L.geoJSON(siteContext.clipBoundary, {
       style: {
-        color: "#2f6fb6",
+        color: "#c13f68",
         dashArray: "8 8",
-        fillColor: "#2f6fb6",
+        fillColor: "#c13f68",
         fillOpacity: 0.04,
         weight: 2,
       },
@@ -2044,7 +2044,7 @@ function updateContextLayers(siteContext) {
   if (!isSelectionPreview && siteContext.parcelContext?.features?.length) {
     state.layers.parcelContext = L.geoJSON(siteContext.parcelContext, {
       style: {
-        color: "#7390b6",
+        color: "#b85b78",
         fillOpacity: 0,
         opacity: 0.85,
         weight: 1.3,
@@ -2055,8 +2055,8 @@ function updateContextLayers(siteContext) {
   if (!isRangeMode && siteContext.parcelBoundary) {
     state.layers.parcelBoundary = L.geoJSON(siteContext.parcelBoundary, {
       style: {
-        color: isSelectionPreview ? "#2f6fb6" : "#1f4f8a",
-        fillColor: "#5a86c4",
+        color: isSelectionPreview ? "#c13f68" : "#8f2148",
+        fillColor: "#d98ca3",
         fillOpacity: isSelectionPreview ? 0.16 : 0,
         weight: isSelectionPreview ? 5 : 3,
         dashArray: isSelectionPreview ? "8 4" : null,
@@ -2137,9 +2137,9 @@ function updateContextLayers(siteContext) {
       {
         style: (feature) => ({
           color:
-            !isRangeMode && feature?.properties?.isTarget ? "#4e6d93" : "#7d8da3",
+            !isRangeMode && feature?.properties?.isTarget ? "#9f4f67" : "#9e8f97",
           fillColor:
-            !isRangeMode && feature?.properties?.isTarget ? "#87a7cf" : "#bcc7d5",
+            !isRangeMode && feature?.properties?.isTarget ? "#e6b7c6" : "#d4c9cf",
           fillOpacity:
             !isRangeMode && feature?.properties?.isTarget
               ? (isSelectionPreview ? 0.42 : 0.32)
@@ -3778,10 +3778,10 @@ function showRangeDraftBounds(bounds) {
       [bounds.maxLat, bounds.maxLng],
     ],
     {
-      color: "#2f6fb6",
+      color: "#c13f68",
       weight: 3,
       dashArray: "10 6",
-      fillColor: "#5a86c4",
+      fillColor: "#d98ca3",
       fillOpacity: 0.12,
     }
   ).addTo(state.map);
@@ -5480,9 +5480,9 @@ async function handleRangeSelectionMapClick(latlng) {
     if (state.map) {
       state.layers.rangeDraft = L.circleMarker([latlng.lat, latlng.lng], {
         radius: 8,
-        color: "#2f6fb6",
+        color: "#c13f68",
         weight: 3,
-        fillColor: "#5a86c4",
+        fillColor: "#d98ca3",
         fillOpacity: 0.4,
       }).addTo(state.map);
     }
