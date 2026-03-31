@@ -9917,10 +9917,27 @@ async function resolveRoadContext(location, clipFeature, options, config) {
   };
   const candidateRuns = debugOptions.includeRawDiagnostics ? [] : null;
   let selectedRoadResult = null;
+  const clipAreaSqm = polygonAreaSquareMeters(getOuterRing(clipFeature));
   const recordCandidateRun = (entry) => {
     if (Array.isArray(candidateRuns)) {
       candidateRuns.push(entry);
     }
+  };
+  const summarizeRoadResult = (result) => {
+    const collectionFeatures = result?.collection?.features || [];
+    const surfaceAreas = collectionFeatures
+      .map((feature) => polygonAreaSquareMeters(getOuterRing(feature)))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    const totalAreaSqm = surfaceAreas.reduce((sum, value) => sum + value, 0);
+    return {
+      surfaceFeatureCount: Number(collectionFeatures.length || 0),
+      surfaceAreaSqm: Number(totalAreaSqm.toFixed(3)),
+      largestSurfaceAreaSqm: surfaceAreas.length
+        ? Number(Math.max(...surfaceAreas).toFixed(3))
+        : 0,
+      surfaceCoverageRatioToClip:
+        clipAreaSqm > 0 ? Number((totalAreaSqm / clipAreaSqm).toFixed(4)) : null,
+    };
   };
   const finalizeRoadResult = (result) => {
     if (Array.isArray(candidateRuns)) {
@@ -10006,6 +10023,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
             false,
             debugOptions
           );
+          const resultSummary = summarizeRoadResult(result);
 
           recordCandidateRun({
             source: "vworld",
@@ -10016,7 +10034,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
             fetchedFeatureCount,
             dedupedFeatureCount: featureMap.size,
             usableFeatureCount: filteredFeatures.length,
-            surfaceFeatureCount: Number(result?.collection?.features?.length || 0),
+            ...resultSummary,
             selectedByResolver: selectedRoadResult == null,
             note: result.note,
           });
@@ -10090,6 +10108,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
         true,
         debugOptions
       );
+      const resultSummary = summarizeRoadResult(result);
 
       recordCandidateRun({
         source: "overpass",
@@ -10098,7 +10117,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
         geometryType: "line",
         fetchedFeatureCount: Number(collection?.features?.length || 0),
         usableFeatureCount: filteredFeatures.length,
-        surfaceFeatureCount: Number(result?.collection?.features?.length || 0),
+        ...resultSummary,
         selectedByResolver: selectedRoadResult == null,
         note: result.note,
       });
@@ -10207,6 +10226,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
           true,
           debugOptions
         );
+        const resultSummary = summarizeRoadResult(result);
 
         recordCandidateRun({
           source: "vworld-fallback",
@@ -10217,7 +10237,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
           fetchedFeatureCount,
           dedupedFeatureCount: featureMap.size,
           usableFeatureCount: filteredFeatures.length,
-          surfaceFeatureCount: Number(result?.collection?.features?.length || 0),
+          ...resultSummary,
           selectedByResolver: selectedRoadResult == null,
           note: result.note,
         });
