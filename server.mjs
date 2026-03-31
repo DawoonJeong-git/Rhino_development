@@ -16170,6 +16170,8 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
       name: "TERRAIN",
       faces: [],
       polylines: [],
+      mergeSolids: true,
+      softenEdges: true,
       solids: contextTerrainSolids,
     });
   }
@@ -16183,6 +16185,8 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
       container: resolveSketchUpGroupContainer(parcelContainerMap, groupIndex),
       faces: [],
       polylines: [],
+      mergeSolids: true,
+      softenEdges: true,
       solids,
     });
   }
@@ -16522,34 +16526,61 @@ def add_polylines_to_group(group, polylines)
   end
 end
 
-def add_solids_to_group(group, solids)
+def add_solid_to_entities(entities, solid)
+  outer_points = (solid['outerLoop'] || []).map { |point| point_from_triplet(point) }
+  return if outer_points.length < 3
+
+  face = entities.add_face(outer_points)
+  return unless face && face.valid?
+
+  (solid['holeLoops'] || []).each do |hole_loop|
+    hole_points = hole_loop.map { |point| point_from_triplet(point) }
+    next if hole_points.length < 3
+    hole_loop_points = hole_points.dup
+    hole_loop_points << hole_loop_points.first if hole_loop_points.first != hole_loop_points.last
+    entities.add_edges(hole_loop_points)
+    hole_face = entities.add_face(hole_points)
+    hole_face.erase! if hole_face && hole_face.valid?
+  end
+
+  height_inches = solid['heightMeters'].to_f * METERS_TO_INCHES
+  return if height_inches.abs <= 1e-6
+
+  face.reverse! if face.valid? && face.normal.z < 0
+  face.pushpull(height_inches, true) if face.valid?
+end
+
+def soften_coplanar_edges(entities)
+  entities.grep(Sketchup::Edge).each do |edge|
+    next unless edge.valid?
+    faces = edge.faces
+    next unless faces.length == 2
+
+    face_a = faces[0]
+    face_b = faces[1]
+    next unless face_a && face_a.valid? && face_b && face_b.valid?
+    next unless face_a.normal.parallel?(face_b.normal)
+
+    edge.soft = true
+    edge.smooth = true
+    edge.hidden = true
+  end
+end
+
+def add_solids_to_group(group, solids, merge_solids = false, soften_edges = false)
   ents = group.entities
 
   solids.each do |solid|
-    solid_group = ents.add_group
-    solid_ents = solid_group.entities
-    outer_points = (solid['outerLoop'] || []).map { |point| point_from_triplet(point) }
-    next if outer_points.length < 3
-
-    face = solid_ents.add_face(outer_points)
-    next unless face && face.valid?
-
-    (solid['holeLoops'] || []).each do |hole_loop|
-      hole_points = hole_loop.map { |point| point_from_triplet(point) }
-      next if hole_points.length < 3
-      hole_loop_points = hole_points.dup
-      hole_loop_points << hole_loop_points.first if hole_loop_points.first != hole_loop_points.last
-      solid_ents.add_edges(hole_loop_points)
-      hole_face = solid_ents.add_face(hole_points)
-      hole_face.erase! if hole_face && hole_face.valid?
+    if merge_solids
+      add_solid_to_entities(ents, solid)
+      next
     end
 
-    height_inches = solid['heightMeters'].to_f * METERS_TO_INCHES
-    next if height_inches.abs <= 1e-6
-
-    face.reverse! if face.valid? && face.normal.z < 0
-    face.pushpull(height_inches, true) if face.valid?
+    solid_group = ents.add_group
+    add_solid_to_entities(solid_group.entities, solid)
   end
+
+  soften_coplanar_edges(ents) if merge_solids && soften_edges
 end
 
 model = Sketchup.active_model
@@ -16591,7 +16622,12 @@ begin
     group.name = group_data['name'].to_s unless group_data['name'].to_s.empty?
     layer = ensure_layer(model, group_data['layer'])
     group.layer = layer if layer
-    add_solids_to_group(group, group_data['solids'] || [])
+    add_solids_to_group(
+      group,
+      group_data['solids'] || [],
+      group_data['mergeSolids'] == true,
+      group_data['softenEdges'] == true
+    )
     add_faces_to_group(group, group_data['faces'] || [])
     add_polylines_to_group(group, group_data['polylines'] || [])
   end

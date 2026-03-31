@@ -2042,6 +2042,16 @@ async function runBaselineVerification() {
       ),
       "Synthetic stair-step SKP terrain should still generate terrain solids."
     );
+    assert.ok(
+      (stairStepSketchUpPayload?.groups || []).some(
+        (group) =>
+          group?.layer === "terrain" &&
+          Number(group?.solids?.length || 0) > 0 &&
+          group?.mergeSolids === true &&
+          group?.softenEdges === true
+      ),
+      "SKP terrain payload should request merged solids with softened coplanar edges to reduce visible grid seams."
+    );
     const sketchUpDirtyRegion = {
       outerPoints: [
         [0, 0],
