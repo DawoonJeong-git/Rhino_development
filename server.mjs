@@ -14985,7 +14985,7 @@ function boundsOverlap(left, right, toleranceMeters = 0) {
 }
 
 function buildContourTopSurfaceGroups(siteContext) {
-  const bandGroups = getCachedContourBandGroups(siteContext);
+  const bandGroups = getCachedCumulativeContourBandGroups(siteContext);
 
   if (!bandGroups.length) {
     return [];
