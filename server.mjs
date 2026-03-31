@@ -9799,9 +9799,20 @@ function buildRoadContextResult(
   geometryType,
   location,
   note,
-  isFallback = false
+  isFallback = false,
+  debugOptions = null
 ) {
+  const rawCollection = featureCollection(features);
   const surfaceCollection = buildRoadSurfaceFeatureCollection(features, location);
+  const diagnostics =
+    debugOptions?.includeRawDiagnostics === true
+      ? {
+          rawFeatureCount: Array.isArray(features) ? features.length : 0,
+          rawGeometryType: geometryType,
+          rawCollection,
+          derivedSurfaceCollection: surfaceCollection,
+        }
+      : null;
 
   if (surfaceCollection.features.length) {
     const rawFeatureLabel = geometryType === "polygon" ? "polygon" : "line";
@@ -9810,6 +9821,7 @@ function buildRoadContextResult(
       collection: surfaceCollection,
       provider,
       isFallback,
+      diagnostics,
       note:
         rawFeatureCount > 0
           ? `Loaded ${rawFeatureCount} road ${rawFeatureLabel} feature(s) from ${provider}; merged them into ${surfaceCollection.features.length} road surface polygon(s).`
@@ -9818,9 +9830,10 @@ function buildRoadContextResult(
   }
 
   return {
-    collection: featureCollection(features),
+    collection: rawCollection,
     provider,
     isFallback,
+    diagnostics,
     note,
   };
 }
@@ -9898,6 +9911,10 @@ async function resolveRoadContext(location, clipFeature, options, config) {
     (candidate) => candidate.layer === "lt_l_sprd"
   );
   const hasVWorldKey = Boolean(config.vworldApiKey);
+  const debugOptions = {
+    includeRawDiagnostics:
+      options?.debugDiagnostics === true || options?.debugRoadDiagnostics === true,
+  };
 
   if (hasVWorldKey) {
     for (const candidate of ROAD_LAYER_CANDIDATES) {
@@ -9968,7 +9985,8 @@ async function resolveRoadContext(location, clipFeature, options, config) {
             candidate.geometryType,
             location,
             `Loaded ${filteredFeatures.length} road feature(s) from ${candidate.layer}.`,
-            false
+            false,
+            debugOptions
           );
         }
       } catch (error) {
@@ -10007,7 +10025,8 @@ async function resolveRoadContext(location, clipFeature, options, config) {
         "line",
         location,
         `Loaded ${filteredFeatures.length} road feature(s) from Overpass.`,
-        true
+        true,
+        debugOptions
       );
     }
   } catch (error) {
@@ -10081,7 +10100,8 @@ async function resolveRoadContext(location, clipFeature, options, config) {
           fallbackBoundaryCandidate.geometryType,
           location,
           `Loaded ${filteredFeatures.length} road feature(s) from ${fallbackBoundaryCandidate.layer}.`,
-          true
+          true,
+          debugOptions
         );
       }
     } catch (error) {
@@ -10252,6 +10272,10 @@ async function buildSiteContext(body, config, reportProgress = null) {
   const lng = Number(location.lng);
   const progress =
     typeof reportProgress === "function" ? reportProgress : () => null;
+  const diagnosticsRequested =
+    body?.debugDiagnostics === true ||
+    body?.options?.debugDiagnostics === true ||
+    body?.options?.debugRoadDiagnostics === true;
 
   const normalizedLocation = {
     ...location,
@@ -10278,6 +10302,7 @@ async function buildSiteContext(body, config, reportProgress = null) {
   const cachedSiteContext = siteContextCache.get(cacheKey);
 
   if (
+    !diagnosticsRequested &&
     cachedSiteContext &&
     now - cachedSiteContext.cachedAt < SITE_CONTEXT_CACHE_TTL_MS
   ) {
@@ -10550,6 +10575,13 @@ async function buildSiteContext(body, config, reportProgress = null) {
     roads: roadResult.collection,
   };
 
+  if (diagnosticsRequested) {
+    siteContext.debug = {
+      requestedAt: new Date().toISOString(),
+      roads: roadResult?.diagnostics || null,
+    };
+  }
+
   const effectiveContourBandInterval = resolveEffectiveContourBandInterval(
     siteContext
   );
@@ -10568,17 +10600,20 @@ async function buildSiteContext(body, config, reportProgress = null) {
   }
 
   const cachedAt = Date.now();
-  siteContextCache.set(cacheKey, {
-    cachedAt,
-    lastAccessedAt: cachedAt,
-    value: siteContext,
-  });
-  pruneCacheEntries(siteContextCache, {
-    now: cachedAt,
-    maxEntries: SITE_CONTEXT_CACHE_MAX_ENTRIES,
-    isExpired: (entry, timestamp) =>
-      timestamp - Number(entry?.cachedAt || 0) >= SITE_CONTEXT_CACHE_TTL_MS,
-  });
+
+  if (!diagnosticsRequested) {
+    siteContextCache.set(cacheKey, {
+      cachedAt,
+      lastAccessedAt: cachedAt,
+      value: siteContext,
+    });
+    pruneCacheEntries(siteContextCache, {
+      now: cachedAt,
+      maxEntries: SITE_CONTEXT_CACHE_MAX_ENTRIES,
+      isExpired: (entry, timestamp) =>
+        timestamp - Number(entry?.cachedAt || 0) >= SITE_CONTEXT_CACHE_TTL_MS,
+    });
+  }
 
   progress(100, "대지 컨텍스트 준비가 완료되었습니다.");
   return siteContext;

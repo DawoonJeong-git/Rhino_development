@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node server.mjs",
+    "inspect:preview": "node scripts/inspect-preview-flow.mjs",
     "inspect:terrain": "node scripts/inspect-terrain-case.mjs",
     "start": "node server.mjs",
     "verify:baseline": "node verify-exports.mjs --baseline",

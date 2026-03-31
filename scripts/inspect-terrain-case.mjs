@@ -19,6 +19,7 @@ const DEFAULT_OPTIONS = {
   includeParcelBoundary: true,
   includeContours: true,
   includeRoads: true,
+  debugRoadDiagnostics: true,
   contourInterval: 1,
   terrainMode: "contour",
   buildingPlacement: "dominant",
@@ -196,7 +197,8 @@ function summarizeContours(contourCollection) {
 }
 
 function summarizeRawRoads(siteContext) {
-  const features = siteContext?.roads?.features || [];
+  const features =
+    siteContext?.debug?.roads?.rawCollection?.features || siteContext?.roads?.features || [];
   const polygonSets = features.flatMap((feature) =>
     getPolygonCoordinateSets(feature?.geometry)
   );
@@ -645,6 +647,7 @@ async function main() {
       stats: siteContext?.stats || {},
       dataSources: siteContext?.dataSources || {},
       options: siteContext?.options || {},
+      debug: siteContext?.debug || null,
     },
     contours: contourSummary,
     roads: {
