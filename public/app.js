@@ -4588,6 +4588,8 @@ function updateDownloadButtonLabel() {
 
   if (previewSiteContextButton) {
     previewSiteContextButton.textContent = "모델 미리보기";
+    previewSiteContextButton.dataset.idleLabel = "모델 미리보기";
+    previewSiteContextButton.dataset.busyLabel = "미리보기 준비 중...";
   }
 }
 
@@ -4721,6 +4723,16 @@ function resolvePanelChipState(scope) {
 function syncBusyButtonState(button, isDisabled, isBusy = false) {
   if (!button) {
     return;
+  }
+
+  const idleLabel = String(button.dataset.idleLabel || button.textContent || "").trim();
+
+  if (!button.dataset.idleLabel && idleLabel) {
+    button.dataset.idleLabel = idleLabel;
+  }
+
+  if (button.dataset.busyLabel) {
+    button.textContent = isBusy ? button.dataset.busyLabel : button.dataset.idleLabel;
   }
 
   button.disabled = Boolean(isDisabled);
@@ -5092,6 +5104,10 @@ async function generateModelSpec() {
 
   const operationKey = "preview";
   const startedAt = performance.now();
+  state.siteContextNoteOverride = "현재 조건으로 미리보기를 준비하는 중입니다.";
+  specPreview.textContent = "현재 조건으로 대지/지형/건물 미리보기를 불러오는 중입니다.";
+  setActionFeedback("모델 미리보기를 준비하는 중입니다.");
+  renderSiteContextMeta();
   startModelProgress(operationKey, "대지, 지형, 건물 컨텍스트를 준비하는 중입니다.", {
     startValue: 8,
     maxValue: 94,

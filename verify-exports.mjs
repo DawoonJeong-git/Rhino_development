@@ -1900,10 +1900,8 @@ async function runBaselineVerification() {
         Number(refined3dmSiteContext?.terrainGrid?.step || 0) < 1.25,
       "3DM refined terrain grid should also use a tighter sample step than the source grid."
     );
-    const refined3dmExportContourCollection =
-      refined3dmSiteContext?.exportContourLines || refined3dmSiteContext?.contourLines;
     const refined3dmContourElevations = [...new Set(
-      (refined3dmExportContourCollection?.features || [])
+      (refined3dmSiteContext?.contourLines?.features || [])
         .map((feature) => Number(feature?.properties?.elevation))
         .filter((value) => Number.isFinite(value))
         .sort((left, right) => left - right)
@@ -1922,21 +1920,6 @@ async function runBaselineVerification() {
       refined3dmSiteContext?.stats?.effectiveContourDisplayInterval,
       1,
       "3DM contour curve export should match the terrain band interval so curves and terraces stay aligned."
-    );
-    assert.ok(
-      Number(refined3dmSiteContext?.stats?.exportContourClosedLoopCount || 0) > 0,
-      "3DM contour export should build closed contour loops from the clipped raw contours."
-    );
-    assert.ok(
-      (refined3dmSiteContext?.exportContourLines?.features || []).every((feature) => {
-        const coordinates = feature?.geometry?.coordinates || [];
-        return (
-          Array.isArray(coordinates) &&
-          coordinates.length >= 4 &&
-          JSON.stringify(coordinates[0]) === JSON.stringify(coordinates[coordinates.length - 1])
-        );
-      }),
-      "3DM export contour loops should be explicitly closed after clipping."
     );
     const refined3dmTerrainPlan = resolveContourTerrainRenderPlan(refined3dmSiteContext);
     assert.equal(
@@ -1984,22 +1967,17 @@ async function runBaselineVerification() {
     const refinedSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       refinedSketchUpSiteContext
     );
-    const refinedContourPolylines = (refinedSketchUpPayload.groups || [])
+    const refinedContourCurves = (refinedSketchUpPayload.groups || [])
       .filter((group) => group?.layer === "contours")
-      .flatMap((group) => group?.polylines || []);
+      .flatMap((group) => group?.polylines || [])
+      .map((polyline) => polyline?.curve === true);
     assert.ok(
-      refinedContourPolylines.length > 0,
+      refinedContourCurves.length > 0,
       "SKP payload should still contain contour polylines."
     );
     assert.ok(
-      refinedContourPolylines.some((polyline) => polyline?.closed === true),
-      "SKP contour export should include closed contour loops after boundary clipping."
-    );
-    assert.ok(
-      refinedContourPolylines.every(
-        (polyline) => polyline?.closed === true || polyline?.curve === true
-      ),
-      "SKP contour polylines should remain either closed loops or explicit curves."
+      refinedContourCurves.every(Boolean),
+      "SKP contour polylines should be exported as curves."
     );
     const stairStepSketchUpSource = cloneJsonValue({
       ...syntheticContourSiteContext,
