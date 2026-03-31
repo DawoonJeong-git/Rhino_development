@@ -25,6 +25,7 @@ const state = {
   selectionPreviewCache: new Map(),
   selectedLocation: null,
   siteContext: null,
+  siteContextNoteOverride: "",
   siteContextRequest: null,
   siteContextOptionsSignature: "",
   suppressNextAutoFit: false,
@@ -2157,6 +2158,60 @@ function updateContextLayers(siteContext) {
   state.suppressNextAutoFit = false;
 }
 
+function cloneLeafletBounds(bounds) {
+  if (!bounds || typeof bounds.isValid !== "function" || !bounds.isValid()) {
+    return null;
+  }
+
+  return L.latLngBounds(bounds.getSouthWest(), bounds.getNorthEast());
+}
+
+function focusSiteContextLayersOnMap(siteContext) {
+  if (!state.map || !siteContext) {
+    return false;
+  }
+
+  const layerCandidates = [
+    state.layers.clipBoundary,
+    state.layers.targetParcelGroups,
+    state.layers.parcelBoundary,
+    state.layers.buildings,
+  ];
+  let bounds = null;
+
+  for (const layer of layerCandidates) {
+    if (!layer || typeof layer.getBounds !== "function") {
+      continue;
+    }
+
+    const layerBounds = cloneLeafletBounds(layer.getBounds());
+
+    if (!layerBounds) {
+      continue;
+    }
+
+    if (!bounds) {
+      bounds = layerBounds;
+      continue;
+    }
+
+    bounds.extend(layerBounds);
+  }
+
+  if (!bounds || !bounds.isValid()) {
+    return false;
+  }
+
+  state.map.stop();
+  state.map.closePopup();
+  state.map.fitBounds(bounds.pad(0.14), {
+    animate: false,
+    padding: [32, 32],
+    maxZoom: 19,
+  });
+  return true;
+}
+
 function renderSelectionSummary() {
   if (!state.selectedLocation) {
     selectionSummary.classList.remove("has-multi-list");
@@ -2301,6 +2356,7 @@ function renderSiteContextMeta() {
   const buildings = state.siteContext.dataSources?.buildings;
   const stats = state.siteContext.stats || {};
   const targetParcelCount = Number(stats.targetParcelCount || 0);
+  const siteContextNoteOverride = String(state.siteContextNoteOverride || "").trim();
 
   siteContextMeta.innerHTML = `
     <div><dt>대지 경계</dt><dd>${escapeHtml(
@@ -2322,7 +2378,12 @@ function renderSiteContextMeta() {
   `;
   siteContextNote.textContent = getRequestAwareNote(
     "siteContext",
-    contours?.note || terrain?.note || buildings?.note || parcel?.note || "대지 컨텍스트를 불러왔습니다."
+    siteContextNoteOverride ||
+      contours?.note ||
+      terrain?.note ||
+      buildings?.note ||
+      parcel?.note ||
+      "대지 컨텍스트를 불러왔습니다."
   );
 }
 
@@ -3877,6 +3938,7 @@ function hasSelectionPreviewForCurrentSelection(selectionKey = state.activeSelec
 function markModelOptionsDirty() {
   const previewStillFresh = hasFreshSiteContextForCurrentOptions();
   state.latestSpec = null;
+  state.siteContextNoteOverride = "";
 
   if (previewStillFresh) {
     if (state.siteContext) {
@@ -5049,6 +5111,11 @@ async function generateModelSpec() {
       summary,
     };
     specPreview.textContent = summary;
+    const focused = focusSiteContextLayersOnMap(siteContext);
+    state.siteContextNoteOverride = focused
+      ? "미리보기가 갱신되었습니다. 지도를 현재 대지 범위로 맞췄습니다."
+      : "미리보기가 갱신되었습니다.";
+    renderSiteContextMeta();
     finishModelProgress("범위 적용이 완료되었습니다.");
     rememberModelProgressEstimate(operationKey, performance.now() - startedAt);
     return siteContext;
@@ -5760,6 +5827,7 @@ function setSelectedLocation(location, moveMap = true) {
   state.pendingSearchSelectionId = "";
   setSearchSelectionCardVisible(false);
   state.selectedLocation = location;
+  state.siteContextNoteOverride = "";
   const rangeMode = isRangeSelection(location);
   const multiParcelMode = isMultiParcelSelection(location);
   state.activeSelectionKey = buildHistoryKey(location);

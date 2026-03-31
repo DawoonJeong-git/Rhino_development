@@ -235,9 +235,22 @@ async function runSiteContextPreview(page, timeoutMs = 120000) {
     timeoutMs
   );
 
+  const siteContextNote = await waitForStableText(
+    page,
+    "#siteContextNote",
+    [],
+    timeoutMs
+  );
+  assert.match(
+    String(siteContextNote || ""),
+    /미리보기가 갱신되었습니다/,
+    "Preview flow should visibly confirm that the map preview was refreshed."
+  );
+
   return {
     specSummary,
     siteContextChip,
+    siteContextNote,
   };
 }
 

@@ -1878,6 +1878,31 @@ async function runBaselineVerification() {
         Number(refinedSketchUpSiteContext?.terrainGrid?.step || 0) < 1.25,
       "SKP refined terrain grid should use a tighter sample step than the source grid."
     );
+    assert.equal(
+      refinedSketchUpSiteContext?.stats?.nativeContourTerrainGridRefined,
+      true,
+      "SKP export should record that native contour terrain refinement ran."
+    );
+    const refined3dmSiteContext = prepareSiteContextForExport(
+      syntheticContourSiteContext,
+      syntheticContourSiteContext.options,
+      "3dm"
+    );
+    assert.equal(
+      refined3dmSiteContext?.stats?.nativeContourTerrainGridRefined,
+      true,
+      "3DM export should refine official contour terrain sampling when native contours exist."
+    );
+    assert.ok(
+      Number(refined3dmSiteContext?.terrainGrid?.step || 0) > 0 &&
+        Number(refined3dmSiteContext?.terrainGrid?.step || 0) < 1.25,
+      "3DM refined terrain grid should also use a tighter sample step than the source grid."
+    );
+    assert.deepEqual(
+      refined3dmSiteContext?.contourLines,
+      syntheticContourSiteContext.contourLines,
+      "3DM export should keep the native contour geometries while refining the terrain grid."
+    );
     const refinedSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       refinedSketchUpSiteContext
     );

@@ -901,40 +901,81 @@ function hasOfficialContourDisplaySource(siteContext) {
 }
 
 function shouldRefineSketchUpTerrainGrid(siteContext) {
-  const radiusMeters = Math.max(30, Number(siteContext?.options?.radius) || 120);
-
   return Boolean(
     isSketchUpExportFormat(siteContext) &&
+      shouldRefineNativeContourTerrainGrid(siteContext)
+  );
+}
+
+function shouldRefineNativeContourTerrainGrid(siteContext) {
+  const radiusMeters = Math.max(30, Number(siteContext?.options?.radius) || 120);
+  const exportFormat = String(siteContext?.options?.exportFormat || "")
+    .trim()
+    .toLowerCase();
+
+  return Boolean(
+    (exportFormat === "skp" ||
+      exportFormat === "skp-payload" ||
+      exportFormat === "3dm" ||
+      exportFormat === "obj") &&
       siteContext?.options?.terrainMode === "contour" &&
       siteContext?.terrainGrid?.elevations?.length &&
       siteContext?.clipBoundary &&
       hasOfficialContourDisplaySource(siteContext) &&
-      radiusMeters <= 220
+      radiusMeters <= 260
   );
 }
 
 function resolveSketchUpTerrainRefineStep(siteContext) {
+  return resolveNativeContourTerrainRefineStep(siteContext);
+}
+
+function resolveNativeContourTerrainRefineStep(siteContext) {
   const currentStep = Number(siteContext?.terrainGrid?.step || 0);
   const sourceContourInterval = resolveSourceContourInterval(siteContext);
   const radiusMeters = Math.max(30, Number(siteContext?.options?.radius) || 120);
+  const exportFormat = String(siteContext?.options?.exportFormat || "")
+    .trim()
+    .toLowerCase();
+  const sketchUpFormat = isSketchUpExportFormat(siteContext);
+  const formatScale =
+    sketchUpFormat
+      ? 0.58
+      : exportFormat === "3dm"
+        ? 0.68
+        : exportFormat === "obj"
+          ? 0.78
+          : 0.72;
   const maxPreferredStep =
     sourceContourInterval <= 1
-      ? 0.5
+      ? 0.45
       : sourceContourInterval <= 2
-        ? 0.7
+        ? 0.65
         : sourceContourInterval <= 5
-          ? 0.95
+          ? 0.85
           : sourceContourInterval <= 10
-            ? 1.25
-            : 1.6;
-  const radiusScaledStep =
+            ? 1.1
+            : 1.45;
+  const radiusScale =
     radiusMeters <= 120
-      ? currentStep * 0.6
+      ? formatScale
       : radiusMeters <= 220
-        ? currentStep * 0.72
-        : currentStep * 0.82;
+        ? Math.min(formatScale + 0.1, 0.82)
+        : Math.min(formatScale + 0.16, 0.9);
+  const radiusScaledStep =
+    currentStep * radiusScale;
   const minimumStep =
-    radiusMeters <= 120 ? 0.35 : radiusMeters <= 220 ? 0.45 : 0.6;
+    radiusMeters <= 120
+      ? sketchUpFormat
+        ? 0.35
+        : 0.4
+      : radiusMeters <= 220
+        ? sketchUpFormat
+          ? 0.45
+          : 0.55
+        : exportFormat === "obj"
+          ? 0.8
+          : 0.65;
   const targetStep = Math.max(
     minimumStep,
     Math.min(
@@ -948,13 +989,13 @@ function resolveSketchUpTerrainRefineStep(siteContext) {
   return Number(targetStep.toFixed(3));
 }
 
-function maybeRefineSketchUpTerrainGrid(siteContext) {
-  if (!shouldRefineSketchUpTerrainGrid(siteContext)) {
+function maybeRefineNativeContourTerrainGrid(siteContext) {
+  if (!shouldRefineNativeContourTerrainGrid(siteContext)) {
     return siteContext;
   }
 
   const currentStep = Number(siteContext?.terrainGrid?.step || 0);
-  const targetStep = resolveSketchUpTerrainRefineStep(siteContext);
+  const targetStep = resolveNativeContourTerrainRefineStep(siteContext);
 
   if (
     !Number.isFinite(targetStep) ||
@@ -977,22 +1018,36 @@ function maybeRefineSketchUpTerrainGrid(siteContext) {
       siteContext.terrainGrid = refinedGrid;
       siteContext.stats = {
         ...(siteContext?.stats || {}),
-        skpTerrainGridRefined: true,
-        skpTerrainGridSourceStep: Number.isFinite(currentStep)
+        nativeContourTerrainGridRefined: true,
+        nativeContourTerrainGridSourceStep: Number.isFinite(currentStep)
           ? Number(currentStep.toFixed(3))
           : null,
-        skpTerrainGridStep: Number(
+        nativeContourTerrainGridStep: Number(
           Number(refinedGrid.step || targetStep).toFixed(3)
         ),
       };
+
+      if (isSketchUpExportFormat(siteContext)) {
+        siteContext.stats.skpTerrainGridRefined = true;
+        siteContext.stats.skpTerrainGridSourceStep = Number.isFinite(currentStep)
+          ? Number(currentStep.toFixed(3))
+          : null;
+        siteContext.stats.skpTerrainGridStep = Number(
+          Number(refinedGrid.step || targetStep).toFixed(3)
+        );
+      }
     }
   } catch (error) {
     console.warn(
-      `[skp-contours] terrain-grid refinement fallback error=${formatErrorForLog(error)}`
+      `[terrain-contours] terrain-grid refinement fallback error=${formatErrorForLog(error)}`
     );
   }
 
   return siteContext;
+}
+
+function maybeRefineSketchUpTerrainGrid(siteContext) {
+  return maybeRefineNativeContourTerrainGrid(siteContext);
 }
 
 function resolveEffectiveContourBandInterval(siteContext) {
@@ -8865,31 +8920,107 @@ function estimateElevationFromContourRecords(
   contourInterval,
   sampleStep
 ) {
-  const nearestRecords = contourRecords
-    .map((record) => ({
-      elevation: record.elevation,
-      distanceSquared: distanceSquaredPointToContourRecord(xMeters, yMeters, record),
-    }))
-    .filter((item) => Number.isFinite(item.distanceSquared))
-    .sort((left, right) => left.distanceSquared - right.distanceSquared)
-    .slice(0, Math.min(6, contourRecords.length));
+  const nearestByElevation = new Map();
+
+  for (const record of contourRecords) {
+    const distanceSquared = distanceSquaredPointToContourRecord(
+      xMeters,
+      yMeters,
+      record
+    );
+
+    if (!Number.isFinite(distanceSquared)) {
+      continue;
+    }
+
+    const elevationKey = Number(record.elevation.toFixed(3));
+    const existing = nearestByElevation.get(elevationKey);
+
+    if (!existing || distanceSquared < existing.distanceSquared) {
+      nearestByElevation.set(elevationKey, {
+        elevation: elevationKey,
+        distanceSquared,
+      });
+    }
+  }
+
+  const nearestRecords = [...nearestByElevation.values()].sort(
+    (left, right) => left.distanceSquared - right.distanceSquared
+  );
 
   if (!nearestRecords.length) {
     return null;
   }
 
-  const snapThresholdSquared = Math.pow(Math.max(0.5, sampleStep * 0.35), 2);
+  const snapThresholdSquared = Math.pow(Math.max(0.75, sampleStep * 0.6), 2);
 
   if (nearestRecords[0].distanceSquared <= snapThresholdSquared) {
     return Number(nearestRecords[0].elevation.toFixed(3));
   }
 
+  const elevationOrderedRecords = [...nearestRecords].sort(
+    (left, right) => left.elevation - right.elevation
+  );
+  let preferredPair = null;
+  let preferredPairScore = Number.POSITIVE_INFINITY;
+
+  for (let index = 0; index < elevationOrderedRecords.length - 1; index += 1) {
+    const lowerRecord = elevationOrderedRecords[index];
+    const upperRecord = elevationOrderedRecords[index + 1];
+    const elevationGap = Number(
+      (upperRecord.elevation - lowerRecord.elevation).toFixed(3)
+    );
+
+    if (!(elevationGap > 1e-6)) {
+      continue;
+    }
+
+    const lowerDistance = Math.max(Math.sqrt(lowerRecord.distanceSquared), 0.25);
+    const upperDistance = Math.max(Math.sqrt(upperRecord.distanceSquared), 0.25);
+    const normalizedGap =
+      contourInterval > 0 ? Math.max(1, elevationGap / contourInterval) : 1;
+    const balancePenalty = Math.abs(lowerDistance - upperDistance) * 0.12;
+    const score =
+      (lowerDistance + upperDistance) * normalizedGap + balancePenalty;
+
+    if (score < preferredPairScore) {
+      preferredPair = {
+        lowerRecord,
+        upperRecord,
+      };
+      preferredPairScore = score;
+    }
+  }
+
+  if (preferredPair) {
+    const lowerDistance = Math.max(
+      Math.sqrt(preferredPair.lowerRecord.distanceSquared),
+      0.25
+    );
+    const upperDistance = Math.max(
+      Math.sqrt(preferredPair.upperRecord.distanceSquared),
+      0.25
+    );
+    const totalDistance = lowerDistance + upperDistance;
+
+    if (totalDistance > 0) {
+      const ratio = lowerDistance / totalDistance;
+      const interpolatedElevation =
+        preferredPair.lowerRecord.elevation +
+        (preferredPair.upperRecord.elevation -
+          preferredPair.lowerRecord.elevation) *
+          ratio;
+
+      return Number(interpolatedElevation.toFixed(3));
+    }
+  }
+
   let weightedElevationSum = 0;
   let totalWeight = 0;
 
-  for (const record of nearestRecords) {
+  for (const record of nearestRecords.slice(0, 4)) {
     const distance = Math.max(Math.sqrt(record.distanceSquared), 0.35);
-    const weight = 1 / Math.pow(distance, 1.8);
+    const weight = 1 / Math.pow(distance, 2.2);
     weightedElevationSum += record.elevation * weight;
     totalWeight += weight;
   }
@@ -19725,7 +19856,7 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
       ? { ...exportSiteContext.dataSources.contours }
       : exportSiteContext?.dataSources?.contours,
   };
-  maybeRefineSketchUpTerrainGrid(exportSiteContext);
+  maybeRefineNativeContourTerrainGrid(exportSiteContext);
   const requestedContourInterval = normalizeContourInterval(
     exportSiteContext.options?.contourInterval
   );
@@ -19792,7 +19923,7 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
   }
 
   console.log(
-    `[export-terrain] format=${format} requested=${requestedContourInterval} source=${sourceContourInterval} effective=${effectiveContourBandInterval} display=${exportSiteContext.stats.effectiveContourDisplayInterval} preserveNativeContours=${preserveNativeContourDisplayLines} skpTerrainStep=${Number(exportSiteContext?.terrainGrid?.step || 0).toFixed(3)} refined=${exportSiteContext?.stats?.skpTerrainGridRefined === true}`
+    `[export-terrain] format=${format} requested=${requestedContourInterval} source=${sourceContourInterval} effective=${effectiveContourBandInterval} display=${exportSiteContext.stats.effectiveContourDisplayInterval} preserveNativeContours=${preserveNativeContourDisplayLines} terrainStep=${Number(exportSiteContext?.terrainGrid?.step || 0).toFixed(3)} refined=${exportSiteContext?.stats?.nativeContourTerrainGridRefined === true}`
   );
 
   return exportSiteContext;
