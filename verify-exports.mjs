@@ -1982,6 +1982,15 @@ async function runBaselineVerification() {
       3,
       "Merged contour export should keep the original shape while removing duplicate breakpoints."
     );
+    const closedExportContours = refined3dmSiteContext?.exportContourLines?.features || [];
+    assert.ok(
+      closedExportContours.length > 0,
+      "3DM contour export should produce closed export contours when contour terrain bands are available."
+    );
+    assert.ok(
+      closedExportContours.every((feature) => feature?.properties?.closedLoop === true),
+      "3DM contour export should mark each exported contour loop as closed."
+    );
     const refined3dmTerrainPlan = resolveContourTerrainRenderPlan(refined3dmSiteContext);
     assert.equal(
       refined3dmSiteContext?.stats?.rawAnchoredContourTerrainUsed,

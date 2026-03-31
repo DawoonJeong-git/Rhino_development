@@ -9912,6 +9912,75 @@ function normalizeContourFeatureCollection(siteContext, contourCollection = null
   );
 }
 
+function buildClosedContourExportCollection(siteContext) {
+  const cumulativeGroups = getCachedCumulativeContourBandGroups(siteContext);
+
+  if (!cumulativeGroups.length || !siteContext?.location) {
+    return siteContext?.contourLines || featureCollection([]);
+  }
+
+  const nativeElevationKeys = new Set(
+    (siteContext?.contourLines?.features || [])
+      .filter((feature) => feature?.properties?.generated !== true)
+      .map((feature) => Number(feature?.properties?.elevation))
+      .filter((value) => Number.isFinite(value))
+      .map((value) => buildContourLevelKey(value))
+  );
+  const features = [];
+
+  for (const group of cumulativeGroups) {
+    const elevation = Number(group?.bottomElevation);
+
+    if (!Number.isFinite(elevation)) {
+      continue;
+    }
+
+    const levelKey = buildContourLevelKey(elevation);
+    const generated = !nativeElevationKeys.has(levelKey);
+
+    for (const loop of group?.boundaryLoops || []) {
+      const closedLoop = closeRing(dedupeLocalPolygonPoints(loop, 0.001));
+
+      if (closedLoop.length < 4) {
+        continue;
+      }
+
+      features.push(
+        lineFeature(
+          closedLoop.map(([xMeters, yMeters]) =>
+            lngLatFromMeters(siteContext.location, xMeters, yMeters)
+          ),
+          {
+            elevation: Number(elevation.toFixed(3)),
+            provider: generated ? "derived-contours-closed" : "official-contours-closed",
+            generated,
+            closedLoop: true,
+            exportDerived: "cumulative-contour-boundary",
+          }
+        )
+      );
+    }
+  }
+
+  return featureCollection(
+    features.sort(
+      (left, right) =>
+        Number(left?.properties?.elevation || 0) -
+          Number(right?.properties?.elevation || 0) ||
+        Number(Boolean(left?.properties?.generated)) -
+          Number(Boolean(right?.properties?.generated))
+    )
+  );
+}
+
+function getExportContourFeatureCollection(siteContext) {
+  if (siteContext?.exportContourLines?.features?.length) {
+    return siteContext.exportContourLines;
+  }
+
+  return siteContext?.contourLines || featureCollection([]);
+}
+
 async function resolveParcelBoundary(location, config) {
   if (!config.vworldApiKey) {
     const mockParcel = normalizeParcelFeature(createMockParcelFeature(location));
@@ -14154,6 +14223,13 @@ function buildRawAnchoredContourBandGroups(siteContext) {
   }
 
   if (bandGroups.length) {
+    Object.assign(bandGroups, {
+      rawAnchoredContourTerrainUsed: true,
+      rawAnchoredContourBandCount: bandGroups.length,
+      rawAnchoredContourEntryCount: contourEntries.length,
+      rawAnchoredNativeContourLevelCount: anchorLevels.length,
+      rawAnchoredSourceContourInterval: sourceContourInterval,
+    });
     siteContext.stats = {
       ...(siteContext?.stats || {}),
       rawAnchoredContourTerrainUsed: true,
@@ -14454,6 +14530,33 @@ function buildContourBandGroups(siteContext) {
   return buildGridContourBandGroups(siteContext);
 }
 
+function applyContourBandGroupStats(siteContext, bandGroups) {
+  if (!siteContext || typeof siteContext !== "object" || !Array.isArray(bandGroups)) {
+    return bandGroups;
+  }
+
+  if (bandGroups.rawAnchoredContourTerrainUsed === true) {
+    siteContext.stats = {
+      ...(siteContext?.stats || {}),
+      rawAnchoredContourTerrainUsed: true,
+      rawAnchoredContourBandCount: Number(
+        bandGroups.rawAnchoredContourBandCount || bandGroups.length || 0
+      ),
+      rawAnchoredContourEntryCount: Number(
+        bandGroups.rawAnchoredContourEntryCount || 0
+      ),
+      rawAnchoredNativeContourLevelCount: Number(
+        bandGroups.rawAnchoredNativeContourLevelCount || 0
+      ),
+      rawAnchoredSourceContourInterval: Number(
+        bandGroups.rawAnchoredSourceContourInterval || 0
+      ),
+    };
+  }
+
+  return bandGroups;
+}
+
 function getCachedContourBandGroups(siteContext) {
   if (!siteContext || typeof siteContext !== "object") {
     return buildContourBandGroups(siteContext);
@@ -14466,14 +14569,14 @@ function getCachedContourBandGroups(siteContext) {
   );
 
   if (sharedCachedBandGroups) {
-    return sharedCachedBandGroups;
+    return applyContourBandGroupStats(siteContext, sharedCachedBandGroups);
   }
 
   const owner = resolveContourCacheOwner(siteContext);
   const entry = getOrCreateWeakMapEntry(contourBandGroupCache, owner);
 
   if (entry instanceof Map && entry.has(cacheKey)) {
-    return entry.get(cacheKey);
+    return applyContourBandGroupStats(siteContext, entry.get(cacheKey));
   }
 
   const bandGroups = buildContourBandGroups(siteContext).sort(
@@ -14487,7 +14590,7 @@ function getCachedContourBandGroups(siteContext) {
   }
   writeSharedDerivedCache(sharedContourBandGroupCache, cacheKey, bandGroups);
 
-  return bandGroups;
+  return applyContourBandGroupStats(siteContext, bandGroups);
 }
 
 function buildCumulativeContourBandGroups(siteContext) {
@@ -14547,7 +14650,27 @@ function buildCumulativeContourBandGroups(siteContext) {
     cumulativeMultiPolygon = nextMultiPolygon;
   }
 
-  return cumulativeDescending.reverse();
+  const cumulativeGroups = cumulativeDescending.reverse();
+
+  if (bandGroups.rawAnchoredContourTerrainUsed === true) {
+    Object.assign(cumulativeGroups, {
+      rawAnchoredContourTerrainUsed: true,
+      rawAnchoredContourBandCount: Number(
+        bandGroups.rawAnchoredContourBandCount || bandGroups.length || 0
+      ),
+      rawAnchoredContourEntryCount: Number(
+        bandGroups.rawAnchoredContourEntryCount || 0
+      ),
+      rawAnchoredNativeContourLevelCount: Number(
+        bandGroups.rawAnchoredNativeContourLevelCount || 0
+      ),
+      rawAnchoredSourceContourInterval: Number(
+        bandGroups.rawAnchoredSourceContourInterval || 0
+      ),
+    });
+  }
+
+  return cumulativeGroups;
 }
 
 function getCachedCumulativeContourBandGroups(siteContext) {
@@ -14562,14 +14685,14 @@ function getCachedCumulativeContourBandGroups(siteContext) {
   );
 
   if (sharedCachedBandGroups) {
-    return sharedCachedBandGroups;
+    return applyContourBandGroupStats(siteContext, sharedCachedBandGroups);
   }
 
   const owner = resolveContourCacheOwner(siteContext);
   const entry = getOrCreateWeakMapEntry(contourCumulativeBandGroupCache, owner);
 
   if (entry instanceof Map && entry.has(cacheKey)) {
-    return entry.get(cacheKey);
+    return applyContourBandGroupStats(siteContext, entry.get(cacheKey));
   }
 
   const bandGroups = buildCumulativeContourBandGroups(siteContext).sort(
@@ -14587,7 +14710,7 @@ function getCachedCumulativeContourBandGroups(siteContext) {
     bandGroups
   );
 
-  return bandGroups;
+  return applyContourBandGroupStats(siteContext, bandGroups);
 }
 
 function buildPolygonClippingMultiPolygonFromRegions(regions) {
@@ -14776,6 +14899,24 @@ function buildRenderableContourBandGroups(siteContext) {
     });
   }
 
+  if (cumulativeGroups.rawAnchoredContourTerrainUsed === true) {
+    Object.assign(renderableGroups, {
+      rawAnchoredContourTerrainUsed: true,
+      rawAnchoredContourBandCount: Number(
+        cumulativeGroups.rawAnchoredContourBandCount || cumulativeGroups.length || 0
+      ),
+      rawAnchoredContourEntryCount: Number(
+        cumulativeGroups.rawAnchoredContourEntryCount || 0
+      ),
+      rawAnchoredNativeContourLevelCount: Number(
+        cumulativeGroups.rawAnchoredNativeContourLevelCount || 0
+      ),
+      rawAnchoredSourceContourInterval: Number(
+        cumulativeGroups.rawAnchoredSourceContourInterval || 0
+      ),
+    });
+  }
+
   return renderableGroups;
 }
 
@@ -14793,7 +14934,7 @@ function getCachedRenderableContourBandGroups(siteContext) {
   const entry = getOrCreateWeakMapEntry(contourRenderableBandGroupCache, owner);
 
   if (entry instanceof Map && entry.has(cacheKey)) {
-    return entry.get(cacheKey);
+    return applyContourBandGroupStats(siteContext, entry.get(cacheKey));
   }
 
   const bandGroups = buildRenderableContourBandGroups(siteContext);
@@ -14802,7 +14943,7 @@ function getCachedRenderableContourBandGroups(siteContext) {
     entry.set(cacheKey, bandGroups);
   }
 
-  return bandGroups;
+  return applyContourBandGroupStats(siteContext, bandGroups);
 }
 
 function computeLocalMultiPolygonArea(multiPolygon) {
@@ -16806,8 +16947,9 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
   if (siteContext.options?.includeContours !== false) {
     progress(66, "등고선 레이어를 정리하는 중입니다.");
     let contourCounter = 1;
+    const contourCollection = getExportContourFeatureCollection(siteContext);
 
-    for (const feature of siteContext.contourLines.features) {
+    for (const feature of contourCollection.features || []) {
       for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
         lines.push(`o CONTOUR_${contourCounter}`);
         const contourIndices = [];
@@ -17167,21 +17309,21 @@ function buildSketchUpPolyline(points, closed = false, options = {}) {
 
   return {
     closed,
-    curve: options?.curve === true && !closed,
+    curve: options?.curve === true,
     points: normalizedPoints.map(([xMeters, yMeters, elevation]) =>
       buildSketchUpFacePoint(xMeters, yMeters, elevation)
     ),
   };
 }
 
-function buildSketchUpContourPolyline(points, elevation) {
+function buildSketchUpContourPolyline(points, elevation, closed = false) {
   return buildSketchUpPolyline(
     (points || []).map(([xMeters, yMeters]) => [
       Number(xMeters || 0),
       Number(yMeters || 0),
       FLAT_EXPORT_CURVE_ELEVATION,
     ]),
-    false,
+    closed,
     { curve: true }
   );
 }
@@ -17476,15 +17618,21 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
   if (siteContext.options?.includeContours !== false) {
     const contourPolylines = [];
     const parcelContourPolylines = new Map();
+    const contourCollection = getExportContourFeatureCollection(siteContext);
 
-    for (const feature of siteContext.contourLines?.features || []) {
+    for (const feature of contourCollection?.features || []) {
       const elevation = Number(feature?.properties?.elevation || 0);
+      const closedLoop = feature?.properties?.closedLoop === true;
 
       for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
         const localPoints = lineString.map((point) =>
           localMetersFromLngLat(point, center)
         );
-        const polyline = buildSketchUpContourPolyline(localPoints, elevation);
+        const polyline = buildSketchUpContourPolyline(
+          localPoints,
+          elevation,
+          closedLoop
+        );
 
         if (polyline) {
           const targetParcelFeature = resolveTargetParcelGroupForLineString(
@@ -19897,7 +20045,9 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
   if (siteContext.options?.includeContours !== false) {
     progress(42, "DXF ?깃퀬??寃쎅퀎瑜??붽??섎뒗 以묒엯?덈떎.");
 
-    for (const feature of siteContext.contourLines?.features || []) {
+    const contourCollection = getExportContourFeatureCollection(siteContext);
+
+    for (const feature of contourCollection?.features || []) {
       for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
         appendDxfPathAsLineEntities(
           state,
@@ -19905,7 +20055,7 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
           "CONTOURS",
           lineString.map((point) => localMetersFromLngLat(point, center)),
           {
-            closed: false,
+            closed: feature?.properties?.closedLoop === true,
             elevation: FLAT_EXPORT_CURVE_ELEVATION,
           }
         );
@@ -21206,6 +21356,19 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
     );
   }
 
+  if (
+    isContourModelExport &&
+    exportSiteContext.options?.terrainMode === "contour" &&
+    exportSiteContext.options?.includeContours !== false &&
+    exportSiteContext.contourLines?.features?.length
+  ) {
+    exportSiteContext.exportContourLines =
+      buildClosedContourExportCollection(exportSiteContext);
+    exportSiteContext.stats.exportContourFeatureCount = Number(
+      exportSiteContext?.exportContourLines?.features?.length || 0
+    );
+  }
+
   console.log(
     `[export-terrain] format=${format} requested=${requestedContourInterval} source=${sourceContourInterval} effective=${effectiveContourBandInterval} display=${exportSiteContext.stats.effectiveContourDisplayInterval} preserveNativeContours=${preserveNativeContourDisplayLines} terrainStep=${Number(exportSiteContext?.terrainGrid?.step || 0).toFixed(3)} refined=${exportSiteContext?.stats?.nativeContourTerrainGridRefined === true}`
   );
@@ -21346,12 +21509,14 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
 
   if (siteContext.options?.includeContours !== false) {
     progress(86, "등고선 레이어를 추가하는 중입니다.");
+    const contourCollection = getExportContourFeatureCollection(siteContext);
+
     for (
       let index = 0;
-      index < (siteContext.contourLines?.features || []).length;
+      index < (contourCollection?.features || []).length;
       index += 1
     ) {
-      const feature = siteContext.contourLines.features[index];
+      const feature = contourCollection.features[index];
       const lineStrings = getLineStringsFromGeometry(feature.geometry);
 
       for (let lineIndex = 0; lineIndex < lineStrings.length; lineIndex += 1) {
