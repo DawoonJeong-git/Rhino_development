@@ -9915,6 +9915,22 @@ async function resolveRoadContext(location, clipFeature, options, config) {
     includeRawDiagnostics:
       options?.debugDiagnostics === true || options?.debugRoadDiagnostics === true,
   };
+  const candidateRuns = debugOptions.includeRawDiagnostics ? [] : null;
+  let selectedRoadResult = null;
+  const recordCandidateRun = (entry) => {
+    if (Array.isArray(candidateRuns)) {
+      candidateRuns.push(entry);
+    }
+  };
+  const finalizeRoadResult = (result) => {
+    if (Array.isArray(candidateRuns)) {
+      result.diagnostics = {
+        ...(result?.diagnostics || {}),
+        candidateRuns,
+      };
+    }
+    return result;
+  };
 
   if (hasVWorldKey) {
     for (const candidate of ROAD_LAYER_CANDIDATES) {
@@ -9924,6 +9940,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
 
       try {
         const featureMap = new Map();
+        let fetchedFeatureCount = 0;
 
         for (const query of queryPlan) {
           const collection = await fetchAllVWorldFeatureCollections(
@@ -9934,6 +9951,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
             250,
             Math.max(3, query.maxPages)
           );
+          fetchedFeatureCount += Number(collection?.features?.length || 0);
 
           for (const feature of collection.features || []) {
             const normalizedFeature = normalizeRoadFeature(feature, candidate.layer);
@@ -9979,7 +9997,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
         );
 
         if (filteredFeatures.length) {
-          return buildRoadContextResult(
+          const result = buildRoadContextResult(
             filteredFeatures,
             candidate.provider,
             candidate.geometryType,
@@ -9988,8 +10006,52 @@ async function resolveRoadContext(location, clipFeature, options, config) {
             false,
             debugOptions
           );
+
+          recordCandidateRun({
+            source: "vworld",
+            layer: candidate.layer,
+            provider: candidate.provider,
+            geometryType: candidate.geometryType,
+            queryCount: queryPlan.length,
+            fetchedFeatureCount,
+            dedupedFeatureCount: featureMap.size,
+            usableFeatureCount: filteredFeatures.length,
+            surfaceFeatureCount: Number(result?.collection?.features?.length || 0),
+            selectedByResolver: selectedRoadResult == null,
+            note: result.note,
+          });
+
+          if (!debugOptions.includeRawDiagnostics) {
+            return finalizeRoadResult(result);
+          }
+
+          if (selectedRoadResult == null) {
+            selectedRoadResult = result;
+          }
+        } else {
+          recordCandidateRun({
+            source: "vworld",
+            layer: candidate.layer,
+            provider: candidate.provider,
+            geometryType: candidate.geometryType,
+            queryCount: queryPlan.length,
+            fetchedFeatureCount,
+            dedupedFeatureCount: featureMap.size,
+            usableFeatureCount: 0,
+            surfaceFeatureCount: 0,
+            selectedByResolver: false,
+            note: "No usable road features after clipping.",
+          });
         }
       } catch (error) {
+        recordCandidateRun({
+          source: "vworld",
+          layer: candidate.layer,
+          provider: candidate.provider,
+          geometryType: candidate.geometryType,
+          selectedByResolver: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
         console.warn(
           `[roads] layer=${candidate.layer} failed: ${error instanceof Error ? error.message : error}`
         );
@@ -10019,7 +10081,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
     console.log(`[roads] layer=overpass-highway features=${filteredFeatures.length} geometry=line`);
 
     if (filteredFeatures.length) {
-      return buildRoadContextResult(
+      const result = buildRoadContextResult(
         filteredFeatures,
         "openstreetmap-overpass",
         "line",
@@ -10028,8 +10090,48 @@ async function resolveRoadContext(location, clipFeature, options, config) {
         true,
         debugOptions
       );
+
+      recordCandidateRun({
+        source: "overpass",
+        layer: "overpass-highway",
+        provider: "openstreetmap-overpass",
+        geometryType: "line",
+        fetchedFeatureCount: Number(collection?.features?.length || 0),
+        usableFeatureCount: filteredFeatures.length,
+        surfaceFeatureCount: Number(result?.collection?.features?.length || 0),
+        selectedByResolver: selectedRoadResult == null,
+        note: result.note,
+      });
+
+      if (!debugOptions.includeRawDiagnostics) {
+        return finalizeRoadResult(result);
+      }
+
+      if (selectedRoadResult == null) {
+        selectedRoadResult = result;
+      }
+    } else {
+      recordCandidateRun({
+        source: "overpass",
+        layer: "overpass-highway",
+        provider: "openstreetmap-overpass",
+        geometryType: "line",
+        fetchedFeatureCount: Number(collection?.features?.length || 0),
+        usableFeatureCount: 0,
+        surfaceFeatureCount: 0,
+        selectedByResolver: false,
+        note: "No usable road features after clipping.",
+      });
     }
   } catch (error) {
+    recordCandidateRun({
+      source: "overpass",
+      layer: "overpass-highway",
+      provider: "openstreetmap-overpass",
+      geometryType: "line",
+      selectedByResolver: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
     console.warn(
       `[roads] layer=overpass-highway failed: ${error instanceof Error ? error.message : error}`
     );
@@ -10038,6 +10140,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
   if (hasVWorldKey && fallbackBoundaryCandidate) {
     try {
       const featureMap = new Map();
+      let fetchedFeatureCount = 0;
 
       for (const query of queryPlan) {
         const collection = await fetchAllVWorldFeatureCollections(
@@ -10048,6 +10151,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
           250,
           Math.max(3, query.maxPages)
         );
+        fetchedFeatureCount += Number(collection?.features?.length || 0);
 
         for (const feature of collection.features || []) {
           const normalizedFeature = normalizeRoadFeature(
@@ -10094,7 +10198,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
       );
 
       if (filteredFeatures.length) {
-        return buildRoadContextResult(
+        const result = buildRoadContextResult(
           filteredFeatures,
           fallbackBoundaryCandidate.provider,
           fallbackBoundaryCandidate.geometryType,
@@ -10103,22 +10207,70 @@ async function resolveRoadContext(location, clipFeature, options, config) {
           true,
           debugOptions
         );
+
+        recordCandidateRun({
+          source: "vworld-fallback",
+          layer: fallbackBoundaryCandidate.layer,
+          provider: fallbackBoundaryCandidate.provider,
+          geometryType: fallbackBoundaryCandidate.geometryType,
+          queryCount: queryPlan.length,
+          fetchedFeatureCount,
+          dedupedFeatureCount: featureMap.size,
+          usableFeatureCount: filteredFeatures.length,
+          surfaceFeatureCount: Number(result?.collection?.features?.length || 0),
+          selectedByResolver: selectedRoadResult == null,
+          note: result.note,
+        });
+
+        if (!debugOptions.includeRawDiagnostics) {
+          return finalizeRoadResult(result);
+        }
+
+        if (selectedRoadResult == null) {
+          selectedRoadResult = result;
+        }
+      } else {
+        recordCandidateRun({
+          source: "vworld-fallback",
+          layer: fallbackBoundaryCandidate.layer,
+          provider: fallbackBoundaryCandidate.provider,
+          geometryType: fallbackBoundaryCandidate.geometryType,
+          queryCount: queryPlan.length,
+          fetchedFeatureCount,
+          dedupedFeatureCount: featureMap.size,
+          usableFeatureCount: 0,
+          surfaceFeatureCount: 0,
+          selectedByResolver: false,
+          note: "No usable road features after clipping.",
+        });
       }
     } catch (error) {
+      recordCandidateRun({
+        source: "vworld-fallback",
+        layer: fallbackBoundaryCandidate.layer,
+        provider: fallbackBoundaryCandidate.provider,
+        geometryType: fallbackBoundaryCandidate.geometryType,
+        selectedByResolver: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
       console.warn(
         `[roads] layer=${fallbackBoundaryCandidate.layer} failed: ${error instanceof Error ? error.message : error}`
       );
     }
   }
 
-  return {
+  if (selectedRoadResult) {
+    return finalizeRoadResult(selectedRoadResult);
+  }
+
+  return finalizeRoadResult({
     collection: featureCollection([]),
     provider: "unavailable",
     isFallback: true,
     note: hasVWorldKey
       ? "No road-context layer returned usable features for the current area."
       : "Road context unavailable from Overpass and no VWorld key was configured.",
-  };
+  });
 }
 
 async function resolveOverpassBuildingContext(
