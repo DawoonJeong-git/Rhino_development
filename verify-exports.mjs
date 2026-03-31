@@ -35,6 +35,7 @@ import {
   resolveSketchUpTerrainSolidSimplifyTolerance,
   resolveTerrainContourPath,
   resolveVWorldSearchCategories,
+  selectPreferredRoadContextCandidate,
   selectGeocodedVWorldResultForJusoCandidate,
   selectShortCircuitJusoCandidate,
   selectStrongJusoFastPathCandidates,
@@ -1482,6 +1483,62 @@ async function runBaselineVerification() {
       roadSurfaceWithHole?.features?.[0]?.geometry?.coordinates?.length,
       2,
       "Derived road preview should preserve source polygon holes instead of filling them in."
+    );
+    const preferredLineRoadCandidate = selectPreferredRoadContextCandidate(
+      [
+        {
+          layer: "lt_c_upisuq151",
+          geometryType: "polygon",
+          result: { collection: { features: [{}] } },
+          summary: {
+            surfaceCoverageRatioToClip: 0.6527,
+            largestSurfaceAreaSqm: 25979.151,
+          },
+        },
+        {
+          layer: "lt_l_moctlink",
+          geometryType: "line",
+          result: { collection: { features: [{}] } },
+          summary: {
+            surfaceCoverageRatioToClip: 0.0851,
+            largestSurfaceAreaSqm: 1222.512,
+          },
+        },
+      ],
+      40000.48
+    );
+    assert.equal(
+      preferredLineRoadCandidate?.layer,
+      "lt_l_moctlink",
+      "Broad polygon road candidates should yield to tighter line candidates in dense urban cases."
+    );
+    const preferredPolygonRoadCandidate = selectPreferredRoadContextCandidate(
+      [
+        {
+          layer: "lt_c_upisuq151",
+          geometryType: "polygon",
+          result: { collection: { features: [{}] } },
+          summary: {
+            surfaceCoverageRatioToClip: 0.0704,
+            largestSurfaceAreaSqm: 1999.065,
+          },
+        },
+        {
+          layer: "lt_l_moctlink",
+          geometryType: "line",
+          result: { collection: { features: [{}] } },
+          summary: {
+            surfaceCoverageRatioToClip: 0.029,
+            largestSurfaceAreaSqm: 698.295,
+          },
+        },
+      ],
+      40000.48
+    );
+    assert.equal(
+      preferredPolygonRoadCandidate?.layer,
+      "lt_c_upisuq151",
+      "Normal polygon road candidates should stay selected when their coverage is already bounded."
     );
 
     const rankedRoadResults = normalizeSearchResultsForQuery(

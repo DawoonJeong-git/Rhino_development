@@ -9838,6 +9838,75 @@ function buildRoadContextResult(
   };
 }
 
+function summarizeRoadContextResultMetrics(result, clipAreaSqm) {
+  const collectionFeatures = result?.collection?.features || [];
+  const surfaceAreas = collectionFeatures
+    .map((feature) => polygonAreaSquareMeters(getOuterRing(feature)))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const totalAreaSqm = surfaceAreas.reduce((sum, value) => sum + value, 0);
+  return {
+    surfaceFeatureCount: Number(collectionFeatures.length || 0),
+    surfaceAreaSqm: Number(totalAreaSqm.toFixed(3)),
+    largestSurfaceAreaSqm: surfaceAreas.length
+      ? Number(Math.max(...surfaceAreas).toFixed(3))
+      : 0,
+    surfaceCoverageRatioToClip:
+      clipAreaSqm > 0 ? Number((totalAreaSqm / clipAreaSqm).toFixed(4)) : null,
+  };
+}
+
+function shouldPreferRoadLineCandidateOverBroadPolygon(
+  polygonSummary,
+  lineSummary,
+  clipAreaSqm
+) {
+  if (!Number.isFinite(clipAreaSqm) || clipAreaSqm <= 0) {
+    return false;
+  }
+
+  const polygonCoverage = Number(polygonSummary?.surfaceCoverageRatioToClip || 0);
+  const polygonLargestArea = Number(polygonSummary?.largestSurfaceAreaSqm || 0);
+  const lineCoverage = Number(lineSummary?.surfaceCoverageRatioToClip || 0);
+  const polygonLargestCoverage = polygonLargestArea / clipAreaSqm;
+
+  if (polygonCoverage < 0.35 || polygonLargestCoverage < 0.5) {
+    return false;
+  }
+
+  if (lineCoverage <= 0) {
+    return false;
+  }
+
+  return lineCoverage <= Math.min(0.25, polygonCoverage * 0.5);
+}
+
+function selectPreferredRoadContextCandidate(candidates, clipAreaSqm) {
+  const successfulCandidates = (candidates || []).filter((candidate) => candidate?.result);
+
+  if (!successfulCandidates.length) {
+    return null;
+  }
+
+  const primaryCandidate = successfulCandidates[0];
+
+  if (primaryCandidate.geometryType !== "polygon") {
+    return primaryCandidate;
+  }
+
+  const preferredLineCandidate = successfulCandidates.find(
+    (candidate) =>
+      candidate !== primaryCandidate &&
+      candidate.geometryType === "line" &&
+      shouldPreferRoadLineCandidateOverBroadPolygon(
+        primaryCandidate.summary,
+        candidate.summary,
+        clipAreaSqm
+      )
+  );
+
+  return preferredLineCandidate || primaryCandidate;
+}
+
 async function finalizeBuildingContextCollection(
   features,
   provider,
@@ -9917,27 +9986,12 @@ async function resolveRoadContext(location, clipFeature, options, config) {
   };
   const candidateRuns = debugOptions.includeRawDiagnostics ? [] : null;
   let selectedRoadResult = null;
+  const successfulVWorldCandidates = [];
   const clipAreaSqm = polygonAreaSquareMeters(getOuterRing(clipFeature));
   const recordCandidateRun = (entry) => {
     if (Array.isArray(candidateRuns)) {
       candidateRuns.push(entry);
     }
-  };
-  const summarizeRoadResult = (result) => {
-    const collectionFeatures = result?.collection?.features || [];
-    const surfaceAreas = collectionFeatures
-      .map((feature) => polygonAreaSquareMeters(getOuterRing(feature)))
-      .filter((value) => Number.isFinite(value) && value > 0);
-    const totalAreaSqm = surfaceAreas.reduce((sum, value) => sum + value, 0);
-    return {
-      surfaceFeatureCount: Number(collectionFeatures.length || 0),
-      surfaceAreaSqm: Number(totalAreaSqm.toFixed(3)),
-      largestSurfaceAreaSqm: surfaceAreas.length
-        ? Number(Math.max(...surfaceAreas).toFixed(3))
-        : 0,
-      surfaceCoverageRatioToClip:
-        clipAreaSqm > 0 ? Number((totalAreaSqm / clipAreaSqm).toFixed(4)) : null,
-    };
   };
   const finalizeRoadResult = (result) => {
     if (Array.isArray(candidateRuns)) {
@@ -10023,29 +10077,30 @@ async function resolveRoadContext(location, clipFeature, options, config) {
             false,
             debugOptions
           );
-          const resultSummary = summarizeRoadResult(result);
-
-          recordCandidateRun({
+          const resultSummary = summarizeRoadContextResultMetrics(
+            result,
+            clipAreaSqm
+          );
+          successfulVWorldCandidates.push({
             source: "vworld",
             layer: candidate.layer,
             provider: candidate.provider,
             geometryType: candidate.geometryType,
-            queryCount: queryPlan.length,
-            fetchedFeatureCount,
-            dedupedFeatureCount: featureMap.size,
-            usableFeatureCount: filteredFeatures.length,
-            ...resultSummary,
-            selectedByResolver: selectedRoadResult == null,
-            note: result.note,
+            result,
+            summary: resultSummary,
+            record: {
+              source: "vworld",
+              layer: candidate.layer,
+              provider: candidate.provider,
+              geometryType: candidate.geometryType,
+              queryCount: queryPlan.length,
+              fetchedFeatureCount,
+              dedupedFeatureCount: featureMap.size,
+              usableFeatureCount: filteredFeatures.length,
+              ...resultSummary,
+              note: result.note,
+            },
           });
-
-          if (!debugOptions.includeRawDiagnostics) {
-            return finalizeRoadResult(result);
-          }
-
-          if (selectedRoadResult == null) {
-            selectedRoadResult = result;
-          }
         } else {
           recordCandidateRun({
             source: "vworld",
@@ -10074,6 +10129,36 @@ async function resolveRoadContext(location, clipFeature, options, config) {
           `[roads] layer=${candidate.layer} failed: ${error instanceof Error ? error.message : error}`
         );
       }
+    }
+
+    const preferredVWorldCandidate = selectPreferredRoadContextCandidate(
+      successfulVWorldCandidates,
+      clipAreaSqm
+    );
+
+    for (const candidateEntry of successfulVWorldCandidates) {
+      recordCandidateRun({
+        ...candidateEntry.record,
+        selectedByResolver: candidateEntry === preferredVWorldCandidate,
+      });
+    }
+
+    if (
+      preferredVWorldCandidate &&
+      successfulVWorldCandidates[0] &&
+      preferredVWorldCandidate !== successfulVWorldCandidates[0]
+    ) {
+      console.log(
+        `[roads] preferring line candidate ${preferredVWorldCandidate.layer} over broad polygon candidate ${successfulVWorldCandidates[0].layer}`
+      );
+    }
+
+    if (preferredVWorldCandidate) {
+      if (!debugOptions.includeRawDiagnostics) {
+        return finalizeRoadResult(preferredVWorldCandidate.result);
+      }
+
+      selectedRoadResult = preferredVWorldCandidate.result;
     }
   }
 
@@ -10108,7 +10193,7 @@ async function resolveRoadContext(location, clipFeature, options, config) {
         true,
         debugOptions
       );
-      const resultSummary = summarizeRoadResult(result);
+      const resultSummary = summarizeRoadContextResultMetrics(result, clipAreaSqm);
 
       recordCandidateRun({
         source: "overpass",
@@ -10226,7 +10311,10 @@ async function resolveRoadContext(location, clipFeature, options, config) {
           true,
           debugOptions
         );
-        const resultSummary = summarizeRoadResult(result);
+        const resultSummary = summarizeRoadContextResultMetrics(
+          result,
+          clipAreaSqm
+        );
 
         recordCandidateRun({
           source: "vworld-fallback",
@@ -21263,6 +21351,7 @@ export {
   beginInteractiveSearchPriority,
   buildObjFromSiteContext,
   buildRoadSurfaceFeatureCollection,
+  selectPreferredRoadContextCandidate,
   buildSketchUpPayloadFromSiteContext,
   buildSkpFromSiteContext,
   buildSkpFromSiteContextWithRetry,
