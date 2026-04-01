@@ -12282,6 +12282,11 @@ function estimateBuildingDominantTerraceElevation(
   seed
 ) {
   return (
+    estimateBuildingDominantTerraceElevationFromBandOverlap(
+      siteContext,
+      ring,
+      center
+    ) ||
     estimateBuildingDominantTerraceElevationFromCellOverlap(
       siteContext,
       ring,
@@ -12398,11 +12403,19 @@ function resolveBuildingPlacementForRing(siteContext, ring, center, seed) {
     siteContext.options?.buildingPlacement === "embed-lowest"
       ? "embed-lowest"
       : "dominant";
-  const overlapDominantElevation = estimateBuildingDominantTerraceElevationFromCellOverlap(
+  const bandOverlapDominantElevation = estimateBuildingDominantTerraceElevationFromBandOverlap(
     siteContext,
     ring,
     center
   );
+  const cellOverlapDominantElevation = estimateBuildingDominantTerraceElevationFromCellOverlap(
+    siteContext,
+    ring,
+    center
+  );
+  const overlapDominantElevation = Number.isFinite(bandOverlapDominantElevation)
+    ? bandOverlapDominantElevation
+    : cellOverlapDominantElevation;
   const sampledDominantElevation = estimateBuildingDominantTerraceElevationFromSamples(
     siteContext,
     ring,
@@ -12430,6 +12443,9 @@ function resolveBuildingPlacementForRing(siteContext, ring, center, seed) {
       finalBaseElevation = lowestElevation;
       source = "lowest-sample";
     }
+  } else if (Number.isFinite(bandOverlapDominantElevation)) {
+    finalBaseElevation = bandOverlapDominantElevation;
+    source = "dominant-band-overlap";
   } else if (Number.isFinite(overlapDominantElevation)) {
     finalBaseElevation = overlapDominantElevation;
     source = "dominant-cell-overlap";
@@ -12449,6 +12465,12 @@ function resolveBuildingPlacementForRing(siteContext, ring, center, seed) {
     source,
     dominantElevation: Number.isFinite(overlapDominantElevation)
       ? Number(overlapDominantElevation.toFixed(3))
+      : null,
+    bandDominantElevation: Number.isFinite(bandOverlapDominantElevation)
+      ? Number(bandOverlapDominantElevation.toFixed(3))
+      : null,
+    cellOverlapDominantElevation: Number.isFinite(cellOverlapDominantElevation)
+      ? Number(cellOverlapDominantElevation.toFixed(3))
       : null,
     sampledDominantElevation: Number.isFinite(sampledDominantElevation)
       ? Number(sampledDominantElevation.toFixed(3))
@@ -12478,6 +12500,8 @@ function applyBuildingPlacementDebug(feature, placementInfo) {
     placementMode: placementInfo.placementMode,
     source: placementInfo.source,
     dominantElevation: placementInfo.dominantElevation,
+    bandDominantElevation: placementInfo.bandDominantElevation,
+    cellOverlapDominantElevation: placementInfo.cellOverlapDominantElevation,
     sampledDominantElevation: placementInfo.sampledDominantElevation,
     fallbackDominantElevation: placementInfo.fallbackDominantElevation,
     lowestElevation: placementInfo.lowestElevation,
@@ -12543,6 +12567,8 @@ function buildBuildingPlacementDiagnostics(siteContext) {
         placementMode: placementInfo.placementMode,
         source: placementInfo.source,
         dominantElevation: placementInfo.dominantElevation,
+        bandDominantElevation: placementInfo.bandDominantElevation,
+        cellOverlapDominantElevation: placementInfo.cellOverlapDominantElevation,
         sampledDominantElevation: placementInfo.sampledDominantElevation,
         fallbackDominantElevation: placementInfo.fallbackDominantElevation,
         lowestElevation: placementInfo.lowestElevation,

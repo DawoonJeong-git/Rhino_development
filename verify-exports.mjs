@@ -2158,6 +2158,123 @@ async function runBaselineVerification() {
       ),
       "Exact native contour terrain should place the raw 12m contour directly on the exact 12m terrain boundary."
     );
+    const syntheticBuildingPlacementSiteContext = cloneJsonValue({
+      ...syntheticContourSiteContext,
+      contourLines: {
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            properties: { provider: "synthetic-test", elevation: 10 },
+            geometry: {
+              type: "LineString",
+              coordinates: [
+                [126.97802, 37.56643],
+                [126.9784, 37.56643],
+              ],
+            },
+          },
+          {
+            type: "Feature",
+            properties: { provider: "synthetic-test", elevation: 15 },
+            geometry: {
+              type: "LineString",
+              coordinates: [
+                [126.97802, 37.56655],
+                [126.9784, 37.56655],
+              ],
+            },
+          },
+          {
+            type: "Feature",
+            properties: { provider: "synthetic-test", elevation: 20 },
+            geometry: {
+              type: "LineString",
+              coordinates: [
+                [126.97802, 37.56667],
+                [126.9784, 37.56667],
+              ],
+            },
+          },
+        ],
+      },
+      terrainGrid: {
+        step: 1.25,
+        xValues: [0, 20, 40],
+        yValues: [0, 20, 40],
+        elevations: [
+          [10, 10, 10],
+          [21, 21, 21],
+          [20, 20, 20],
+        ],
+        minElevation: 10,
+        maxElevation: 21,
+      },
+      options: {
+        ...syntheticContourSiteContext.options,
+        contourInterval: 5,
+        includeBuildings: true,
+      },
+      dataSources: {
+        contours: {
+          provider: "synthetic-test",
+          mode: "derived",
+          interval: 5,
+        },
+      },
+      buildings: {
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            properties: {
+              buildingId: "B-1",
+              buildingName: "Band Overlap Placement",
+              heightMeters: 15,
+              isTarget: true,
+            },
+            geometry: {
+              type: "Polygon",
+              coordinates: [[
+                [126.97808, 37.566435],
+                [126.9782, 37.566435],
+                [126.9782, 37.566505],
+                [126.97808, 37.566505],
+                [126.97808, 37.566435],
+              ]],
+            },
+          },
+        ],
+      },
+    });
+    const preparedBuildingPlacementSiteContext = prepareSiteContextForExport(
+      syntheticBuildingPlacementSiteContext,
+      syntheticBuildingPlacementSiteContext.options,
+      "3dm"
+    );
+    const buildingPlacementDebug =
+      preparedBuildingPlacementSiteContext?.buildings?.features?.[0]?.properties
+        ?.buildingPlacementDebug;
+    assert.equal(
+      buildingPlacementDebug?.source,
+      "dominant-band-overlap",
+      "Contour-terrain building placement should prefer the actual terrace band overlap over cell-averaged terrain samples."
+    );
+    assert.equal(
+      buildingPlacementDebug?.bandDominantElevation,
+      15,
+      "Contour-terrain building placement should capture the dominant elevation from the exact terrace band overlap."
+    );
+    assert.equal(
+      buildingPlacementDebug?.cellOverlapDominantElevation,
+      20,
+      "The synthetic placement regression should still expose the misleading higher cell-overlap elevation."
+    );
+    assert.equal(
+      buildingPlacementDebug?.finalBaseElevation,
+      15,
+      "Contour-terrain building placement should keep the building on the matching 5m terrace instead of floating it one band too high."
+    );
     const refinedSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       refinedSketchUpSiteContext
     );
