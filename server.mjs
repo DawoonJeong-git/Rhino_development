@@ -14524,6 +14524,64 @@ function buildContourBandGroups(siteContext) {
   const rawAnchoredBandGroups = buildRawAnchoredContourBandGroups(siteContext);
 
   if (rawAnchoredBandGroups.length) {
+    const gridBandGroups = buildGridContourBandGroups(siteContext);
+    const rawBottomKeys = new Set(
+      rawAnchoredBandGroups.map((group) => buildContourLevelKey(group?.bottomElevation))
+    );
+    const fallbackGridBandGroups = gridBandGroups.filter(
+      (group) => !rawBottomKeys.has(buildContourLevelKey(group?.bottomElevation))
+    );
+
+    if (fallbackGridBandGroups.length) {
+      const mergedBandGroups = [...rawAnchoredBandGroups, ...fallbackGridBandGroups].sort(
+        (left, right) =>
+          left.bottomElevation - right.bottomElevation ||
+          left.topElevation - right.topElevation
+      );
+
+      Object.assign(mergedBandGroups, {
+        rawAnchoredContourTerrainUsed:
+          rawAnchoredBandGroups.rawAnchoredContourTerrainUsed === true,
+        rawAnchoredContourBandCount: Number(
+          rawAnchoredBandGroups.rawAnchoredContourBandCount || rawAnchoredBandGroups.length || 0
+        ),
+        rawAnchoredContourEntryCount: Number(
+          rawAnchoredBandGroups.rawAnchoredContourEntryCount || 0
+        ),
+        rawAnchoredNativeContourLevelCount: Number(
+          rawAnchoredBandGroups.rawAnchoredNativeContourLevelCount || 0
+        ),
+        rawAnchoredSourceContourInterval: Number(
+          rawAnchoredBandGroups.rawAnchoredSourceContourInterval || 0
+        ),
+        rawAnchoredGridFallbackBandCount: fallbackGridBandGroups.length,
+        rawAnchoredGridFallbackBottomElevations: fallbackGridBandGroups.map((group) =>
+          Number(Number(group?.bottomElevation || 0).toFixed(3))
+        ),
+      });
+
+      siteContext.stats = {
+        ...(siteContext?.stats || {}),
+        rawAnchoredContourTerrainUsed:
+          rawAnchoredBandGroups.rawAnchoredContourTerrainUsed === true,
+        rawAnchoredContourBandCount: Number(
+          rawAnchoredBandGroups.rawAnchoredContourBandCount || rawAnchoredBandGroups.length || 0
+        ),
+        rawAnchoredContourEntryCount: Number(
+          rawAnchoredBandGroups.rawAnchoredContourEntryCount || 0
+        ),
+        rawAnchoredNativeContourLevelCount: Number(
+          rawAnchoredBandGroups.rawAnchoredNativeContourLevelCount || 0
+        ),
+        rawAnchoredSourceContourInterval: Number(
+          rawAnchoredBandGroups.rawAnchoredSourceContourInterval || 0
+        ),
+        rawAnchoredGridFallbackBandCount: fallbackGridBandGroups.length,
+      };
+
+      return mergedBandGroups;
+    }
+
     return rawAnchoredBandGroups;
   }
 
@@ -14550,6 +14608,9 @@ function applyContourBandGroupStats(siteContext, bandGroups) {
       ),
       rawAnchoredSourceContourInterval: Number(
         bandGroups.rawAnchoredSourceContourInterval || 0
+      ),
+      rawAnchoredGridFallbackBandCount: Number(
+        bandGroups.rawAnchoredGridFallbackBandCount || 0
       ),
     };
   }
@@ -14665,6 +14726,12 @@ function buildCumulativeContourBandGroups(siteContext) {
       rawAnchoredSourceContourInterval: Number(
         bandGroups.rawAnchoredSourceContourInterval || 0
       ),
+      rawAnchoredGridFallbackBandCount: Number(
+        bandGroups.rawAnchoredGridFallbackBandCount || 0
+      ),
+      rawAnchoredGridFallbackBottomElevations: [
+        ...(bandGroups.rawAnchoredGridFallbackBottomElevations || []),
+      ],
     });
   }
 
@@ -14912,6 +14979,12 @@ function buildRenderableContourBandGroups(siteContext) {
       rawAnchoredSourceContourInterval: Number(
         cumulativeGroups.rawAnchoredSourceContourInterval || 0
       ),
+      rawAnchoredGridFallbackBandCount: Number(
+        cumulativeGroups.rawAnchoredGridFallbackBandCount || 0
+      ),
+      rawAnchoredGridFallbackBottomElevations: [
+        ...(cumulativeGroups.rawAnchoredGridFallbackBottomElevations || []),
+      ],
     });
   }
 
