@@ -378,6 +378,8 @@ function summarizeTerrainPipeline(exportSiteContext) {
       rawAreaAboveByLevel: rawAnchorBandDiagnostics?.rawAreaAboveByLevel || [],
       constrainedAnchorAreaByLevel:
         rawAnchorBandDiagnostics?.constrainedAnchorAreaByLevel || [],
+      resolvedAreaAboveByLevel:
+        rawAnchorBandDiagnostics?.resolvedAreaAboveByLevel || [],
       gridAreaAboveByLevel: rawAnchorBandDiagnostics?.gridAreaAboveByLevel || [],
       bandBottomElevations: rawAnchorBandDiagnostics?.bandBottomElevations || [],
       bandTopElevations: rawAnchorBandDiagnostics?.bandTopElevations || [],

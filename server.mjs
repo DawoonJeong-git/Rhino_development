@@ -10039,9 +10039,7 @@ function normalizeContourFeatureCollection(siteContext, contourCollection = null
 }
 
 function buildClosedContourExportCollection(siteContext) {
-  const cumulativeGroups = getCachedCumulativeContourBandGroups(siteContext);
-
-  if (!cumulativeGroups.length || !siteContext?.location) {
+  if (!siteContext?.location) {
     return siteContext?.contourLines || featureCollection([]);
   }
 
@@ -10053,6 +10051,106 @@ function buildClosedContourExportCollection(siteContext) {
       .map((value) => buildContourLevelKey(value))
   );
   const features = [];
+  const featureKeys = new Set();
+
+  const appendFeaturesFromMultiPolygon = (
+    multiPolygon,
+    elevation,
+    exportDerived = "resolved-area-above-contour"
+  ) => {
+    if (!Array.isArray(multiPolygon) || !multiPolygon.length) {
+      return;
+    }
+
+    const levelKey = buildContourLevelKey(elevation);
+    const generated = !nativeElevationKeys.has(levelKey);
+    const regions = buildContourBandRegionsFromMultiPolygon(multiPolygon);
+
+    for (const region of regions) {
+      for (const loop of [region?.outerPoints, ...(region?.holePoints || [])]) {
+        const closedLoop = closeRing(dedupeLocalPolygonPoints(loop, 0.001));
+
+        if (closedLoop.length < 4) {
+          continue;
+        }
+
+        const featureKey = [
+          levelKey,
+          closedLoop.map((point) => buildLocalPointKey(point, 3)).join(";"),
+        ].join("|");
+
+        if (featureKeys.has(featureKey)) {
+          continue;
+        }
+
+        featureKeys.add(featureKey);
+        features.push(
+          lineFeature(
+            closedLoop.map(([xMeters, yMeters]) =>
+              lngLatFromMeters(siteContext.location, xMeters, yMeters)
+            ),
+            {
+              elevation: Number(Number(elevation).toFixed(3)),
+              provider: generated ? "derived-contours-closed" : "official-contours-closed",
+              generated,
+              closedLoop: true,
+              exportDerived,
+            }
+          )
+        );
+      }
+    }
+  };
+  const rawAnchorAssembly = buildRawAnchoredContourBandAssembly(siteContext);
+
+  if (rawAnchorAssembly?.resolvedAreaAboveByLevel instanceof Map) {
+    const resolvedLevels = [...rawAnchorAssembly.resolvedAreaAboveByLevel.keys()]
+      .map(Number)
+      .filter(Number.isFinite)
+      .sort((left, right) => left - right);
+
+    for (const level of resolvedLevels) {
+      appendFeaturesFromMultiPolygon(
+        rawAnchorAssembly.resolvedAreaAboveByLevel.get(buildContourLevelKey(level)) || [],
+        level,
+        "resolved-area-above-contour"
+      );
+    }
+
+    const highestTopSurfaceGroup = getCachedContourTopSurfaceGroups(siteContext)
+      .filter(
+        (group) =>
+          Number.isFinite(Number(group?.elevation)) && Array.isArray(group?.multiPolygon)
+      )
+      .sort((left, right) => Number(left.elevation) - Number(right.elevation))
+      .at(-1);
+
+    if (highestTopSurfaceGroup?.multiPolygon?.length) {
+      appendFeaturesFromMultiPolygon(
+        highestTopSurfaceGroup.multiPolygon,
+        Number(highestTopSurfaceGroup.elevation),
+        "top-surface-cap-contour"
+      );
+    }
+  }
+
+  if (features.length) {
+    return featureCollection(
+      features.sort(
+        (left, right) =>
+          Number(left?.properties?.elevation || 0) -
+            Number(right?.properties?.elevation || 0) ||
+          Number(Boolean(left?.properties?.generated)) -
+            Number(Boolean(right?.properties?.generated))
+      )
+    );
+  }
+
+  const cumulativeGroups = getCachedCumulativeContourBandGroups(siteContext);
+
+  if (!cumulativeGroups.length) {
+    return siteContext?.contourLines || featureCollection([]);
+  }
 
   for (const group of cumulativeGroups) {
     const elevation = Number(group?.bottomElevation);
@@ -14321,6 +14419,8 @@ function buildRawAnchoredContourBandAssembly(
   { includeLevelDiagnostics = false } = {}
 ) {
   const terrainGrid = siteContext?.terrainGrid;
+  const cleanupAreaThresholdSqm =
+    resolveRawAnchoredContourCleanupAreaThreshold(siteContext);
   const emptyResult = {
     reason: null,
     interval: 0,
@@ -14333,6 +14433,7 @@ function buildRawAnchoredContourBandAssembly(
     contourEntryCountsByElevation: new Map(),
     rawAreaAboveByLevel: new Map(),
     constrainedAnchorAreaByLevel: new Map(),
+    resolvedAreaAboveByLevel: new Map(),
     gridAreaAboveByLevel: new Map(),
     levelDiagnostics: [],
     bandGroups: [],
@@ -14465,6 +14566,11 @@ function buildRawAnchoredContourBandAssembly(
       }
     }
 
+    constrainedAnchorArea = filterTinyLocalMultiPolygonArtifacts(
+      constrainedAnchorArea,
+      cleanupAreaThresholdSqm
+    );
+
     if (constrainedAnchorArea.length) {
       constrainedAnchorAreaByLevel.set(levelKey, constrainedAnchorArea);
     }
@@ -14596,6 +14702,11 @@ function buildRawAnchoredContourBandAssembly(
           : "upper_anchor_union";
     }
 
+    constrainedAreaAbove = filterTinyLocalMultiPolygonArtifacts(
+      constrainedAreaAbove,
+      cleanupAreaThresholdSqm
+    );
+
     return {
       normalizedLevel,
       reason,
@@ -14610,6 +14721,7 @@ function buildRawAnchoredContourBandAssembly(
   };
   const bandGroups = [];
   const levelDiagnostics = [];
+  const resolvedAreaAboveByLevel = new Map();
 
   for (
     let bottomElevation = Number(startLevel.toFixed(3));
@@ -14619,6 +14731,7 @@ function buildRawAnchoredContourBandAssembly(
     const topElevation = Number(Math.min(bottomElevation + interval, maxElevation).toFixed(3));
     const bottomResolution = resolveConstrainedAreaAboveLevelDetail(bottomElevation);
     const bottomArea = bottomResolution.resolvedAreaAbove;
+    resolvedAreaAboveByLevel.set(buildContourLevelKey(bottomElevation), bottomArea || []);
 
     if (!bottomArea?.length) {
       if (includeLevelDiagnostics) {
@@ -14799,6 +14912,7 @@ function buildRawAnchoredContourBandAssembly(
     contourEntryCountsByElevation,
     rawAreaAboveByLevel: cumulativeByLevel,
     constrainedAnchorAreaByLevel,
+    resolvedAreaAboveByLevel,
     gridAreaAboveByLevel,
     levelDiagnostics,
     bandGroups,
@@ -14838,6 +14952,9 @@ function buildRawAnchoredContourBandDiagnostics(siteContext) {
     rawAreaAboveByLevel: summarizeAreaLevels(assembly.rawAreaAboveByLevel || new Map()),
     constrainedAnchorAreaByLevel: summarizeAreaLevels(
       assembly.constrainedAnchorAreaByLevel || new Map()
+    ),
+    resolvedAreaAboveByLevel: summarizeAreaLevels(
+      assembly.resolvedAreaAboveByLevel || new Map()
     ),
     gridAreaAboveByLevel: summarizeAreaLevels(assembly.gridAreaAboveByLevel || new Map()),
     bandBottomElevations: sortNumericAscending(
@@ -15644,6 +15761,54 @@ function computeLocalMultiPolygonArea(multiPolygon) {
   }
 
   return Math.max(0, Number(area.toFixed(6)));
+}
+
+function resolveRawAnchoredContourCleanupAreaThreshold(siteContext) {
+  const terrainStep = Number(siteContext?.terrainGrid?.step || 0);
+  const interval = Number(resolveEffectiveContourBandInterval(siteContext) || 0);
+
+  return Math.max(
+    0.25,
+    Math.min(
+      4,
+      Math.max(
+        terrainStep > 0 ? terrainStep * terrainStep * 2.5 : 0,
+        terrainStep > 0 && interval > 0 ? terrainStep * interval * 1.25 : 0,
+        interval > 0 ? interval * interval * 0.2 : 0
+      )
+    )
+  );
+}
+
+function filterTinyLocalMultiPolygonArtifacts(
+  multiPolygon,
+  minimumOuterAreaSqm = 0.25,
+  minimumHoleAreaSqm = minimumOuterAreaSqm * 0.7
+) {
+  const minOuterArea = Math.max(0.0001, Number(minimumOuterAreaSqm) || 0.25);
+  const minHoleArea = Math.max(0.0001, Number(minimumHoleAreaSqm) || minOuterArea * 0.7);
+  const filteredMultiPolygon = [];
+
+  for (const polygon of multiPolygon || []) {
+    if (!Array.isArray(polygon) || !polygon.length) {
+      continue;
+    }
+
+    const outerRing = polygon[0] || [];
+    const outerArea = Math.abs(computeLocalPolygonSignedArea(outerRing));
+
+    if (!(outerArea >= minOuterArea)) {
+      continue;
+    }
+
+    const filteredHoles = (polygon.slice(1) || []).filter(
+      (ring) => Math.abs(computeLocalPolygonSignedArea(ring || [])) >= minHoleArea
+    );
+
+    filteredMultiPolygon.push([outerRing, ...filteredHoles]);
+  }
+
+  return filteredMultiPolygon;
 }
 
 function computeLocalBoundsFromPoints(points) {
