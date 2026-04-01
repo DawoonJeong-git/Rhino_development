@@ -9730,7 +9730,11 @@ function buildGeneratedContourLinesFromResolvedAreas(siteContext, contourInterva
       continue;
     }
 
-    const regions = buildContourBandRegionsFromMultiPolygon(multiPolygon);
+    const regions = normalizeContourRegionsForLevel(
+      siteContext,
+      buildContourBandRegionsFromMultiPolygon(multiPolygon),
+      level
+    );
 
     for (const region of regions) {
       for (const loop of [region?.outerPoints, ...(region?.holePoints || [])]) {
@@ -10331,7 +10335,11 @@ function buildClosedContourExportCollection(siteContext) {
 
     const levelKey = buildContourLevelKey(elevation);
     const generated = !nativeElevationKeys.has(levelKey);
-    const regions = buildContourBandRegionsFromMultiPolygon(multiPolygon);
+    const regions = normalizeContourRegionsForLevel(
+      siteContext,
+      buildContourBandRegionsFromMultiPolygon(multiPolygon),
+      elevation
+    );
 
     for (const region of regions) {
       for (const loop of [region?.outerPoints, ...(region?.holePoints || [])]) {
@@ -13263,6 +13271,174 @@ function smoothLocalPolygonChaikin(
   return polygon.length >= 3 ? polygon : dedupeLocalPolygonPoints(points, 0.001);
 }
 
+function computeLocalLoopAxisAlignedSegmentRatio(points) {
+  const polygon = dedupeLocalPolygonPoints(points, 0.001);
+
+  if (polygon.length < 2) {
+    return 0;
+  }
+
+  let segmentCount = 0;
+  let axisAlignedCount = 0;
+
+  for (let index = 0; index < polygon.length; index += 1) {
+    const current = polygon[index];
+    const next = polygon[(index + 1) % polygon.length];
+    const dx = Number(next?.[0] || 0) - Number(current?.[0] || 0);
+    const dy = Number(next?.[1] || 0) - Number(current?.[1] || 0);
+
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+      continue;
+    }
+
+    if (Math.abs(dx) <= 1e-9 && Math.abs(dy) <= 1e-9) {
+      continue;
+    }
+
+    segmentCount += 1;
+    const angle = (Math.atan2(Math.abs(dy), Math.abs(dx)) * 180) / Math.PI;
+
+    if (angle <= 5 || angle >= 85) {
+      axisAlignedCount += 1;
+    }
+  }
+
+  return segmentCount > 0 ? axisAlignedCount / segmentCount : 0;
+}
+
+function resolveGeneratedContourLoopNormalizationOptions(siteContext) {
+  const interval = Number(resolveEffectiveContourBandInterval(siteContext) || 0);
+  const sourceContourInterval = Number(resolveSourceContourInterval(siteContext) || 0);
+  const terrainStep = Number(siteContext?.terrainGrid?.step || 0);
+  const finerThanSource =
+    interval > 0 &&
+    sourceContourInterval > 0 &&
+    interval < sourceContourInterval - 1e-9;
+  const baseTolerance = Math.max(
+    0.02,
+    Math.min(
+      0.09,
+      terrainStep > 0 ? terrainStep * 0.08 : 0.05,
+      interval > 0 ? interval * 0.08 : 0.05
+    )
+  );
+
+  return {
+    enabled: finerThanSource,
+    simplifyTolerance: baseTolerance,
+    minSegmentLength: Math.max(0.05, baseTolerance * 1.5),
+    minPointCount: interval <= 0.1 ? 28 : interval <= 1 ? 22 : 18,
+    ratioThreshold: 0.21,
+  };
+}
+
+function normalizeContourBoundaryLoop(
+  points,
+  {
+    simplifyTolerance = 0.01,
+    smoothGenerated = false,
+    minSegmentLength = 0.08,
+    minPointCount = 20,
+    ratioThreshold = 0.21,
+  } = {}
+) {
+  let polygon = dedupeLocalPolygonPoints(
+    points,
+    Math.max(0.001, Math.min(0.01, simplifyTolerance * 0.3))
+  );
+
+  if (polygon.length < 3) {
+    return polygon;
+  }
+
+  polygon = simplifyLocalPolygon(polygon, Math.max(0.01, simplifyTolerance * 0.35));
+
+  if (polygon.length < 3) {
+    return dedupeLocalPolygonPoints(points, 0.001);
+  }
+
+  const axisAlignedRatio = computeLocalLoopAxisAlignedSegmentRatio(polygon);
+
+  if (
+    smoothGenerated &&
+    polygon.length >= minPointCount &&
+    axisAlignedRatio >= ratioThreshold
+  ) {
+    polygon = smoothLocalPolygonChaikin(polygon, {
+      iterations: 1,
+      ratio: 0.18,
+      maxPointCount: Math.min(768, Math.max(128, polygon.length * 2)),
+      minSegmentLength,
+    });
+  }
+
+  polygon = simplifyLocalPolygonDouglasPeucker(
+    polygon,
+    Math.max(0.01, simplifyTolerance)
+  );
+
+  return polygon.length >= 3 ? polygon : dedupeLocalPolygonPoints(points, 0.001);
+}
+
+function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
+  const levelKey = buildContourLevelKey(elevation);
+  const nativeLevelKeys = buildContourElevationKeySet(siteContext?.contourLines);
+  const generatedNormalization =
+    !nativeLevelKeys.has(levelKey) &&
+    resolveGeneratedContourLoopNormalizationOptions(siteContext);
+  const shouldSmoothGenerated = Boolean(generatedNormalization?.enabled);
+  const simplifyTolerance = shouldSmoothGenerated
+    ? generatedNormalization.simplifyTolerance
+    : 0.01;
+  const minSegmentLength = shouldSmoothGenerated
+    ? generatedNormalization.minSegmentLength
+    : 0.08;
+  const minPointCount = shouldSmoothGenerated
+    ? generatedNormalization.minPointCount
+    : 20;
+  const ratioThreshold = shouldSmoothGenerated
+    ? generatedNormalization.ratioThreshold
+    : 0.21;
+
+  return (regions || [])
+    .map((region) => {
+      const outerPoints = orientLocalPolygonCounterClockwise(
+        normalizeContourBoundaryLoop(region?.outerPoints || [], {
+          simplifyTolerance,
+          smoothGenerated: shouldSmoothGenerated,
+          minSegmentLength,
+          minPointCount,
+          ratioThreshold,
+        })
+      );
+      const holePoints = (region?.holePoints || [])
+        .map((ring) =>
+          normalizeContourBoundaryLoop(
+            [...orientLocalPolygonCounterClockwise(ring || [])].reverse(),
+            {
+              simplifyTolerance,
+              smoothGenerated: shouldSmoothGenerated,
+              minSegmentLength,
+              minPointCount,
+              ratioThreshold,
+            }
+          )
+        )
+        .filter((ring) => ring.length >= 3)
+        .map((ring) => [...orientLocalPolygonCounterClockwise(ring)].reverse());
+
+      if (outerPoints.length < 3) {
+        return null;
+      }
+
+      return {
+        outerPoints,
+        holePoints,
+      };
+    })
+    .filter(Boolean);
+}
+
 function smoothSketchUpSolidLoop(points, toleranceMeters = 0) {
   const tolerance = Math.max(0, Number(toleranceMeters) || 0);
   const polygon = dedupeLocalPolygonPoints(points, Math.max(0.001, tolerance * 0.12));
@@ -15355,6 +15531,7 @@ function summarizeRawContourBandAssemblyArea(multiPolygon) {
 }
 
 function buildExactNativeContourBandAssembly({
+  normalizationSiteContext = null,
   interval,
   sourceContourInterval,
   minElevation,
@@ -15540,7 +15717,11 @@ function buildExactNativeContourBandAssembly({
             top: Number(topElevation.toFixed(3)),
           })
         : bottomArea;
-    const regions = buildContourBandRegionsFromMultiPolygon(bandMultiPolygon);
+    const regions = normalizeContourRegionsForLevel(
+      normalizationSiteContext,
+      buildContourBandRegionsFromMultiPolygon(bandMultiPolygon),
+      bottomElevation
+    );
 
     if (!regions.length) {
       if (includeLevelDiagnostics) {
@@ -15573,7 +15754,7 @@ function buildExactNativeContourBandAssembly({
         ...(region.holePoints || []),
       ]),
       regions,
-      multiPolygon: bandMultiPolygon,
+      multiPolygon: buildPolygonClippingMultiPolygonFromRegions(regions),
       bounds: computeRegionBounds(regions),
     });
 
@@ -15752,6 +15933,7 @@ function buildRawAnchoredContourBandAssembly(
   }
 
   const exactNativeAnchorAssembly = buildExactNativeContourBandAssembly({
+    normalizationSiteContext: siteContext,
     interval: sourceContourInterval > 0 ? sourceContourInterval : interval,
     sourceContourInterval,
     minElevation,
@@ -16066,7 +16248,11 @@ function buildRawAnchoredContourBandAssembly(
       continue;
     }
 
-    const regions = buildContourBandRegionsFromMultiPolygon(bandMultiPolygon);
+    const regions = normalizeContourRegionsForLevel(
+      siteContext,
+      buildContourBandRegionsFromMultiPolygon(bandMultiPolygon),
+      bottomElevation
+    );
 
     if (!regions.length) {
       if (includeLevelDiagnostics) {
@@ -16105,7 +16291,7 @@ function buildRawAnchoredContourBandAssembly(
         ...(region.holePoints || []),
       ]),
       regions,
-      multiPolygon: bandMultiPolygon,
+      multiPolygon: buildPolygonClippingMultiPolygonFromRegions(regions),
       bounds: computeRegionBounds(regions),
     };
 
@@ -16721,7 +16907,11 @@ function buildCumulativeContourBandGroups(siteContext) {
         const levelKey = buildContourLevelKey(group?.bottomElevation);
         const directMultiPolygon =
           rawAnchorAssembly.resolvedAreaAboveByLevel.get(levelKey) || [];
-        const regions = buildContourBandRegionsFromMultiPolygon(directMultiPolygon);
+        const regions = normalizeContourRegionsForLevel(
+          siteContext,
+          buildContourBandRegionsFromMultiPolygon(directMultiPolygon),
+          group?.bottomElevation
+        );
 
         if (!regions.length) {
           continue;
@@ -16734,7 +16924,7 @@ function buildCumulativeContourBandGroups(siteContext) {
             ...(region.holePoints || []),
           ]),
           regions,
-          multiPolygon: directMultiPolygon,
+          multiPolygon: buildPolygonClippingMultiPolygonFromRegions(regions),
         });
       }
 
@@ -16795,7 +16985,11 @@ function buildCumulativeContourBandGroups(siteContext) {
       }
     }
 
-    const regions = buildContourBandRegionsFromMultiPolygon(nextMultiPolygon);
+    const regions = normalizeContourRegionsForLevel(
+      siteContext,
+      buildContourBandRegionsFromMultiPolygon(nextMultiPolygon),
+      group?.bottomElevation
+    );
 
     if (!regions.length) {
       cumulativeMultiPolygon = nextMultiPolygon;
@@ -16809,7 +17003,7 @@ function buildCumulativeContourBandGroups(siteContext) {
         ...(region.holePoints || []),
       ]),
       regions,
-      multiPolygon: nextMultiPolygon,
+      multiPolygon: buildPolygonClippingMultiPolygonFromRegions(regions),
     });
     cumulativeMultiPolygon = nextMultiPolygon;
   }
@@ -23604,6 +23798,10 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
       exportSiteContext?.exportContourLines?.features?.length || 0
     );
   }
+
+  exportSiteContext.stats.buildingPlacementDebug = buildBuildingPlacementDiagnostics(
+    exportSiteContext
+  );
 
   console.log(
     `[export-terrain] format=${format} requested=${requestedContourInterval} source=${sourceContourInterval} effective=${effectiveContourBandInterval} display=${exportSiteContext.stats.effectiveContourDisplayInterval} preserveNativeContours=${preserveNativeContourDisplayLines} terrainStep=${Number(exportSiteContext?.terrainGrid?.step || 0).toFixed(3)} refined=${exportSiteContext?.stats?.nativeContourTerrainGridRefined === true}`

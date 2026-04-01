@@ -2260,6 +2260,8 @@ async function runBaselineVerification() {
     const buildingPlacementDebug =
       preparedBuildingPlacementSiteContext?.buildings?.features?.[0]?.properties
         ?.buildingPlacementDebug;
+    const buildingPlacementStatsDebug =
+      preparedBuildingPlacementSiteContext?.stats?.buildingPlacementDebug?.[0];
     assert.equal(
       buildingPlacementDebug?.source,
       "dominant-band-overlap",
@@ -2279,6 +2281,16 @@ async function runBaselineVerification() {
       buildingPlacementDebug?.finalBaseElevation,
       15,
       "Contour-terrain building placement should keep the building on the matching 5m terrace instead of floating it one band too high."
+    );
+    assert.equal(
+      buildingPlacementStatsDebug?.source,
+      "dominant-band-overlap",
+      "Prepared export stats should expose the same dominant terrace source as the per-building placement debug."
+    );
+    assert.equal(
+      buildingPlacementStatsDebug?.finalBaseElevation,
+      15,
+      "Prepared export stats should keep building placement diagnostics aligned with the exported building base elevation."
     );
     const refinedSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       refinedSketchUpSiteContext
