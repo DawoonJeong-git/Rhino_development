@@ -14338,6 +14338,24 @@ function computeLocalMultiPolygonBounds(multiPolygon) {
   return bounds;
 }
 
+function filterLocalMultiPolygonByBoundsOverlap(
+  multiPolygon,
+  referenceBounds,
+  paddingMeters = 0.001
+) {
+  if (!Array.isArray(multiPolygon) || !multiPolygon.length || !referenceBounds) {
+    return [];
+  }
+
+  return multiPolygon.filter((polygon) =>
+    boundsOverlap(
+      getLocalMultiPolygonPolygonBounds(polygon),
+      referenceBounds,
+      paddingMeters
+    )
+  );
+}
+
 function partitionLocalMultiPolygonPolygons(
   multiPolygon,
   maxBucketSize = LOCAL_MULTIPOLYGON_DIFFERENCE_MAX_POLYGONS
@@ -14474,6 +14492,76 @@ function differenceLocalMultiPolygonByTiles(
   return tileHitCount > 0 ? partitionedResult : null;
 }
 
+function buildNestedContourDifferenceMultiPolygon(
+  baseMultiPolygon,
+  subtractMultiPolygon,
+  minimumAreaSqm = 0.0001
+) {
+  const baseRegions = buildContourBandRegionsFromMultiPolygon(baseMultiPolygon).map(
+    (region) => ({
+      outerPoints: orientLocalPolygonCounterClockwise(region?.outerPoints || []),
+      holePoints: (region?.holePoints || []).map((holePoints) =>
+        orientLocalPolygonClockwise(holePoints || [])
+      ),
+    })
+  );
+  const subtractRegions = buildContourBandRegionsFromMultiPolygon(subtractMultiPolygon);
+
+  if (!baseRegions.length || !subtractRegions.length) {
+    return null;
+  }
+
+  const islandRegions = [];
+
+  for (const subtractRegion of subtractRegions) {
+    const outerPoints = orientLocalPolygonCounterClockwise(
+      subtractRegion?.outerPoints || []
+    );
+
+    if (outerPoints.length < 3) {
+      continue;
+    }
+
+    const hostPoint =
+      estimateLocalRegionInteriorPoint({
+        outerPoints,
+        holePoints: subtractRegion?.holePoints || [],
+      }) || outerPoints[0];
+    const hostIndex = baseRegions.findIndex((region) =>
+      isPointInsideLocalRegion(hostPoint, region)
+    );
+
+    if (hostIndex === -1) {
+      return null;
+    }
+
+    baseRegions[hostIndex].holePoints.push(orientLocalPolygonClockwise(outerPoints));
+
+    for (const holePoints of subtractRegion?.holePoints || []) {
+      const islandOuterPoints = orientLocalPolygonCounterClockwise(holePoints || []);
+
+      if (
+        islandOuterPoints.length >= 3 &&
+        Math.abs(computeLocalPolygonSignedArea(islandOuterPoints)) >= minimumAreaSqm
+      ) {
+        islandRegions.push({
+          outerPoints: islandOuterPoints,
+          holePoints: [],
+        });
+      }
+    }
+  }
+
+  const contourAwareMultiPolygon = buildPolygonClippingMultiPolygonFromRegions([
+    ...baseRegions,
+    ...islandRegions,
+  ]);
+
+  return contourAwareMultiPolygon.length
+    ? filterTinyLocalMultiPolygonArtifacts(contourAwareMultiPolygon, minimumAreaSqm)
+    : null;
+}
+
 function differenceLocalMultiPolygon(
   baseMultiPolygon,
   subtractMultiPolygon,
@@ -14487,60 +14575,122 @@ function differenceLocalMultiPolygon(
     return baseMultiPolygon;
   }
 
+  const normalizedBaseBounds = computeLocalMultiPolygonBounds(baseMultiPolygon);
+  const normalizedSubtractMultiPolygon = normalizedBaseBounds
+    ? filterLocalMultiPolygonByBoundsOverlap(
+        subtractMultiPolygon,
+        normalizedBaseBounds,
+        0.001
+      )
+    : subtractMultiPolygon;
+
+  if (!normalizedSubtractMultiPolygon?.length) {
+    return baseMultiPolygon;
+  }
+
+  const normalizedSubtractBounds = computeLocalMultiPolygonBounds(
+    normalizedSubtractMultiPolygon
+  );
+  const overlappingBaseMultiPolygon = normalizedSubtractBounds
+    ? filterLocalMultiPolygonByBoundsOverlap(
+        baseMultiPolygon,
+        normalizedSubtractBounds,
+        0.001
+      )
+    : baseMultiPolygon;
+  const untouchedBaseMultiPolygon =
+    overlappingBaseMultiPolygon.length < baseMultiPolygon.length &&
+    normalizedSubtractBounds
+      ? baseMultiPolygon.filter(
+          (polygon) =>
+            !boundsOverlap(
+              getLocalMultiPolygonPolygonBounds(polygon),
+              normalizedSubtractBounds,
+              0.001
+            )
+        )
+      : [];
+
+  if (!overlappingBaseMultiPolygon.length) {
+    return baseMultiPolygon;
+  }
+
   try {
-    return polygonClipping.difference(baseMultiPolygon, subtractMultiPolygon) || [];
+    const differenceResult =
+      polygonClipping.difference(
+        overlappingBaseMultiPolygon,
+        normalizedSubtractMultiPolygon
+      ) || [];
+
+    return untouchedBaseMultiPolygon.length
+      ? [...untouchedBaseMultiPolygon, ...differenceResult]
+      : differenceResult;
   } catch (error) {
     if (depth < LOCAL_MULTIPOLYGON_DIFFERENCE_MAX_DEPTH) {
       const tilePartitionedResult = differenceLocalMultiPolygonByTiles(
-        baseMultiPolygon,
-        subtractMultiPolygon,
+        overlappingBaseMultiPolygon,
+        normalizedSubtractMultiPolygon,
         depth
       );
 
       if (Array.isArray(tilePartitionedResult)) {
+        const mergedTileResult = tilePartitionedResult.length
+          ? unionLocalMultiPolygons(tilePartitionedResult.map((polygon) => [polygon]))
+          : [];
         console.warn(
-          `[terrain-band] tiled difference fallback base=${baseMultiPolygon.length} subtract=${subtractMultiPolygon.length} tiles=${depth <= 0 ? 9 : 4} depth=${depth + 1}`
+          `[terrain-band] tiled difference fallback base=${overlappingBaseMultiPolygon.length} subtract=${normalizedSubtractMultiPolygon.length} tiles=${depth <= 0 ? 9 : 4} depth=${depth + 1}`
         );
-        return tilePartitionedResult;
+        return untouchedBaseMultiPolygon.length
+          ? [...untouchedBaseMultiPolygon, ...mergedTileResult]
+          : mergedTileResult;
       }
     }
 
     const baseBuckets =
       depth < LOCAL_MULTIPOLYGON_DIFFERENCE_MAX_DEPTH
         ? partitionLocalMultiPolygonPolygons(
-            baseMultiPolygon,
+            overlappingBaseMultiPolygon,
             LOCAL_MULTIPOLYGON_DIFFERENCE_MAX_POLYGONS
           )
         : [];
     const subtractBuckets =
       depth < LOCAL_MULTIPOLYGON_DIFFERENCE_MAX_DEPTH
         ? partitionLocalMultiPolygonPolygons(
-            subtractMultiPolygon,
+            normalizedSubtractMultiPolygon,
             LOCAL_MULTIPOLYGON_DIFFERENCE_MAX_POLYGONS
           )
         : [];
 
-    if (baseBuckets.length > 1 && baseBuckets.length < baseMultiPolygon.length) {
+    if (
+      baseBuckets.length > 1 &&
+      baseBuckets.length < overlappingBaseMultiPolygon.length
+    ) {
       console.warn(
-        `[terrain-band] partitioned difference base=${baseMultiPolygon.length} buckets=${baseBuckets.length} depth=${depth + 1}`
+        `[terrain-band] partitioned difference base=${overlappingBaseMultiPolygon.length} buckets=${baseBuckets.length} depth=${depth + 1}`
       );
       const partitionedResult = baseBuckets.flatMap((bucket) =>
-        differenceLocalMultiPolygon(bucket, subtractMultiPolygon, depth + 1)
+        differenceLocalMultiPolygon(
+          bucket,
+          normalizedSubtractMultiPolygon,
+          depth + 1
+        )
       );
 
-      if (partitionedResult.length || !baseMultiPolygon.length) {
-        return partitionedResult;
+      if (partitionedResult.length || !overlappingBaseMultiPolygon.length) {
+        return untouchedBaseMultiPolygon.length
+          ? [...untouchedBaseMultiPolygon, ...partitionedResult]
+          : partitionedResult;
       }
     }
 
     if (
       subtractBuckets.length > 1 &&
-      subtractBuckets.length < subtractMultiPolygon.length
+      subtractBuckets.length < normalizedSubtractMultiPolygon.length
     ) {
       console.warn(
-        `[terrain-band] partitioned difference subtract=${subtractMultiPolygon.length} buckets=${subtractBuckets.length} depth=${depth + 1}`
+        `[terrain-band] partitioned difference subtract=${normalizedSubtractMultiPolygon.length} buckets=${subtractBuckets.length} depth=${depth + 1}`
       );
-      let partitionedResult = baseMultiPolygon;
+      let partitionedResult = overlappingBaseMultiPolygon;
 
       for (const bucket of subtractBuckets) {
         partitionedResult = differenceLocalMultiPolygon(
@@ -14549,18 +14699,37 @@ function differenceLocalMultiPolygon(
           depth + 1
         );
 
-        if (!partitionedResult.length) {
+      if (!partitionedResult.length) {
           return [];
         }
       }
 
-      return partitionedResult;
+      return untouchedBaseMultiPolygon.length
+        ? [...untouchedBaseMultiPolygon, ...partitionedResult]
+        : partitionedResult;
+    }
+
+    const contourAwareFallback = buildNestedContourDifferenceMultiPolygon(
+      overlappingBaseMultiPolygon,
+      normalizedSubtractMultiPolygon,
+      0.0001
+    );
+
+    if (contourAwareFallback?.length) {
+      console.warn(
+        `[terrain-band] contour-aware difference fallback base=${overlappingBaseMultiPolygon.length} subtract=${normalizedSubtractMultiPolygon.length} depth=${depth + 1}`
+      );
+      return untouchedBaseMultiPolygon.length
+        ? [...untouchedBaseMultiPolygon, ...contourAwareFallback]
+        : contourAwareFallback;
     }
 
     console.warn(
       `[terrain-band] raw-contour difference fallback error=${formatErrorForLog(error)}`
     );
-    return baseMultiPolygon;
+    return untouchedBaseMultiPolygon.length
+      ? [...untouchedBaseMultiPolygon, ...overlappingBaseMultiPolygon]
+      : overlappingBaseMultiPolygon;
   }
 }
 
