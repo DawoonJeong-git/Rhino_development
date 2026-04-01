@@ -10043,6 +10043,11 @@ function buildClosedContourExportCollection(siteContext) {
     return siteContext?.contourLines || featureCollection([]);
   }
 
+  const seed = Math.round(
+    Math.abs(Number(siteContext?.location?.lat) * 1000) +
+      Math.abs(Number(siteContext?.location?.lng) * 1000)
+  );
+  const clipRect = buildLocalClipRect(siteContext);
   const nativeElevationKeys = new Set(
     (siteContext?.contourLines?.features || [])
       .filter((feature) => feature?.properties?.generated !== true)
@@ -10052,6 +10057,74 @@ function buildClosedContourExportCollection(siteContext) {
   );
   const features = [];
   const featureKeys = new Set();
+  const appendedNativeFeatureCountsByLevel = new Map();
+
+  if (clipRect) {
+    const canonicalNativeEntries = buildCanonicalContourInputEntries(
+      siteContext,
+      siteContext?.contourLines,
+      { includeLocalPoints: true }
+    ).filter((entry) => entry.source === "native");
+
+    for (const entry of canonicalNativeEntries) {
+      let nativeLoop = [];
+
+      if (entry.closedInput === true) {
+        nativeLoop = closeRing(dedupeLocalPolygonPoints(entry.localPoints || [], 0.001));
+      } else {
+        const closure = resolveOpenContourBoundaryCandidates(entry.localPoints || [], clipRect);
+        const selection = resolveHigherContourSideCandidate(
+          siteContext,
+          entry.elevation,
+          closure.candidateMultiPolygons,
+          seed
+        );
+
+        if (Number.isInteger(selection.selectedIndex)) {
+          nativeLoop = closeRing(
+            dedupeLocalPolygonPoints(
+              closure.candidatePolygons?.[selection.selectedIndex] || [],
+              0.001
+            )
+          );
+        }
+      }
+
+      if (nativeLoop.length < 4) {
+        continue;
+      }
+
+      const levelKey = buildContourLevelKey(entry.elevation);
+      const featureKey = [
+        levelKey,
+        nativeLoop.map((point) => buildLocalPointKey(point, 3)).join(";"),
+      ].join("|");
+
+      if (featureKeys.has(featureKey)) {
+        continue;
+      }
+
+      featureKeys.add(featureKey);
+      appendedNativeFeatureCountsByLevel.set(
+        levelKey,
+        Number(appendedNativeFeatureCountsByLevel.get(levelKey) || 0) + 1
+      );
+      features.push(
+        lineFeature(
+          nativeLoop.map(([xMeters, yMeters]) =>
+            lngLatFromMeters(siteContext.location, xMeters, yMeters)
+          ),
+          {
+            elevation: Number(Number(entry.elevation).toFixed(3)),
+            provider: "official-contours-closed",
+            generated: false,
+            closedLoop: true,
+            exportDerived: "native-source-closed",
+          }
+        )
+      );
+    }
+  }
 
   const appendFeaturesFromMultiPolygon = (
     multiPolygon,
@@ -10110,8 +10183,17 @@ function buildClosedContourExportCollection(siteContext) {
       .sort((left, right) => left - right);
 
     for (const level of resolvedLevels) {
+      const levelKey = buildContourLevelKey(level);
+
+      if (
+        nativeElevationKeys.has(levelKey) &&
+        Number(appendedNativeFeatureCountsByLevel.get(levelKey) || 0) > 0
+      ) {
+        continue;
+      }
+
       appendFeaturesFromMultiPolygon(
-        rawAnchorAssembly.resolvedAreaAboveByLevel.get(buildContourLevelKey(level)) || [],
+        rawAnchorAssembly.resolvedAreaAboveByLevel.get(levelKey) || [],
         level,
         "resolved-area-above-contour"
       );
@@ -10126,11 +10208,20 @@ function buildClosedContourExportCollection(siteContext) {
       .at(-1);
 
     if (highestTopSurfaceGroup?.multiPolygon?.length) {
+      const topLevelKey = buildContourLevelKey(highestTopSurfaceGroup.elevation);
+
+      if (
+        !(
+          nativeElevationKeys.has(topLevelKey) &&
+          Number(appendedNativeFeatureCountsByLevel.get(topLevelKey) || 0) > 0
+        )
+      ) {
       appendFeaturesFromMultiPolygon(
         highestTopSurfaceGroup.multiPolygon,
         Number(highestTopSurfaceGroup.elevation),
         "top-surface-cap-contour"
       );
+      }
     }
   }
 
