@@ -14180,6 +14180,42 @@ function isPointInsideLocalRegion(point, region) {
   return !(region.holePoints || []).some((holePoints) => pointInRing(point, holePoints));
 }
 
+function isPointInsideOrOnLocalRing(point, ring) {
+  if (!point || !Array.isArray(ring) || ring.length < 3) {
+    return false;
+  }
+
+  if (pointInRing(point, ring)) {
+    return true;
+  }
+
+  for (let index = 0; index < ring.length; index += 1) {
+    const startPoint = ring[index];
+    const endPoint = ring[(index + 1) % ring.length];
+    const orientation = orientationOfLocalPoints(startPoint, point, endPoint);
+
+    if (orientation === 0 && isLocalPointOnSegment(startPoint, point, endPoint)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isPointInsideOrOnLocalRegion(point, region) {
+  if (
+    !point ||
+    !region?.outerPoints?.length ||
+    !isPointInsideOrOnLocalRing(point, region.outerPoints)
+  ) {
+    return false;
+  }
+
+  return !(region.holePoints || []).some((holePoints) =>
+    isPointInsideOrOnLocalRing(point, holePoints)
+  );
+}
+
 function estimateLocalRegionInteriorPoint(region) {
   const outerPoints = region?.outerPoints || [];
 
@@ -14528,10 +14564,18 @@ function buildNestedContourDifferenceMultiPolygon(
         holePoints: subtractRegion?.holePoints || [],
       }) || outerPoints[0];
     const hostIndex = baseRegions.findIndex((region) =>
-      isPointInsideLocalRegion(hostPoint, region)
+      isPointInsideOrOnLocalRegion(hostPoint, region)
     );
 
     if (hostIndex === -1) {
+      return null;
+    }
+
+    const hostRegion = baseRegions[hostIndex];
+
+    if (
+      !outerPoints.every((point) => isPointInsideOrOnLocalRegion(point, hostRegion))
+    ) {
       return null;
     }
 
@@ -14613,6 +14657,22 @@ function differenceLocalMultiPolygon(
 
   if (!overlappingBaseMultiPolygon.length) {
     return baseMultiPolygon;
+  }
+
+  const contourAwareFastPath =
+    overlappingBaseMultiPolygon.length <= 4 &&
+    normalizedSubtractMultiPolygon.length <= 4
+      ? buildNestedContourDifferenceMultiPolygon(
+          overlappingBaseMultiPolygon,
+          normalizedSubtractMultiPolygon,
+          0.0001
+        )
+      : null;
+
+  if (contourAwareFastPath?.length) {
+    return untouchedBaseMultiPolygon.length
+      ? [...untouchedBaseMultiPolygon, ...contourAwareFastPath]
+      : contourAwareFastPath;
   }
 
   try {
@@ -16611,6 +16671,64 @@ function buildCumulativeContourBandGroups(siteContext) {
 
   if (!bandGroups.length) {
     return [];
+  }
+
+  if (
+    bandGroups.rawAnchoredContourTerrainUsed === true &&
+    Number(bandGroups.rawAnchoredGridFallbackBandCount || 0) === 0
+  ) {
+    const rawAnchorAssembly = buildRawAnchoredContourBandAssembly(siteContext);
+
+    if (rawAnchorAssembly?.resolvedAreaAboveByLevel instanceof Map) {
+      const directCumulativeGroups = [];
+
+      for (const group of bandGroups) {
+        const levelKey = buildContourLevelKey(group?.bottomElevation);
+        const directMultiPolygon =
+          rawAnchorAssembly.resolvedAreaAboveByLevel.get(levelKey) || [];
+        const regions = buildContourBandRegionsFromMultiPolygon(directMultiPolygon);
+
+        if (!regions.length) {
+          continue;
+        }
+
+        directCumulativeGroups.push({
+          ...group,
+          boundaryLoops: regions.flatMap((region) => [
+            region.outerPoints,
+            ...(region.holePoints || []),
+          ]),
+          regions,
+          multiPolygon: directMultiPolygon,
+        });
+      }
+
+      if (directCumulativeGroups.length === bandGroups.length) {
+        Object.assign(directCumulativeGroups, {
+          rawAnchoredContourTerrainUsed: true,
+          rawAnchoredContourBandCount: Number(
+            bandGroups.rawAnchoredContourBandCount || bandGroups.length || 0
+          ),
+          rawAnchoredContourEntryCount: Number(
+            bandGroups.rawAnchoredContourEntryCount || 0
+          ),
+          rawAnchoredNativeContourLevelCount: Number(
+            bandGroups.rawAnchoredNativeContourLevelCount || 0
+          ),
+          rawAnchoredSourceContourInterval: Number(
+            bandGroups.rawAnchoredSourceContourInterval || 0
+          ),
+          rawAnchoredGridFallbackBandCount: Number(
+            bandGroups.rawAnchoredGridFallbackBandCount || 0
+          ),
+          rawAnchoredGridFallbackBottomElevations: [
+            ...(bandGroups.rawAnchoredGridFallbackBottomElevations || []),
+          ],
+        });
+
+        return directCumulativeGroups;
+      }
+    }
   }
 
   const cumulativeDescending = [];
