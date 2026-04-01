@@ -14606,10 +14606,24 @@ function buildNestedContourDifferenceMultiPolygon(
     : null;
 }
 
+function constrainUpperContourAreaWithinLower(lowerMultiPolygon, upperMultiPolygon) {
+  if (!lowerMultiPolygon?.length || !upperMultiPolygon?.length) {
+    return upperMultiPolygon || [];
+  }
+
+  const intersectedUpperArea = intersectLocalMultiPolygon(
+    upperMultiPolygon,
+    lowerMultiPolygon
+  );
+
+  return intersectedUpperArea.length ? intersectedUpperArea : upperMultiPolygon;
+}
+
 function differenceLocalMultiPolygon(
   baseMultiPolygon,
   subtractMultiPolygon,
-  depth = 0
+  depth = 0,
+  context = null
 ) {
   if (!baseMultiPolygon?.length) {
     return [];
@@ -14697,8 +14711,15 @@ function differenceLocalMultiPolygon(
         const mergedTileResult = tilePartitionedResult.length
           ? unionLocalMultiPolygons(tilePartitionedResult.map((polygon) => [polygon]))
           : [];
+        const contextLabel =
+          context && typeof context === "object"
+            ? Object.entries(context)
+                .filter(([, value]) => value !== null && value !== undefined && value !== "")
+                .map(([key, value]) => `${key}=${value}`)
+                .join(" ")
+            : "";
         console.warn(
-          `[terrain-band] tiled difference fallback base=${overlappingBaseMultiPolygon.length} subtract=${normalizedSubtractMultiPolygon.length} tiles=${depth <= 0 ? 9 : 4} depth=${depth + 1}`
+          `[terrain-band] tiled difference fallback base=${overlappingBaseMultiPolygon.length} subtract=${normalizedSubtractMultiPolygon.length} tiles=${depth <= 0 ? 9 : 4} depth=${depth + 1}${contextLabel ? ` ${contextLabel}` : ""}`
         );
         return untouchedBaseMultiPolygon.length
           ? [...untouchedBaseMultiPolygon, ...mergedTileResult]
@@ -14732,7 +14753,8 @@ function differenceLocalMultiPolygon(
         differenceLocalMultiPolygon(
           bucket,
           normalizedSubtractMultiPolygon,
-          depth + 1
+          depth + 1,
+          context
         )
       );
 
@@ -14756,7 +14778,8 @@ function differenceLocalMultiPolygon(
         partitionedResult = differenceLocalMultiPolygon(
           partitionedResult,
           bucket,
-          depth + 1
+          depth + 1,
+          context
         );
 
       if (!partitionedResult.length) {
@@ -15479,11 +15502,12 @@ function buildExactNativeContourBandAssembly({
     );
     const bottomArea =
       exactAreaAboveByLevel.get(buildContourLevelKey(bottomElevation)) || [];
-    const topArea =
+    const rawTopArea =
       Number.isFinite(nextLevel) &&
       exactAreaAboveByLevel.has(buildContourLevelKey(nextLevel))
         ? exactAreaAboveByLevel.get(buildContourLevelKey(nextLevel)) || []
         : [];
+    const topArea = constrainUpperContourAreaWithinLower(bottomArea, rawTopArea);
 
     if (!(topElevation > bottomElevation + 0.001)) {
       if (includeLevelDiagnostics) {
@@ -15510,7 +15534,11 @@ function buildExactNativeContourBandAssembly({
 
     const bandMultiPolygon =
       topArea.length && topElevation > bottomElevation + 0.001
-        ? differenceLocalMultiPolygon(bottomArea, topArea)
+        ? differenceLocalMultiPolygon(bottomArea, topArea, 0, {
+            kind: "exact-native-band",
+            bottom: Number(bottomElevation.toFixed(3)),
+            top: Number(topElevation.toFixed(3)),
+          })
         : bottomArea;
     const regions = buildContourBandRegionsFromMultiPolygon(bandMultiPolygon);
 
@@ -15995,11 +16023,18 @@ function buildRawAnchoredContourBandAssembly(
             resolvedAreaAbove: [],
           }
         : resolveConstrainedAreaAboveLevelDetail(topElevation);
-    const topArea = topResolution.resolvedAreaAbove;
+    const topArea = constrainUpperContourAreaWithinLower(
+      bottomArea,
+      topResolution.resolvedAreaAbove
+    );
 
     const bandMultiPolygon =
       topArea?.length
-        ? differenceLocalMultiPolygon(bottomArea, topArea)
+        ? differenceLocalMultiPolygon(bottomArea, topArea, 0, {
+            kind: "raw-anchor-band",
+            bottom: Number(bottomElevation.toFixed(3)),
+            top: Number(topElevation.toFixed(3)),
+          })
         : bottomArea;
 
     if (!bandMultiPolygon.length) {
@@ -17333,9 +17368,18 @@ function buildContourTopSurfaceGroups(siteContext) {
     let topSurfaceMultiPolygon = group.multiPolygon;
 
     if (nextGroup?.multiPolygon?.length) {
-      topSurfaceMultiPolygon = differenceLocalMultiPolygon(
+      const constrainedNextMultiPolygon = constrainUpperContourAreaWithinLower(
         group.multiPolygon,
         nextGroup.multiPolygon
+      );
+      topSurfaceMultiPolygon = differenceLocalMultiPolygon(
+        group.multiPolygon,
+        constrainedNextMultiPolygon,
+        0,
+        {
+          kind: "top-surface",
+          elevation: Number(group.topElevation.toFixed(3)),
+        }
       );
     }
 
