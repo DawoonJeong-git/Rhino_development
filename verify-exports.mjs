@@ -2039,6 +2039,58 @@ async function runBaselineVerification() {
       ),
       "The raw 12m contour should lie directly on a terrain-band boundary edge."
     );
+    const exact3dmSiteContext = prepareSiteContextForExport(
+      syntheticContourSiteContext,
+      {
+        ...syntheticContourSiteContext.options,
+        contourInterval: 2,
+      },
+      "3dm"
+    );
+    const exact3dmTerrainPlan = resolveContourTerrainRenderPlan(exact3dmSiteContext);
+    assert.equal(
+      exact3dmSiteContext?.stats?.rawAnchoredExactNativeIntervalUsed,
+      true,
+      "When the requested interval matches the source contour interval, 3DM terrain should use the exact native contour band path."
+    );
+    assert.equal(
+      exact3dmSiteContext?.stats?.rawAnchoredGridFallbackBandCount,
+      0,
+      "Exact native contour terrain should not need fallback grid bands."
+    );
+    assert.deepEqual(
+      (exact3dmTerrainPlan?.bandGroups || []).map((group) => Number(group?.bottomElevation)),
+      [10, 12],
+      "Exact native contour terrain should keep every native bottom band when the request matches the source interval."
+    );
+    const exact12Band = (exact3dmTerrainPlan?.bandGroups || []).find(
+      (group) => Math.abs(Number(group?.bottomElevation || 0) - 12) <= 1e-9
+    );
+    assert.ok(
+      exact12Band,
+      "Exact native contour terrain should keep the 12m band as a real terrain step."
+    );
+    assert.ok(
+      (exact12Band?.boundaryLoops || []).some((loop) =>
+        (loop || []).some((point, index) => {
+          const nextPoint = loop[(index + 1) % loop.length];
+
+          if (!nextPoint) {
+            return false;
+          }
+
+          const segmentMinX = Math.min(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
+          const segmentMaxX = Math.max(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
+          return (
+            Math.abs(Number(point?.[1] || 0) - raw12ContourY) <= 0.5 &&
+            Math.abs(Number(nextPoint?.[1] || 0) - raw12ContourY) <= 0.5 &&
+            segmentMinX <= raw12ContourMinX + 0.5 &&
+            segmentMaxX >= raw12ContourMaxX - 0.5
+          );
+        })
+      ),
+      "Exact native contour terrain should place the raw 12m contour directly on the exact 12m terrain boundary."
+    );
     const refinedSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       refinedSketchUpSiteContext
     );

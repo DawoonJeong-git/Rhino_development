@@ -14729,6 +14729,8 @@ function buildExactNativeContourBandAssembly({
         referenceAreaSqm > 0 ? overlapAreaSqm / referenceAreaSqm : 0;
       const precisionRatio =
         candidateAreaSqm > 0 ? overlapAreaSqm / candidateAreaSqm : 0;
+      const areaDeltaRatio =
+        Math.abs(candidateAreaSqm - referenceAreaSqm) / Math.max(referenceAreaSqm, 1);
       const meaningfulOverlap =
         referenceAreaSqm <= 0 ||
         overlapAreaSqm >= Math.max(2, referenceAreaSqm * 0.02) ||
@@ -14736,9 +14738,10 @@ function buildExactNativeContourBandAssembly({
         precisionRatio >= 0.12;
       const containerLike =
         referenceAreaSqm > 0 &&
-        candidateAreaSqm > referenceAreaSqm * 1.12 &&
+        candidateAreaSqm > referenceAreaSqm * 1.3 &&
         coverageRatio >= 0.72 &&
         precisionRatio <= 0.92 &&
+        areaDeltaRatio >= 0.22 &&
         !(clipAreaSqm > 0 && referenceAreaSqm >= clipAreaSqm * 0.94);
 
       if (!meaningfulOverlap) {
