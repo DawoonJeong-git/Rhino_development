@@ -15055,52 +15055,43 @@ function buildRawAnchoredContourBandAssembly(
     }
   }
 
+  const exactNativeAnchorAssembly = buildExactNativeContourBandAssembly({
+    interval: sourceContourInterval > 0 ? sourceContourInterval : interval,
+    sourceContourInterval,
+    minElevation,
+    maxElevation,
+    startLevel: Math.floor(minElevation / Math.max(sourceContourInterval || interval, 0.001)) *
+      Math.max(sourceContourInterval || interval, 0.001),
+    contourEntries,
+    contourEntryCountsByElevation,
+    cumulativeByLevel,
+    referenceAreaAboveByLevel: selectionGridAreaResult.gridAreaAboveByLevel,
+    cleanupAreaThresholdSqm,
+    includeLevelDiagnostics:
+      sourceContourInterval > 0 &&
+      Math.abs(interval - sourceContourInterval) <= 1e-9
+        ? includeLevelDiagnostics
+        : false,
+  });
+  const exactNativeAnchorAreaByLevel =
+    exactNativeAnchorAssembly.constrainedAnchorAreaByLevel || new Map();
+
   if (
     sourceContourInterval > 0 &&
     Math.abs(interval - sourceContourInterval) <= 1e-9
   ) {
-    const exactReferenceInterval = interval > 1 ? Math.min(1, interval) : interval;
-    const exactReferenceAreaAboveByLevel =
-      Math.abs(exactReferenceInterval - interval) <= 1e-9
-        ? gridAreaAboveByLevel
-        : buildRawAnchoredContourBandAssembly({
-            ...siteContext,
-            options: {
-              ...(siteContext?.options || {}),
-              contourInterval: exactReferenceInterval,
-            },
-            stats: {
-              ...(siteContext?.stats || {}),
-              requestedContourInterval: exactReferenceInterval,
-              effectiveContourBandInterval: exactReferenceInterval,
-            },
-          }).resolvedAreaAboveByLevel;
-    const exactNativeAssembly = buildExactNativeContourBandAssembly({
-      interval,
-      sourceContourInterval,
-      minElevation,
-      maxElevation,
-      startLevel,
-      contourEntries,
-      contourEntryCountsByElevation,
-      cumulativeByLevel,
-      referenceAreaAboveByLevel: exactReferenceAreaAboveByLevel,
-      cleanupAreaThresholdSqm,
-      includeLevelDiagnostics,
-    });
-
-    if (exactNativeAssembly.bandGroups.length) {
+    if (exactNativeAnchorAssembly.bandGroups.length) {
       siteContext.stats = {
         ...(siteContext?.stats || {}),
         rawAnchoredContourTerrainUsed: true,
-        rawAnchoredContourBandCount: exactNativeAssembly.bandGroups.length,
+        rawAnchoredContourBandCount: exactNativeAnchorAssembly.bandGroups.length,
         rawAnchoredContourEntryCount: contourEntries.length,
-        rawAnchoredNativeContourLevelCount: exactNativeAssembly.anchorLevels.length,
+        rawAnchoredNativeContourLevelCount: exactNativeAnchorAssembly.anchorLevels.length,
         rawAnchoredSourceContourInterval: sourceContourInterval,
         rawAnchoredGridFallbackBandCount: 0,
         rawAnchoredExactNativeIntervalUsed: true,
       };
-      return exactNativeAssembly;
+      return exactNativeAnchorAssembly;
     }
   }
 
@@ -15110,9 +15101,14 @@ function buildRawAnchoredContourBandAssembly(
     const levelKey = buildContourLevelKey(level);
     const rawAnchorArea = cumulativeByLevel.get(levelKey) || [];
     const gridAreaAbove = resolveGridAreaAboveLevel(level);
-    let constrainedAnchorArea = rawAnchorArea;
+    let constrainedAnchorArea =
+      exactNativeAnchorAreaByLevel.get(levelKey) || rawAnchorArea;
 
-    if (rawAnchorArea.length && gridAreaAbove.length) {
+    if (
+      !exactNativeAnchorAreaByLevel.has(levelKey) &&
+      rawAnchorArea.length &&
+      gridAreaAbove.length
+    ) {
       const intersectedAnchorArea = intersectLocalMultiPolygon(rawAnchorArea, gridAreaAbove);
 
       if (intersectedAnchorArea.length) {
@@ -15131,6 +15127,12 @@ function buildRawAnchoredContourBandAssembly(
   }
 
   const resolveRawAreaAboveLevel = (level) => {
+    const levelKey = buildContourLevelKey(level);
+
+    if (constrainedAnchorAreaByLevel.has(levelKey)) {
+      return constrainedAnchorAreaByLevel.get(levelKey) || [];
+    }
+
     if (level <= minElevation + 0.001) {
       return clipRect.multiPolygon;
     }
@@ -15139,14 +15141,33 @@ function buildRawAnchoredContourBandAssembly(
       return [];
     }
 
-    return (
-      constrainedAnchorAreaByLevel.get(buildContourLevelKey(level)) ||
-      cumulativeByLevel.get(buildContourLevelKey(level)) ||
-      null
-    );
+    return cumulativeByLevel.get(levelKey) || null;
   };
   const resolveConstrainedAreaAboveLevelDetail = (level) => {
     const normalizedLevel = Number(Number(level || 0).toFixed(3));
+    const levelKey = buildContourLevelKey(normalizedLevel);
+
+    if (cumulativeByLevel.has(levelKey)) {
+      const rawAnchorArea = cumulativeByLevel.get(levelKey) || [];
+      const resolvedAreaAbove = resolveRawAreaAboveLevel(normalizedLevel) || [];
+      const rawAnchorAreaSqm = computeLocalMultiPolygonArea(rawAnchorArea);
+      const resolvedAreaSqm = computeLocalMultiPolygonArea(resolvedAreaAbove);
+
+      return {
+        normalizedLevel,
+        reason:
+          rawAnchorAreaSqm > resolvedAreaSqm + 0.001
+            ? "exact_raw_anchor_constrained_by_grid"
+            : "exact_raw_anchor",
+        exactAnchor: true,
+        lowerAnchorLevel: normalizedLevel,
+        upperAnchorLevel: normalizedLevel,
+        lowerAnchorArea: resolvedAreaAbove,
+        upperAnchorArea: resolvedAreaAbove,
+        gridAreaAbove: resolveGridAreaAboveLevel(normalizedLevel),
+        resolvedAreaAbove,
+      };
+    }
 
     if (normalizedLevel <= minElevation + 0.001) {
       return {
@@ -15183,30 +15204,6 @@ function buildRawAnchoredContourBandAssembly(
         upperAnchorArea: [],
         gridAreaAbove: [],
         resolvedAreaAbove: [],
-      };
-    }
-
-    const levelKey = buildContourLevelKey(normalizedLevel);
-
-    if (cumulativeByLevel.has(levelKey)) {
-      const rawAnchorArea = cumulativeByLevel.get(levelKey) || [];
-      const resolvedAreaAbove = resolveRawAreaAboveLevel(normalizedLevel) || [];
-      const rawAnchorAreaSqm = computeLocalMultiPolygonArea(rawAnchorArea);
-      const resolvedAreaSqm = computeLocalMultiPolygonArea(resolvedAreaAbove);
-
-      return {
-        normalizedLevel,
-        reason:
-          rawAnchorAreaSqm > resolvedAreaSqm + 0.001
-            ? "exact_raw_anchor_constrained_by_grid"
-            : "exact_raw_anchor",
-        exactAnchor: true,
-        lowerAnchorLevel: normalizedLevel,
-        upperAnchorLevel: normalizedLevel,
-        lowerAnchorArea: resolvedAreaAbove,
-        upperAnchorArea: resolvedAreaAbove,
-        gridAreaAbove: resolveGridAreaAboveLevel(normalizedLevel),
-        resolvedAreaAbove,
       };
     }
 

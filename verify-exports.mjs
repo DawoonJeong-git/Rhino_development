@@ -42,6 +42,7 @@ import {
   selectStrongJusoFastPathCandidates,
   sanitizeSketchUpSolidRegion,
   simplifySketchUpSolidRegion,
+  buildRawAnchoredContourBandDiagnostics,
   localMetersFromLngLat,
 } from "./server.mjs";
 
@@ -2001,6 +2002,58 @@ async function runBaselineVerification() {
       refined3dmSiteContext?.stats?.rawAnchoredNativeContourLevelCount,
       3,
       "Raw-contour terrain anchoring should use only the native contour levels as hard terrain anchors."
+    );
+    const raw10ContourFeature = syntheticContourSiteContext.contourLines.features.find(
+      (feature) => Number(feature?.properties?.elevation) === 10
+    );
+    const raw10ContourLocalPoints = (raw10ContourFeature?.geometry?.coordinates || []).map(
+      (point) => localMetersFromLngLat(point, syntheticContourSiteContext.location)
+    );
+    const rawAnchored10Band = (refined3dmTerrainPlan?.bandGroups || []).find(
+      (group) => Math.abs(Number(group?.bottomElevation || 0) - 10) <= 1e-9
+    );
+    const refined3dmRawAnchorDiagnostics = buildRawAnchoredContourBandDiagnostics(
+      refined3dmSiteContext
+    );
+    const rawAnchored10BandDiagnostic = (
+      refined3dmRawAnchorDiagnostics?.levelDiagnostics || []
+    ).find((entry) => Math.abs(Number(entry?.bottomElevation || 0) - 10) <= 1e-9);
+    assert.ok(
+      rawAnchored10Band,
+      "3DM terrain plan should contain the band whose lower boundary is the lowest raw native contour."
+    );
+    assert.ok(
+      rawAnchored10BandDiagnostic,
+      "Raw-anchor diagnostics should describe the lowest native terrain band."
+    );
+    assert.equal(
+      rawAnchored10BandDiagnostic?.exactBottomAnchor,
+      true,
+      "The lowest native contour should stay an exact terrain anchor when a finer contour interval is requested."
+    );
+    const raw10ContourY = raw10ContourLocalPoints[0]?.[1];
+    const raw10ContourMinX = Math.min(...raw10ContourLocalPoints.map((point) => point[0]));
+    const raw10ContourMaxX = Math.max(...raw10ContourLocalPoints.map((point) => point[0]));
+    assert.ok(
+      (rawAnchored10Band?.boundaryLoops || []).some((loop) =>
+        (loop || []).some((point, index) => {
+          const nextPoint = loop[(index + 1) % loop.length];
+
+          if (!nextPoint) {
+            return false;
+          }
+
+          const segmentMinX = Math.min(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
+          const segmentMaxX = Math.max(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
+          return (
+            Math.abs(Number(point?.[1] || 0) - raw10ContourY) <= 0.5 &&
+            Math.abs(Number(nextPoint?.[1] || 0) - raw10ContourY) <= 0.5 &&
+            segmentMinX <= raw10ContourMinX + 0.5 &&
+            segmentMaxX >= raw10ContourMaxX - 0.5
+          );
+        })
+      ),
+      "The lowest raw native contour should lie directly on a terrain-band boundary edge even for a finer interval request."
     );
     const raw12ContourFeature = syntheticContourSiteContext.contourLines.features.find(
       (feature) => Number(feature?.properties?.elevation) === 12
