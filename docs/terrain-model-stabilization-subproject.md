@@ -5,6 +5,10 @@
 Recent fixes exposed that the current terrain/export stack is no longer safe to handle as isolated hotfixes.
 We need one stabilization subproject that treats preview, road surfaces, 3DM contour integrity, and SKP terrain generation as one connected system.
 
+The root architecture reset for this work now lives in:
+
+- `docs/terrain-core-rearchitecture-plan.md`
+
 ## Scope
 
 This subproject covers four issues:
