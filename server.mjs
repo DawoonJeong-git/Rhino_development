@@ -10129,6 +10129,7 @@ function buildClosedContourExportCollection(siteContext) {
   const features = [];
   const featureKeys = new Set();
   const appendedNativeFeatureCountsByLevel = new Map();
+  const appendedGeneratedFeatureCountsByLevel = new Map();
 
   for (const entry of buildNativeContourLoopEntries(siteContext, siteContext?.contourLines)) {
     const levelKey = buildContourLevelKey(entry.elevation);
@@ -10160,6 +10161,67 @@ function buildClosedContourExportCollection(siteContext) {
         }
       )
     );
+  }
+
+  for (const feature of siteContext?.contourLines?.features || []) {
+    if (feature?.properties?.generated !== true) {
+      continue;
+    }
+
+    const elevation = Number(feature?.properties?.elevation);
+
+    if (!Number.isFinite(elevation)) {
+      continue;
+    }
+
+    const lineStrings = getLineStringsFromGeometry(feature?.geometry || null);
+
+    if (!lineStrings.length) {
+      continue;
+    }
+
+    for (const lineString of lineStrings) {
+      const localPoints = lineString
+        .map((point) => localMetersFromLngLat(point, siteContext.location))
+        .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+
+      if (localPoints.length < 2) {
+        continue;
+      }
+
+      const levelKey = buildContourLevelKey(elevation);
+      const featureKey = [
+        levelKey,
+        "generated-line",
+        localPoints.map((point) => buildLocalPointKey(point, 3)).join(";"),
+      ].join("|");
+
+      if (featureKeys.has(featureKey)) {
+        continue;
+      }
+
+      featureKeys.add(featureKey);
+      appendedGeneratedFeatureCountsByLevel.set(
+        levelKey,
+        Number(appendedGeneratedFeatureCountsByLevel.get(levelKey) || 0) + 1
+      );
+      features.push(
+        lineFeature(
+          localPoints.map(([xMeters, yMeters]) =>
+            lngLatFromMeters(siteContext.location, xMeters, yMeters)
+          ),
+          {
+            ...(feature?.properties || {}),
+            elevation: Number(elevation.toFixed(3)),
+            provider:
+              String(feature?.properties?.provider || "").trim() || "derived-contours",
+            generated: true,
+            closedLoop: feature?.properties?.closedLoop === true,
+            exportDerived: "generated-display-contour",
+          }
+        )
+      );
+    }
   }
 
   const appendFeaturesFromMultiPolygon = (
@@ -10225,6 +10287,10 @@ function buildClosedContourExportCollection(siteContext) {
         nativeElevationKeys.has(levelKey) &&
         Number(appendedNativeFeatureCountsByLevel.get(levelKey) || 0) > 0
       ) {
+        continue;
+      }
+
+      if (Number(appendedGeneratedFeatureCountsByLevel.get(levelKey) || 0) > 0) {
         continue;
       }
 
@@ -16251,10 +16317,7 @@ function buildBuildingFootprintCarveProfiles(siteContext) {
 function buildRenderableContourBandGroups(siteContext) {
   const cumulativeGroups = getCachedCumulativeContourBandGroups(siteContext);
 
-  if (
-    siteContext.options?.buildingPlacement !== "embed-lowest" ||
-    !cumulativeGroups.length
-  ) {
+  if (!cumulativeGroups.length) {
     return cumulativeGroups;
   }
 

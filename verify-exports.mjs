@@ -1984,13 +1984,27 @@ async function runBaselineVerification() {
       "Merged contour export should keep the original shape while removing duplicate breakpoints."
     );
     const closedExportContours = refined3dmSiteContext?.exportContourLines?.features || [];
+    const nativeExportContours = closedExportContours.filter(
+      (feature) => feature?.properties?.generated !== true
+    );
+    const generatedExportContours = closedExportContours.filter(
+      (feature) => feature?.properties?.generated === true
+    );
     assert.ok(
       closedExportContours.length > 0,
       "3DM contour export should produce closed export contours when contour terrain bands are available."
     );
     assert.ok(
-      closedExportContours.every((feature) => feature?.properties?.closedLoop === true),
-      "3DM contour export should mark each exported contour loop as closed."
+      nativeExportContours.every((feature) => feature?.properties?.closedLoop === true),
+      "Native export contours should stay closed so the original contour boundaries remain exact."
+    );
+    assert.ok(
+      generatedExportContours.length > 0,
+      "3DM contour export should still include generated intermediate contours for finer requests."
+    );
+    assert.ok(
+      generatedExportContours.some((feature) => feature?.properties?.closedLoop !== true),
+      "Generated intermediate contours should preserve the lighter derived linework instead of forcing every contour into a closed loop."
     );
     const refined3dmTerrainPlan = resolveContourTerrainRenderPlan(refined3dmSiteContext);
     assert.equal(
