@@ -2003,8 +2003,13 @@ async function runBaselineVerification() {
       "3DM contour export should still include generated intermediate contours for finer requests."
     );
     assert.ok(
-      generatedExportContours.some((feature) => feature?.properties?.closedLoop !== true),
-      "Generated intermediate contours should preserve the lighter derived linework instead of forcing every contour into a closed loop."
+      generatedExportContours.every(
+        (feature) =>
+          feature?.properties?.closedLoop === true &&
+          String(feature?.properties?.provider || "").trim() ===
+            "derived-contours-resolved-area"
+      ),
+      "Generated intermediate contours should reuse the terrain-aligned resolved contour plan so the display curves and terrace edges stay in sync."
     );
     const refined3dmTerrainPlan = resolveContourTerrainRenderPlan(refined3dmSiteContext);
     assert.equal(
