@@ -9765,6 +9765,132 @@ function buildContourMergeBucketKey(feature, elevation) {
   ].join("|");
 }
 
+function distanceToClipRectBoundary(point, clipRect) {
+  if (
+    !Array.isArray(point) ||
+    point.length < 2 ||
+    !Number.isFinite(point[0]) ||
+    !Number.isFinite(point[1]) ||
+    !clipRect
+  ) {
+    return null;
+  }
+
+  return Number(
+    Math.min(
+      Math.abs(Number(point[0]) - Number(clipRect.minX)),
+      Math.abs(Number(point[0]) - Number(clipRect.maxX)),
+      Math.abs(Number(point[1]) - Number(clipRect.minY)),
+      Math.abs(Number(point[1]) - Number(clipRect.maxY))
+    ).toFixed(6)
+  );
+}
+
+function buildCanonicalContourInputEntries(
+  siteContext,
+  contourCollection = null,
+  { includeLocalPoints = false } = {}
+) {
+  const collection = contourCollection || siteContext?.contourLines || featureCollection([]);
+  const clipRect = buildLocalClipRect(siteContext);
+  const entries = [];
+
+  for (let featureIndex = 0; featureIndex < (collection?.features || []).length; featureIndex += 1) {
+    const feature = collection.features[featureIndex];
+    const elevation = Number(feature?.properties?.elevation);
+
+    if (!Number.isFinite(elevation)) {
+      continue;
+    }
+
+    const source = feature?.properties?.generated === true ? "generated" : "native";
+
+    for (
+      let lineIndex = 0;
+      lineIndex < getLineStringsFromGeometry(feature?.geometry).length;
+      lineIndex += 1
+    ) {
+      const lineString = getLineStringsFromGeometry(feature?.geometry)[lineIndex];
+      const localPoints = lineString
+        .map((point) => localMetersFromLngLat(point, siteContext.location))
+        .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+
+      if (localPoints.length < 2) {
+        continue;
+      }
+
+      const closedInput =
+        localPoints.length >= 3 &&
+        pointsMatchInMeters(localPoints[0], localPoints[localPoints.length - 1], 0.001);
+      const normalizedLocalPoints = closedInput
+        ? closeRing(dedupeLocalPolygonPoints(localPoints, 0.001))
+        : mergeContourPolylinePoints(localPoints, 0.001);
+
+      if (normalizedLocalPoints.length < (closedInput ? 4 : 2)) {
+        continue;
+      }
+
+      entries.push({
+        contourId: `contour_${featureIndex + 1}_${lineIndex + 1}`,
+        featureIndex: featureIndex + 1,
+        lineIndex: lineIndex + 1,
+        elevation: Number(elevation.toFixed(3)),
+        source,
+        provider: String(feature?.properties?.provider || "").trim() || "unknown",
+        originalGeometryType: String(feature?.geometry?.type || "unknown"),
+        closedInput,
+        pointCount: normalizedLocalPoints.length,
+        startBoundaryDistanceMeters: distanceToClipRectBoundary(
+          normalizedLocalPoints[0],
+          clipRect
+        ),
+        endBoundaryDistanceMeters: distanceToClipRectBoundary(
+          normalizedLocalPoints[normalizedLocalPoints.length - 1],
+          clipRect
+        ),
+        localPoints: includeLocalPoints ? normalizedLocalPoints : undefined,
+      });
+    }
+  }
+
+  return entries;
+}
+
+function buildCanonicalContourInput(siteContext, contourCollection = null) {
+  const entries = buildCanonicalContourInputEntries(siteContext, contourCollection, {
+    includeLocalPoints: false,
+  });
+  const nativeLevels = [
+    ...new Set(
+      entries
+        .filter((entry) => entry.source === "native")
+        .map((entry) => Number(entry.elevation))
+        .filter(Number.isFinite)
+        .sort((left, right) => left - right)
+    ),
+  ];
+  const generatedLevels = [
+    ...new Set(
+      entries
+        .filter((entry) => entry.source === "generated")
+        .map((entry) => Number(entry.elevation))
+        .filter(Number.isFinite)
+        .sort((left, right) => left - right)
+    ),
+  ];
+
+  return {
+    nativeLevels,
+    generatedLevels,
+    entryCount: entries.length,
+    nativeEntryCount: entries.filter((entry) => entry.source === "native").length,
+    generatedEntryCount: entries.filter((entry) => entry.source === "generated").length,
+    openEntryCount: entries.filter((entry) => entry.closedInput !== true).length,
+    closedEntryCount: entries.filter((entry) => entry.closedInput === true).length,
+    entries,
+  };
+}
+
 function normalizeContourFeatureCollection(siteContext, contourCollection = null) {
   const collection = contourCollection || siteContext?.contourLines;
 
@@ -13792,10 +13918,19 @@ function intersectLocalMultiPolygon(baseMultiPolygon, clipMultiPolygon) {
 }
 
 function buildOpenContourSideMultiPolygons(localPoints, clipRect) {
+  return resolveOpenContourBoundaryCandidates(localPoints, clipRect).candidateMultiPolygons;
+}
+
+function resolveOpenContourBoundaryCandidates(localPoints, clipRect) {
   const contourPoints = mergeContourPolylinePoints(localPoints, 0.001);
 
   if (contourPoints.length < 2) {
-    return [];
+    return {
+      contourPoints,
+      candidatePolygons: [],
+      candidateMultiPolygons: [],
+      rejectedReason: "too_few_points",
+    };
   }
 
   const startDirection = [
@@ -13835,7 +13970,17 @@ function buildOpenContourSideMultiPolygons(localPoints, clipRect) {
       Math.max(0.01, clipRect.boundarySnapTolerance * 0.1)
     )
   ) {
-    return [];
+    return {
+      contourPoints,
+      snappedStartPoint,
+      snappedEndPoint,
+      candidatePolygons: [],
+      candidateMultiPolygons: [],
+      rejectedReason:
+        !snappedStartPoint || !snappedEndPoint
+          ? "boundary_extension_failed"
+          : "shared_boundary_endpoint",
+    };
   }
 
   const snappedContourPoints = [...contourPoints];
@@ -13885,9 +14030,21 @@ function buildOpenContourSideMultiPolygons(localPoints, clipRect) {
     ),
   ];
 
-  return candidatePolygons
+  const candidateMultiPolygons = candidatePolygons
     .map((polygon) => buildLocalMultiPolygonFromOpenRing(polygon))
     .filter((multiPolygon) => multiPolygon.length);
+
+  return {
+    contourPoints,
+    snappedStartPoint,
+    snappedEndPoint,
+    snappedContourPoints,
+    ccwBoundaryPath,
+    cwBoundaryPath,
+    candidatePolygons,
+    candidateMultiPolygons,
+    rejectedReason: candidateMultiPolygons.length ? null : "no_candidate_polygons",
+  };
 }
 
 function buildClosedContourSideMultiPolygons(localPoints, clipRect) {
@@ -13915,12 +14072,27 @@ function selectHigherContourSideMultiPolygon(
   candidateMultiPolygons,
   seed
 ) {
+  return resolveHigherContourSideCandidate(
+    siteContext,
+    elevation,
+    candidateMultiPolygons,
+    seed
+  ).selectedMultiPolygon;
+}
+
+function resolveHigherContourSideCandidate(
+  siteContext,
+  elevation,
+  candidateMultiPolygons,
+  seed
+) {
   const comparisonTolerance = Math.max(
     0.02,
     resolveEffectiveContourBandInterval(siteContext) * 0.12
   );
-  const scoredCandidates = candidateMultiPolygons
-    .map((multiPolygon) => ({
+  const scoredCandidates = (candidateMultiPolygons || [])
+    .map((multiPolygon, index) => ({
+      index,
       multiPolygon,
       sampleElevation: sampleLocalMultiPolygonElevation(siteContext, multiPolygon, seed),
     }))
@@ -13931,7 +14103,13 @@ function selectHigherContourSideMultiPolygon(
     .sort((left, right) => right.sampleElevation - left.sampleElevation);
 
   if (!scoredCandidates.length) {
-    return null;
+    return {
+      selectedIndex: null,
+      selectedMultiPolygon: null,
+      scoredCandidates,
+      reason: "no_scored_candidates",
+      comparisonTolerance,
+    };
   }
 
   const definitelyHigher = scoredCandidates.filter(
@@ -13939,7 +14117,13 @@ function selectHigherContourSideMultiPolygon(
   );
 
   if (definitelyHigher.length) {
-    return definitelyHigher[0].multiPolygon;
+    return {
+      selectedIndex: definitelyHigher[0].index,
+      selectedMultiPolygon: definitelyHigher[0].multiPolygon,
+      scoredCandidates,
+      reason: "definitely_higher",
+      comparisonTolerance,
+    };
   }
 
   if (
@@ -13949,10 +14133,111 @@ function selectHigherContourSideMultiPolygon(
         Number(scoredCandidates[1].sampleElevation || 0)
     ) <= comparisonTolerance * 0.5
   ) {
-    return null;
+    return {
+      selectedIndex: null,
+      selectedMultiPolygon: null,
+      scoredCandidates,
+      reason: "ambiguous_higher_side",
+      comparisonTolerance,
+    };
   }
 
-  return scoredCandidates[0].multiPolygon;
+  return {
+    selectedIndex: scoredCandidates[0].index,
+    selectedMultiPolygon: scoredCandidates[0].multiPolygon,
+    scoredCandidates,
+    reason: "highest_sample_fallback",
+    comparisonTolerance,
+  };
+}
+
+function buildOpenContourClosureDiagnostics(siteContext, contourCollection = null) {
+  const clipRect = buildLocalClipRect(siteContext);
+
+  if (!clipRect) {
+    return {
+      nativeOpenContourCount: 0,
+      acceptedCount: 0,
+      rejectedCount: 0,
+      acceptedElevations: [],
+      rejectedElevations: [],
+      entries: [],
+    };
+  }
+
+  const seed = Math.round(
+    Math.abs(Number(siteContext?.location?.lat) * 1000) +
+      Math.abs(Number(siteContext?.location?.lng) * 1000)
+  );
+  const canonicalEntries = buildCanonicalContourInputEntries(siteContext, contourCollection, {
+    includeLocalPoints: true,
+  });
+  const diagnosticEntries = canonicalEntries
+    .filter((entry) => entry.source === "native" && entry.closedInput !== true)
+    .map((entry) => {
+      const closure = resolveOpenContourBoundaryCandidates(entry.localPoints || [], clipRect);
+      const selection = resolveHigherContourSideCandidate(
+        siteContext,
+        entry.elevation,
+        closure.candidateMultiPolygons,
+        seed
+      );
+
+      return {
+        contourId: entry.contourId,
+        elevation: entry.elevation,
+        pointCount: entry.pointCount,
+        startBoundaryDistanceMeters: entry.startBoundaryDistanceMeters,
+        endBoundaryDistanceMeters: entry.endBoundaryDistanceMeters,
+        snappedStartBoundaryDistanceMeters: distanceToClipRectBoundary(
+          closure.snappedStartPoint,
+          clipRect
+        ),
+        snappedEndBoundaryDistanceMeters: distanceToClipRectBoundary(
+          closure.snappedEndPoint,
+          clipRect
+        ),
+        candidateCount: Number(closure.candidateMultiPolygons?.length || 0),
+        candidateSampleElevations: (selection.scoredCandidates || []).map((candidate) =>
+          Number(Number(candidate?.sampleElevation || 0).toFixed(3))
+        ),
+        selectedCandidateIndex: Number.isInteger(selection.selectedIndex)
+          ? selection.selectedIndex
+          : null,
+        selectedBoundaryDirection:
+          selection.selectedIndex === 0
+            ? "ccw"
+            : selection.selectedIndex === 1
+              ? "cw"
+              : null,
+        accepted: Boolean(selection.selectedMultiPolygon?.length),
+        closureRejectedReason: closure.rejectedReason,
+        selectionReason: selection.reason,
+      };
+    });
+
+  return {
+    nativeOpenContourCount: diagnosticEntries.length,
+    acceptedCount: diagnosticEntries.filter((entry) => entry.accepted).length,
+    rejectedCount: diagnosticEntries.filter((entry) => !entry.accepted).length,
+    acceptedElevations: [
+      ...new Set(
+        diagnosticEntries
+          .filter((entry) => entry.accepted)
+          .map((entry) => Number(entry.elevation))
+          .sort((left, right) => left - right)
+      ),
+    ],
+    rejectedElevations: [
+      ...new Set(
+        diagnosticEntries
+          .filter((entry) => !entry.accepted)
+          .map((entry) => Number(entry.elevation))
+          .sort((left, right) => left - right)
+      ),
+    ],
+    entries: diagnosticEntries,
+  };
 }
 
 function buildRawAnchoredContourEntries(
@@ -14014,21 +14299,63 @@ function buildRawAnchoredContourEntries(
   return entries;
 }
 
-function buildRawAnchoredContourBandGroups(siteContext) {
+function summarizeRawContourBandAssemblyArea(multiPolygon) {
+  const safeMultiPolygon = Array.isArray(multiPolygon) ? multiPolygon : [];
+  const regions = safeMultiPolygon.length
+    ? buildContourBandRegionsFromMultiPolygon(safeMultiPolygon)
+    : [];
+
+  return {
+    polygonCount: safeMultiPolygon.length,
+    regionCount: regions.length,
+    holeCount: regions.reduce(
+      (sum, region) => sum + Number(region?.holePoints?.length || 0),
+      0
+    ),
+    areaSqm: Number(computeLocalMultiPolygonArea(safeMultiPolygon).toFixed(3)),
+  };
+}
+
+function buildRawAnchoredContourBandAssembly(
+  siteContext,
+  { includeLevelDiagnostics = false } = {}
+) {
   const terrainGrid = siteContext?.terrainGrid;
+  const emptyResult = {
+    reason: null,
+    interval: 0,
+    sourceContourInterval: 0,
+    minElevation: null,
+    maxElevation: null,
+    startLevel: null,
+    contourEntries: [],
+    anchorLevels: [],
+    contourEntryCountsByElevation: new Map(),
+    rawAreaAboveByLevel: new Map(),
+    constrainedAnchorAreaByLevel: new Map(),
+    gridAreaAboveByLevel: new Map(),
+    levelDiagnostics: [],
+    bandGroups: [],
+  };
 
   if (
     !terrainGrid?.elevations?.length ||
     siteContext?.options?.terrainMode !== "contour" ||
     !siteContext?.contourLines?.features?.length
   ) {
-    return [];
+    return {
+      ...emptyResult,
+      reason: "missing_terrain_grid_or_contours",
+    };
   }
 
   const clipRect = buildLocalClipRect(siteContext);
 
   if (!clipRect) {
-    return [];
+    return {
+      ...emptyResult,
+      reason: "missing_clip_rect",
+    };
   }
 
   const interval = resolveEffectiveContourBandInterval(siteContext);
@@ -14048,10 +14375,19 @@ function buildRawAnchoredContourBandGroups(siteContext) {
   );
 
   if (!contourEntries.length) {
-    return [];
+    return {
+      ...emptyResult,
+      reason: "no_raw_anchor_entries",
+      interval,
+      sourceContourInterval,
+      minElevation,
+      maxElevation,
+      startLevel,
+    };
   }
 
   const entriesByLevel = new Map();
+  const contourEntryCountsByElevation = new Map();
 
   for (const entry of contourEntries) {
     const levelKey = buildContourLevelKey(entry.elevation);
@@ -14061,6 +14397,10 @@ function buildRawAnchoredContourBandGroups(siteContext) {
     }
 
     entriesByLevel.get(levelKey).push(entry.multiPolygon);
+    contourEntryCountsByElevation.set(
+      levelKey,
+      Number(contourEntryCountsByElevation.get(levelKey) || 0) + 1
+    );
   }
 
   const cumulativeByLevel = new Map();
@@ -14107,6 +14447,29 @@ function buildRawAnchoredContourBandGroups(siteContext) {
     }
   }
 
+  const resolveGridAreaAboveLevel = (level) =>
+    gridAreaAboveByLevel.get(buildContourLevelKey(level)) || [];
+  const constrainedAnchorAreaByLevel = new Map();
+
+  for (const level of anchorLevels) {
+    const levelKey = buildContourLevelKey(level);
+    const rawAnchorArea = cumulativeByLevel.get(levelKey) || [];
+    const gridAreaAbove = resolveGridAreaAboveLevel(level);
+    let constrainedAnchorArea = rawAnchorArea;
+
+    if (rawAnchorArea.length && gridAreaAbove.length) {
+      const intersectedAnchorArea = intersectLocalMultiPolygon(rawAnchorArea, gridAreaAbove);
+
+      if (intersectedAnchorArea.length) {
+        constrainedAnchorArea = intersectedAnchorArea;
+      }
+    }
+
+    if (constrainedAnchorArea.length) {
+      constrainedAnchorAreaByLevel.set(levelKey, constrainedAnchorArea);
+    }
+  }
+
   const resolveRawAreaAboveLevel = (level) => {
     if (level <= minElevation + 0.001) {
       return clipRect.multiPolygon;
@@ -14116,23 +14479,75 @@ function buildRawAnchoredContourBandGroups(siteContext) {
       return [];
     }
 
-    return cumulativeByLevel.get(buildContourLevelKey(level)) || null;
+    return (
+      constrainedAnchorAreaByLevel.get(buildContourLevelKey(level)) ||
+      cumulativeByLevel.get(buildContourLevelKey(level)) ||
+      null
+    );
   };
-  const resolveConstrainedAreaAboveLevel = (level) => {
+  const resolveConstrainedAreaAboveLevelDetail = (level) => {
     const normalizedLevel = Number(Number(level || 0).toFixed(3));
 
     if (normalizedLevel <= minElevation + 0.001) {
-      return clipRect.multiPolygon;
+      return {
+        normalizedLevel,
+        reason: "min_elevation_clip",
+        exactAnchor: false,
+        lowerAnchorLevel: null,
+        upperAnchorLevel: anchorLevels.find(
+          (anchorLevel) => anchorLevel > normalizedLevel + 0.001
+        ) ?? null,
+        lowerAnchorArea: clipRect.multiPolygon,
+        upperAnchorArea:
+          anchorLevels.find((anchorLevel) => anchorLevel > normalizedLevel + 0.001) === null
+            ? []
+            : resolveRawAreaAboveLevel(
+                anchorLevels.find((anchorLevel) => anchorLevel > normalizedLevel + 0.001)
+              ) || [],
+        gridAreaAbove: resolveGridAreaAboveLevel(normalizedLevel),
+        resolvedAreaAbove: clipRect.multiPolygon,
+      };
     }
 
     if (normalizedLevel >= maxElevation - 0.001) {
-      return [];
+      return {
+        normalizedLevel,
+        reason: "max_elevation_empty",
+        exactAnchor: false,
+        lowerAnchorLevel:
+          [...anchorLevels]
+            .reverse()
+            .find((anchorLevel) => anchorLevel < normalizedLevel - 0.001) ?? null,
+        upperAnchorLevel: null,
+        lowerAnchorArea: [],
+        upperAnchorArea: [],
+        gridAreaAbove: [],
+        resolvedAreaAbove: [],
+      };
     }
 
     const levelKey = buildContourLevelKey(normalizedLevel);
 
     if (cumulativeByLevel.has(levelKey)) {
-      return cumulativeByLevel.get(levelKey) || [];
+      const rawAnchorArea = cumulativeByLevel.get(levelKey) || [];
+      const resolvedAreaAbove = resolveRawAreaAboveLevel(normalizedLevel) || [];
+      const rawAnchorAreaSqm = computeLocalMultiPolygonArea(rawAnchorArea);
+      const resolvedAreaSqm = computeLocalMultiPolygonArea(resolvedAreaAbove);
+
+      return {
+        normalizedLevel,
+        reason:
+          rawAnchorAreaSqm > resolvedAreaSqm + 0.001
+            ? "exact_raw_anchor_constrained_by_grid"
+            : "exact_raw_anchor",
+        exactAnchor: true,
+        lowerAnchorLevel: normalizedLevel,
+        upperAnchorLevel: normalizedLevel,
+        lowerAnchorArea: resolvedAreaAbove,
+        upperAnchorArea: resolvedAreaAbove,
+        gridAreaAbove: resolveGridAreaAboveLevel(normalizedLevel),
+        resolvedAreaAbove,
+      };
     }
 
     const lowerAnchorLevel =
@@ -14149,14 +14564,18 @@ function buildRawAnchoredContourBandGroups(siteContext) {
       upperAnchorLevel === null
         ? []
         : resolveRawAreaAboveLevel(upperAnchorLevel) || [];
-    const gridAreaAbove = gridAreaAboveByLevel.get(levelKey) || [];
+    const gridAreaAbove = resolveGridAreaAboveLevel(normalizedLevel);
     let constrainedAreaAbove =
       gridAreaAbove.length && lowerAnchorArea?.length
         ? intersectLocalMultiPolygon(gridAreaAbove, lowerAnchorArea)
         : lowerAnchorArea;
+    let reason = gridAreaAbove.length
+      ? "grid_intersection_with_lower_anchor"
+      : "lower_anchor_fallback";
 
     if (!constrainedAreaAbove.length && lowerAnchorArea?.length) {
       constrainedAreaAbove = lowerAnchorArea;
+      reason = "lower_anchor_only";
     }
 
     if (upperAnchorArea.length) {
@@ -14171,11 +14590,26 @@ function buildRawAnchoredContourBandGroups(siteContext) {
           lowerAnchorArea
         );
       }
+      reason =
+        gridAreaAbove.length && lowerAnchorArea?.length
+          ? "grid_plus_upper_anchor"
+          : "upper_anchor_union";
     }
 
-    return constrainedAreaAbove;
+    return {
+      normalizedLevel,
+      reason,
+      exactAnchor: false,
+      lowerAnchorLevel,
+      upperAnchorLevel,
+      lowerAnchorArea,
+      upperAnchorArea,
+      gridAreaAbove,
+      resolvedAreaAbove: constrainedAreaAbove,
+    };
   };
   const bandGroups = [];
+  const levelDiagnostics = [];
 
   for (
     let bottomElevation = Number(startLevel.toFixed(3));
@@ -14183,16 +14617,53 @@ function buildRawAnchoredContourBandGroups(siteContext) {
     bottomElevation = Number((bottomElevation + interval).toFixed(3))
   ) {
     const topElevation = Number(Math.min(bottomElevation + interval, maxElevation).toFixed(3));
-    const bottomArea = resolveConstrainedAreaAboveLevel(bottomElevation);
+    const bottomResolution = resolveConstrainedAreaAboveLevelDetail(bottomElevation);
+    const bottomArea = bottomResolution.resolvedAreaAbove;
 
     if (!bottomArea?.length) {
+      if (includeLevelDiagnostics) {
+        levelDiagnostics.push({
+          bottomElevation,
+          topElevation,
+          exactBottomAnchor: bottomResolution.exactAnchor === true,
+          resolutionReason: bottomResolution.reason,
+          lowerAnchorLevel: bottomResolution.lowerAnchorLevel,
+          upperAnchorLevel: bottomResolution.upperAnchorLevel,
+          lowerAnchorArea: summarizeRawContourBandAssemblyArea(
+            bottomResolution.lowerAnchorArea
+          ),
+          upperAnchorArea: summarizeRawContourBandAssemblyArea(
+            bottomResolution.upperAnchorArea
+          ),
+          gridAreaAbove: summarizeRawContourBandAssemblyArea(
+            bottomResolution.gridAreaAbove
+          ),
+          resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
+          resolvedTopArea: summarizeRawContourBandAssemblyArea([]),
+          bandArea: summarizeRawContourBandAssemblyArea([]),
+          regionCount: 0,
+          accepted: false,
+          skippedReason: "empty_bottom_area",
+        });
+      }
       continue;
     }
 
-    const topArea =
+    const topResolution =
       topElevation >= maxElevation - 0.001
-        ? []
-        : resolveConstrainedAreaAboveLevel(topElevation);
+        ? {
+            normalizedLevel: topElevation,
+            reason: "max_elevation_empty",
+            exactAnchor: false,
+            lowerAnchorLevel: bottomResolution.lowerAnchorLevel,
+            upperAnchorLevel: null,
+            lowerAnchorArea: [],
+            upperAnchorArea: [],
+            gridAreaAbove: [],
+            resolvedAreaAbove: [],
+          }
+        : resolveConstrainedAreaAboveLevelDetail(topElevation);
+    const topArea = topResolution.resolvedAreaAbove;
 
     const bandMultiPolygon =
       topArea?.length
@@ -14200,16 +14671,66 @@ function buildRawAnchoredContourBandGroups(siteContext) {
         : bottomArea;
 
     if (!bandMultiPolygon.length) {
+      if (includeLevelDiagnostics) {
+        levelDiagnostics.push({
+          bottomElevation,
+          topElevation,
+          exactBottomAnchor: bottomResolution.exactAnchor === true,
+          resolutionReason: bottomResolution.reason,
+          lowerAnchorLevel: bottomResolution.lowerAnchorLevel,
+          upperAnchorLevel: bottomResolution.upperAnchorLevel,
+          lowerAnchorArea: summarizeRawContourBandAssemblyArea(
+            bottomResolution.lowerAnchorArea
+          ),
+          upperAnchorArea: summarizeRawContourBandAssemblyArea(
+            bottomResolution.upperAnchorArea
+          ),
+          gridAreaAbove: summarizeRawContourBandAssemblyArea(
+            bottomResolution.gridAreaAbove
+          ),
+          resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
+          resolvedTopArea: summarizeRawContourBandAssemblyArea(topArea),
+          bandArea: summarizeRawContourBandAssemblyArea(bandMultiPolygon),
+          regionCount: 0,
+          accepted: false,
+          skippedReason: "empty_band_difference",
+        });
+      }
       continue;
     }
 
     const regions = buildContourBandRegionsFromMultiPolygon(bandMultiPolygon);
 
     if (!regions.length) {
+      if (includeLevelDiagnostics) {
+        levelDiagnostics.push({
+          bottomElevation,
+          topElevation,
+          exactBottomAnchor: bottomResolution.exactAnchor === true,
+          resolutionReason: bottomResolution.reason,
+          lowerAnchorLevel: bottomResolution.lowerAnchorLevel,
+          upperAnchorLevel: bottomResolution.upperAnchorLevel,
+          lowerAnchorArea: summarizeRawContourBandAssemblyArea(
+            bottomResolution.lowerAnchorArea
+          ),
+          upperAnchorArea: summarizeRawContourBandAssemblyArea(
+            bottomResolution.upperAnchorArea
+          ),
+          gridAreaAbove: summarizeRawContourBandAssemblyArea(
+            bottomResolution.gridAreaAbove
+          ),
+          resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
+          resolvedTopArea: summarizeRawContourBandAssemblyArea(topArea),
+          bandArea: summarizeRawContourBandAssemblyArea(bandMultiPolygon),
+          regionCount: 0,
+          accepted: false,
+          skippedReason: "empty_band_regions",
+        });
+      }
       continue;
     }
 
-    bandGroups.push({
+    const bandGroup = {
       bottomElevation,
       topElevation,
       boundaryLoops: regions.flatMap((region) => [
@@ -14219,7 +14740,33 @@ function buildRawAnchoredContourBandGroups(siteContext) {
       regions,
       multiPolygon: bandMultiPolygon,
       bounds: computeRegionBounds(regions),
-    });
+    };
+
+    bandGroups.push(bandGroup);
+
+    if (includeLevelDiagnostics) {
+      levelDiagnostics.push({
+        bottomElevation,
+        topElevation,
+        exactBottomAnchor: bottomResolution.exactAnchor === true,
+        resolutionReason: bottomResolution.reason,
+        lowerAnchorLevel: bottomResolution.lowerAnchorLevel,
+        upperAnchorLevel: bottomResolution.upperAnchorLevel,
+        lowerAnchorArea: summarizeRawContourBandAssemblyArea(
+          bottomResolution.lowerAnchorArea
+        ),
+        upperAnchorArea: summarizeRawContourBandAssemblyArea(
+          bottomResolution.upperAnchorArea
+        ),
+        gridAreaAbove: summarizeRawContourBandAssemblyArea(bottomResolution.gridAreaAbove),
+        resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
+        resolvedTopArea: summarizeRawContourBandAssemblyArea(topArea),
+        bandArea: summarizeRawContourBandAssemblyArea(bandMultiPolygon),
+        regionCount: regions.length,
+        accepted: true,
+        skippedReason: null,
+      });
+    }
   }
 
   if (bandGroups.length) {
@@ -14240,7 +14787,71 @@ function buildRawAnchoredContourBandGroups(siteContext) {
     };
   }
 
-  return bandGroups;
+  return {
+    reason: bandGroups.length ? null : "no_band_groups",
+    interval,
+    sourceContourInterval,
+    minElevation,
+    maxElevation,
+    startLevel,
+    contourEntries,
+    anchorLevels,
+    contourEntryCountsByElevation,
+    rawAreaAboveByLevel: cumulativeByLevel,
+    constrainedAnchorAreaByLevel,
+    gridAreaAboveByLevel,
+    levelDiagnostics,
+    bandGroups,
+  };
+}
+
+function buildRawAnchoredContourBandDiagnostics(siteContext) {
+  const assembly = buildRawAnchoredContourBandAssembly(siteContext, {
+    includeLevelDiagnostics: true,
+  });
+  const sortNumericAscending = (values) =>
+    [...values]
+      .map(Number)
+      .filter(Number.isFinite)
+      .sort((left, right) => left - right);
+  const summarizeAreaLevels = (areaMap) =>
+    sortNumericAscending(areaMap.keys()).map((level) => ({
+      level: Number(level),
+      ...summarizeRawContourBandAssemblyArea(areaMap.get(buildContourLevelKey(level)) || []),
+    }));
+
+  return {
+    reason: assembly.reason,
+    interval: Number(assembly.interval || 0),
+    sourceContourInterval: Number(assembly.sourceContourInterval || 0),
+    minElevation: Number.isFinite(assembly.minElevation) ? assembly.minElevation : null,
+    maxElevation: Number.isFinite(assembly.maxElevation) ? assembly.maxElevation : null,
+    startLevel: Number.isFinite(assembly.startLevel) ? assembly.startLevel : null,
+    contourEntryCount: Number(assembly.contourEntries?.length || 0),
+    anchorLevels: sortNumericAscending(assembly.anchorLevels || []),
+    contourEntryCountsByElevation: Object.fromEntries(
+      sortNumericAscending(assembly.contourEntryCountsByElevation.keys()).map((level) => [
+        String(level),
+        Number(assembly.contourEntryCountsByElevation.get(buildContourLevelKey(level)) || 0),
+      ])
+    ),
+    rawAreaAboveByLevel: summarizeAreaLevels(assembly.rawAreaAboveByLevel || new Map()),
+    constrainedAnchorAreaByLevel: summarizeAreaLevels(
+      assembly.constrainedAnchorAreaByLevel || new Map()
+    ),
+    gridAreaAboveByLevel: summarizeAreaLevels(assembly.gridAreaAboveByLevel || new Map()),
+    bandBottomElevations: sortNumericAscending(
+      (assembly.bandGroups || []).map((group) => group?.bottomElevation)
+    ),
+    bandTopElevations: sortNumericAscending(
+      (assembly.bandGroups || []).map((group) => group?.topElevation)
+    ),
+    levelDiagnostics: assembly.levelDiagnostics || [],
+  };
+}
+
+function buildRawAnchoredContourBandGroups(siteContext) {
+  return buildRawAnchoredContourBandAssembly(siteContext).bandGroups;
 }
 
 function buildContourBandUnionLoopsInternal(slices, interval = 1, depth = 0) {
@@ -21425,6 +22036,19 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
     exportSiteContext.stats.contourFeatureCountAfterNormalize = Number(
       exportSiteContext?.contourLines?.features?.length || 0
     );
+    exportSiteContext.canonicalContourInput = buildCanonicalContourInput(
+      exportSiteContext,
+      exportSiteContext.contourLines
+    );
+    exportSiteContext.stats.canonicalContourEntryCount = Number(
+      exportSiteContext?.canonicalContourInput?.entryCount || 0
+    );
+    exportSiteContext.stats.canonicalNativeContourLevelCount = Number(
+      exportSiteContext?.canonicalContourInput?.nativeLevels?.length || 0
+    );
+    exportSiteContext.stats.canonicalGeneratedContourLevelCount = Number(
+      exportSiteContext?.canonicalContourInput?.generatedLevels?.length || 0
+    );
   }
 
   if (
@@ -23025,7 +23649,10 @@ export {
   buildingBaseElevationForRing,
   buildProviderTimeoutConfig,
   build3dmFromSiteContext,
+  buildCanonicalContourInput,
   buildClipBoundary,
+  buildOpenContourClosureDiagnostics,
+  buildRawAnchoredContourBandDiagnostics,
   buildRoadContourSurfaceGroups,
   buildParcelDataCacheKey,
   buildSearchQueryHints,

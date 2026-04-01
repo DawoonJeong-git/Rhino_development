@@ -4,6 +4,7 @@ import {
   build3dmFromSiteContext,
   buildSketchUpPayloadFromSiteContext,
   buildObjFromSiteContext,
+  resolveContourTerrainRenderPlan,
 } from "../server.mjs";
 
 const BASE_URL = process.env.SITE_CONTEXT_BASE_URL || "http://127.0.0.1:3000";
@@ -66,12 +67,23 @@ function summarizeExportContext(siteContext, format) {
     },
     format
   );
+  const terrainPlan = resolveContourTerrainRenderPlan(exportSiteContext);
 
   return {
     exportSiteContext,
     requested: exportSiteContext.stats?.requestedContourInterval,
     source: exportSiteContext.stats?.sourceContourInterval,
     effective: exportSiteContext.stats?.effectiveContourBandInterval,
+    terrainPlan,
+    exportContourFeatureCount: Number(
+      exportSiteContext?.exportContourLines?.features?.length || 0
+    ),
+    canonicalNativeContourLevelCount: Number(
+      exportSiteContext?.stats?.canonicalNativeContourLevelCount || 0
+    ),
+    canonicalGeneratedContourLevelCount: Number(
+      exportSiteContext?.stats?.canonicalGeneratedContourLevelCount || 0
+    ),
   };
 }
 
@@ -101,18 +113,51 @@ async function verifyCase(testCase) {
         requested: threeDm.requested,
         source: threeDm.source,
         effective: threeDm.effective,
+        exportContourFeatureCount: threeDm.exportContourFeatureCount,
+        canonicalNativeContourLevelCount: threeDm.canonicalNativeContourLevelCount,
+        canonicalGeneratedContourLevelCount: threeDm.canonicalGeneratedContourLevelCount,
+        rawAnchoredContourBandCount: Number(
+          threeDm.terrainPlan?.bandGroups?.rawAnchoredContourBandCount ||
+            threeDm.terrainPlan?.bandGroups?.length ||
+            0
+        ),
+        rawAnchoredGridFallbackBandCount: Number(
+          threeDm.terrainPlan?.bandGroups?.rawAnchoredGridFallbackBandCount || 0
+        ),
         bytes: threeDmBytes.length,
       },
       skp: {
         requested: skp.requested,
         source: skp.source,
         effective: skp.effective,
+        exportContourFeatureCount: skp.exportContourFeatureCount,
+        canonicalNativeContourLevelCount: skp.canonicalNativeContourLevelCount,
+        canonicalGeneratedContourLevelCount: skp.canonicalGeneratedContourLevelCount,
+        rawAnchoredContourBandCount: Number(
+          skp.terrainPlan?.bandGroups?.rawAnchoredContourBandCount ||
+            skp.terrainPlan?.bandGroups?.length ||
+            0
+        ),
+        rawAnchoredGridFallbackBandCount: Number(
+          skp.terrainPlan?.bandGroups?.rawAnchoredGridFallbackBandCount || 0
+        ),
         groups: skpPayload.groups?.length || 0,
       },
       obj: {
         requested: obj.requested,
         source: obj.source,
         effective: obj.effective,
+        exportContourFeatureCount: obj.exportContourFeatureCount,
+        canonicalNativeContourLevelCount: obj.canonicalNativeContourLevelCount,
+        canonicalGeneratedContourLevelCount: obj.canonicalGeneratedContourLevelCount,
+        rawAnchoredContourBandCount: Number(
+          obj.terrainPlan?.bandGroups?.rawAnchoredContourBandCount ||
+            obj.terrainPlan?.bandGroups?.length ||
+            0
+        ),
+        rawAnchoredGridFallbackBandCount: Number(
+          obj.terrainPlan?.bandGroups?.rawAnchoredGridFallbackBandCount || 0
+        ),
         length: objText.length,
       },
     },

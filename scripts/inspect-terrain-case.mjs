@@ -3,8 +3,11 @@ import path from "node:path";
 import process from "node:process";
 import {
   build3dmFromSiteContext,
+  buildCanonicalContourInput,
   buildContourBandGroups,
   buildCumulativeContourBandGroups,
+  buildOpenContourClosureDiagnostics,
+  buildRawAnchoredContourBandDiagnostics,
   buildRoadContourSurfaceGroups,
   buildRoadSurfaceFeatureCollection,
   buildSketchUpPayloadFromSiteContext,
@@ -295,6 +298,16 @@ function summarizeTerrainPipeline(exportSiteContext) {
   const sourceContourCollection = exportSiteContext?.contourLines || null;
   const exportContourCollection =
     exportSiteContext?.exportContourLines || exportSiteContext?.contourLines || null;
+  const canonicalContourInput =
+    exportSiteContext?.canonicalContourInput ||
+    buildCanonicalContourInput(exportSiteContext, sourceContourCollection);
+  const openContourClosureDiagnostics = buildOpenContourClosureDiagnostics(
+    exportSiteContext,
+    sourceContourCollection
+  );
+  const rawAnchorBandDiagnostics = buildRawAnchoredContourBandDiagnostics(
+    exportSiteContext
+  );
   const rawBandGroups = buildContourBandGroups(exportSiteContext);
   const cumulativeBandGroups = buildCumulativeContourBandGroups(exportSiteContext);
   const terrainPlan = resolveContourTerrainRenderPlan(exportSiteContext);
@@ -320,6 +333,56 @@ function summarizeTerrainPipeline(exportSiteContext) {
   );
 
   return {
+    canonicalContourInput: {
+      nativeLevels: canonicalContourInput?.nativeLevels || [],
+      generatedLevels: canonicalContourInput?.generatedLevels || [],
+      entryCount: Number(canonicalContourInput?.entryCount || 0),
+      nativeEntryCount: Number(canonicalContourInput?.nativeEntryCount || 0),
+      generatedEntryCount: Number(canonicalContourInput?.generatedEntryCount || 0),
+      openEntryCount: Number(canonicalContourInput?.openEntryCount || 0),
+      closedEntryCount: Number(canonicalContourInput?.closedEntryCount || 0),
+    },
+    openContourClosureDiagnostics: {
+      nativeOpenContourCount: Number(
+        openContourClosureDiagnostics?.nativeOpenContourCount || 0
+      ),
+      acceptedCount: Number(openContourClosureDiagnostics?.acceptedCount || 0),
+      rejectedCount: Number(openContourClosureDiagnostics?.rejectedCount || 0),
+      acceptedElevations: openContourClosureDiagnostics?.acceptedElevations || [],
+      rejectedElevations: openContourClosureDiagnostics?.rejectedElevations || [],
+      rejectionReasons: groupCounts(
+        openContourClosureDiagnostics?.entries || [],
+        (entry) =>
+          entry?.closureRejectedReason ||
+          (entry?.accepted ? "accepted" : entry?.selectionReason || "unknown")
+      ),
+      entries: openContourClosureDiagnostics?.entries || [],
+    },
+    rawAnchorBandDiagnostics: {
+      reason: rawAnchorBandDiagnostics?.reason || null,
+      interval: Number(rawAnchorBandDiagnostics?.interval || 0),
+      sourceContourInterval: Number(rawAnchorBandDiagnostics?.sourceContourInterval || 0),
+      minElevation: Number.isFinite(rawAnchorBandDiagnostics?.minElevation)
+        ? rawAnchorBandDiagnostics.minElevation
+        : null,
+      maxElevation: Number.isFinite(rawAnchorBandDiagnostics?.maxElevation)
+        ? rawAnchorBandDiagnostics.maxElevation
+        : null,
+      startLevel: Number.isFinite(rawAnchorBandDiagnostics?.startLevel)
+        ? rawAnchorBandDiagnostics.startLevel
+        : null,
+      contourEntryCount: Number(rawAnchorBandDiagnostics?.contourEntryCount || 0),
+      anchorLevels: rawAnchorBandDiagnostics?.anchorLevels || [],
+      contourEntryCountsByElevation:
+        rawAnchorBandDiagnostics?.contourEntryCountsByElevation || {},
+      rawAreaAboveByLevel: rawAnchorBandDiagnostics?.rawAreaAboveByLevel || [],
+      constrainedAnchorAreaByLevel:
+        rawAnchorBandDiagnostics?.constrainedAnchorAreaByLevel || [],
+      gridAreaAboveByLevel: rawAnchorBandDiagnostics?.gridAreaAboveByLevel || [],
+      bandBottomElevations: rawAnchorBandDiagnostics?.bandBottomElevations || [],
+      bandTopElevations: rawAnchorBandDiagnostics?.bandTopElevations || [],
+      levelDiagnostics: rawAnchorBandDiagnostics?.levelDiagnostics || [],
+    },
     sourceContours: summarizeContourStages(sourceContourCollection),
     exportContours: summarizeContourStages(exportContourCollection),
     rawBandGroups: summarizeBandGroupsDetailed(rawBandGroups),
