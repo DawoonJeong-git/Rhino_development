@@ -15866,15 +15866,12 @@ function buildRawAnchoredContourBandAssembly(
     )
   );
   const selectionReferenceInterval = interval > 1 ? Math.min(1, interval) : interval;
-  const gridAreaResult = buildGridAreaAboveByLevel(siteContext);
   const selectionGridAreaResult =
     Math.abs(selectionReferenceInterval - interval) <= 1e-9
-      ? gridAreaResult
+      ? buildGridAreaAboveByLevel(siteContext)
       : buildGridAreaAboveByLevel(siteContext, {
           intervalOverride: selectionReferenceInterval,
         });
-  const { gridBandGroups, gridAreaAboveByLevel } = gridAreaResult;
-  const resolveGridAreaAboveLevel = gridAreaResult.resolveAreaAboveLevel;
   const contourEntries = buildRawAnchoredContourEntries(
     siteContext,
     clipRect,
@@ -15972,6 +15969,13 @@ function buildRawAnchoredContourBandAssembly(
       return exactNativeAnchorAssembly;
     }
   }
+
+  const gridAreaResult =
+    Math.abs(selectionReferenceInterval - interval) <= 1e-9
+      ? selectionGridAreaResult
+      : buildGridAreaAboveByLevel(siteContext);
+  const { gridBandGroups, gridAreaAboveByLevel } = gridAreaResult;
+  const resolveGridAreaAboveLevel = gridAreaResult.resolveAreaAboveLevel;
 
   const constrainedAnchorAreaByLevel = new Map();
 
@@ -16757,6 +16761,13 @@ function buildContourBandGroups(siteContext) {
   const rawAnchoredBandGroups = buildRawAnchoredContourBandGroups(siteContext);
 
   if (rawAnchoredBandGroups.length) {
+    if (
+      rawAnchoredBandGroups.rawAnchoredExactNativeIntervalUsed === true &&
+      Number(rawAnchoredBandGroups.rawAnchoredGridFallbackBandCount || 0) === 0
+    ) {
+      return rawAnchoredBandGroups;
+    }
+
     const gridBandGroups = buildGridContourBandGroups(siteContext);
     const rawBottomKeys = new Set(
       rawAnchoredBandGroups.map((group) => buildContourLevelKey(group?.bottomElevation))
