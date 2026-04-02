@@ -13793,11 +13793,17 @@ function buildGeneratedRegionCleanupEntries(regions) {
       };
       const multiPolygon = buildPolygonClippingMultiPolygonFromRegions([normalizedRegion]);
       const areaSqm = computeLocalMultiPolygonArea(multiPolygon);
+      const outerAreaSqm = Math.abs(
+        computeLocalPolygonSignedArea(normalizedRegion.outerPoints || [])
+      );
+      const holeAreaSqm = Math.max(0, outerAreaSqm - areaSqm);
 
       return {
         region: normalizedRegion,
         multiPolygon,
         areaSqm,
+        outerAreaSqm,
+        holeAreaSqm,
         bounds: computeRegionBounds([normalizedRegion]),
         interiorPoint: estimateLocalRegionInteriorPoint(normalizedRegion),
       };
@@ -13837,22 +13843,6 @@ function hasMeaningfulGeneratedRegionPersistence(candidateEntry, neighborEntries
       overlapAreaSqm >= overlapThresholdSqm &&
       coverageRatio >= 0.24 &&
       precisionRatio >= 0.05
-    ) {
-      return true;
-    }
-
-    if (
-      neighborEntry.areaSqm <= candidateEntry.areaSqm * 6 &&
-      candidateEntry.interiorPoint &&
-      isPointInsideOrOnLocalRegion(candidateEntry.interiorPoint, neighborEntry.region)
-    ) {
-      return true;
-    }
-
-    if (
-      candidateEntry.areaSqm <= neighborEntry.areaSqm * 6 &&
-      neighborEntry.interiorPoint &&
-      isPointInsideOrOnLocalRegion(neighborEntry.interiorPoint, candidateEntry.region)
     ) {
       return true;
     }
@@ -13898,7 +13888,7 @@ function pruneTransientGeneratedRegions(
 
   const previousEntries = buildGeneratedRegionCleanupEntries(previousRegions);
   const nextEntries = buildGeneratedRegionCleanupEntries(nextRegions);
-  const dominantAreaSqm = Math.max(currentEntries[0]?.areaSqm || 0, 1);
+  const dominantAreaSqm = Math.max(currentEntries[0]?.outerAreaSqm || 0, 1);
   const absoluteTransientAreaSqm = Math.max(140, cleanupAreaThresholdSqm * 60);
   const tinyTransientAreaSqm = Math.max(48, cleanupAreaThresholdSqm * 18);
   const keptEntries = [];
@@ -13911,9 +13901,9 @@ function pruneTransientGeneratedRegions(
       continue;
     }
 
-    const areaRatio = entry.areaSqm / dominantAreaSqm;
+    const areaRatio = entry.outerAreaSqm / dominantAreaSqm;
     const transientSizedRegion =
-      entry.areaSqm <= absoluteTransientAreaSqm || areaRatio <= 0.12;
+      entry.outerAreaSqm <= absoluteTransientAreaSqm || areaRatio <= 0.12;
 
     if (!transientSizedRegion || areaRatio >= 0.28) {
       keptEntries.push(entry);
@@ -13952,6 +13942,14 @@ function pruneTransientGeneratedGroupRegions(siteContext, groups) {
     return groups || [];
   }
 
+  const interval = Number(resolveEffectiveContourBandInterval(siteContext) || 0);
+  const sourceContourInterval = Number(resolveSourceContourInterval(siteContext) || 0);
+  const finerThanSource =
+    interval > 0 &&
+    sourceContourInterval > 0 &&
+    interval < sourceContourInterval - 1e-9;
+  const cleanupAreaThresholdSqm =
+    resolveRawAnchoredContourCleanupAreaThreshold(siteContext);
   const prunedGroups = groups.map((group) => ({
     ...group,
     regions: [...(group?.regions || [])],
@@ -13969,24 +13967,88 @@ function pruneTransientGeneratedGroupRegions(siteContext, groups) {
         allowNativeLevelPruning: true,
       }
     );
+    let normalizedRegions = prunedRegions;
 
-    if (prunedRegions.length === (group?.regions || []).length) {
+    if (finerThanSource && normalizedRegions.length > 1) {
+      const currentEntries = buildGeneratedRegionCleanupEntries(normalizedRegions);
+      const previousEntries = buildGeneratedRegionCleanupEntries(
+        groups[index - 1]?.regions || []
+      );
+      const nextEntries = buildGeneratedRegionCleanupEntries(
+        groups[index + 1]?.regions || []
+      );
+      const dominantAreaSqm = Math.max(currentEntries[0]?.outerAreaSqm || 0, 1);
+      const unsupportedTransientAreaSqm = Math.max(
+        260,
+        cleanupAreaThresholdSqm * 110
+      );
+      const supportedEntries = [];
+
+      for (let entryIndex = 0; entryIndex < currentEntries.length; entryIndex += 1) {
+        const entry = currentEntries[entryIndex];
+
+        if (entryIndex === 0) {
+          supportedEntries.push(entry);
+          continue;
+        }
+
+        const areaRatio = entry.outerAreaSqm / dominantAreaSqm;
+        const maximumPreviousOverlap = previousEntries.reduce((maximum, neighborEntry) => {
+          if (!doLocalBoundsOverlap(entry.bounds, neighborEntry?.bounds, 0.05)) {
+            return maximum;
+          }
+
+          const overlapAreaSqm = computeLocalMultiPolygonArea(
+            intersectLocalMultiPolygon(entry.multiPolygon, neighborEntry.multiPolygon)
+          );
+          return Math.max(maximum, overlapAreaSqm);
+        }, 0);
+        const maximumNextOverlap = nextEntries.reduce((maximum, neighborEntry) => {
+          if (!doLocalBoundsOverlap(entry.bounds, neighborEntry?.bounds, 0.05)) {
+            return maximum;
+          }
+
+          const overlapAreaSqm = computeLocalMultiPolygonArea(
+            intersectLocalMultiPolygon(entry.multiPolygon, neighborEntry.multiPolygon)
+          );
+          return Math.max(maximum, overlapAreaSqm);
+        }, 0);
+        const unsupportedAcrossLevels =
+          maximumPreviousOverlap <= 0.001 && maximumNextOverlap <= 0.001;
+
+        if (
+          unsupportedAcrossLevels &&
+          (entry.outerAreaSqm <= unsupportedTransientAreaSqm || areaRatio <= 0.12)
+        ) {
+          continue;
+        }
+
+        supportedEntries.push(entry);
+      }
+
+      if (supportedEntries.length) {
+        normalizedRegions = supportedEntries.map((entry) => entry.region);
+      }
+    }
+
+    const normalizedMultiPolygon =
+      buildPolygonClippingMultiPolygonFromRegions(normalizedRegions);
+
+    if (!normalizedMultiPolygon.length) {
       continue;
     }
 
-    const multiPolygon = buildPolygonClippingMultiPolygonFromRegions(prunedRegions);
-
-    if (!multiPolygon.length) {
+    if (normalizedRegions.length === (group?.regions || []).length) {
       continue;
     }
 
-    group.regions = prunedRegions;
-    group.boundaryLoops = prunedRegions.flatMap((region) => [
+    group.regions = normalizedRegions;
+    group.boundaryLoops = normalizedRegions.flatMap((region) => [
       region.outerPoints,
       ...(region.holePoints || []),
     ]);
-    group.multiPolygon = multiPolygon;
-    group.bounds = computeRegionBounds(prunedRegions);
+    group.multiPolygon = normalizedMultiPolygon;
+    group.bounds = computeRegionBounds(normalizedRegions);
   }
 
   for (const key of [
