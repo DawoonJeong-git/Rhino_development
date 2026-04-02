@@ -13620,10 +13620,29 @@ function normalizeContourBoundaryLoop(
   );
   const normalizeSimpleCandidate = (
     candidate,
-    snapTolerance = Math.max(
-      clipRect?.boundarySnapTolerance || 0,
-      simplifyTolerance * (smoothGenerated ? 16 : 12)
-    )
+    snapTolerance = smoothGenerated
+      ? Math.max(
+          0.18,
+          Math.min(
+            0.8,
+            Math.max(
+              Number(clipRect?.boundarySnapTolerance || 0) * 0.55,
+              simplifyTolerance * 16,
+              minSegmentLength * 3.2
+            )
+          )
+        )
+      : Math.max(
+          0.12,
+          Math.min(
+            0.45,
+            Math.max(
+              Number(clipRect?.boundarySnapTolerance || 0) * 0.22,
+              simplifyTolerance * 8,
+              minSegmentLength * 1.6
+            )
+          )
+        )
   ) => {
     let normalized = dedupeLocalPolygonPoints(candidate || [], 0.001);
 
@@ -14962,6 +14981,18 @@ function snapLocalPointToRectBoundary(point, clipRect, toleranceMeters = 0.8) {
   const maxX = Number(clipRect.maxX);
   const maxY = Number(clipRect.maxY);
   const tolerance = Math.max(0.05, Number(toleranceMeters) || 0);
+  const nearMinX = Math.abs(xMeters - minX) <= tolerance;
+  const nearMaxX = Math.abs(xMeters - maxX) <= tolerance;
+  const nearMinY = Math.abs(yMeters - minY) <= tolerance;
+  const nearMaxY = Math.abs(yMeters - maxY) <= tolerance;
+
+  if ((nearMinX || nearMaxX) && (nearMinY || nearMaxY)) {
+    return [
+      Number((nearMinX ? minX : maxX).toFixed(6)),
+      Number((nearMinY ? minY : maxY).toFixed(6)),
+    ];
+  }
+
   const candidates = [
     {
       distance: Math.abs(yMeters - minY),
@@ -23815,8 +23846,11 @@ function addRhinoContourBandRegionExtrusion(
     return false;
   }
 
+  const solidGeometry =
+    typeof extrusion.toBrep === "function" ? extrusion.toBrep(true) || extrusion : extrusion;
+
   doc.objects().add(
-    extrusion,
+    solidGeometry,
     createRhinoObjectAttributes(rhino, layerIndex, objectName, null, groupIndices)
   );
   return true;
