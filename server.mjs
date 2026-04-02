@@ -13359,6 +13359,63 @@ function computeLocalLoopAxisAlignedSegmentRatio(points) {
   return segmentCount > 0 ? axisAlignedCount / segmentCount : 0;
 }
 
+function computeLocalLoopSharpCornerStats(points) {
+  const polygon = dedupeLocalPolygonPoints(points, 0.001);
+
+  if (polygon.length < 3) {
+    return {
+      minAngle: 180,
+      sharpCornerCount: 0,
+      sharpCornerRatio: 0,
+    };
+  }
+
+  let vertexCount = 0;
+  let sharpCornerCount = 0;
+  let minAngle = 180;
+
+  for (let index = 0; index < polygon.length; index += 1) {
+    const previous = polygon[(index - 1 + polygon.length) % polygon.length];
+    const current = polygon[index];
+    const next = polygon[(index + 1) % polygon.length];
+    const incomingX = Number(previous?.[0] || 0) - Number(current?.[0] || 0);
+    const incomingY = Number(previous?.[1] || 0) - Number(current?.[1] || 0);
+    const outgoingX = Number(next?.[0] || 0) - Number(current?.[0] || 0);
+    const outgoingY = Number(next?.[1] || 0) - Number(current?.[1] || 0);
+    const incomingLength = Math.hypot(incomingX, incomingY);
+    const outgoingLength = Math.hypot(outgoingX, outgoingY);
+
+    if (incomingLength <= 1e-6 || outgoingLength <= 1e-6) {
+      continue;
+    }
+
+    vertexCount += 1;
+    const cosine = Math.max(
+      -1,
+      Math.min(
+        1,
+        (incomingX * outgoingX + incomingY * outgoingY) /
+          (incomingLength * outgoingLength)
+      )
+    );
+    const angle = (Math.acos(cosine) * 180) / Math.PI;
+
+    if (angle < minAngle) {
+      minAngle = angle;
+    }
+
+    if (angle <= 120) {
+      sharpCornerCount += 1;
+    }
+  }
+
+  return {
+    minAngle,
+    sharpCornerCount,
+    sharpCornerRatio: vertexCount > 0 ? sharpCornerCount / vertexCount : 0,
+  };
+}
+
 function resolveClipRectBoundarySide(point, clipRect, toleranceMeters = 0.05) {
   if (
     !Array.isArray(point) ||
@@ -13518,6 +13575,9 @@ function resolveGeneratedContourLoopNormalizationOptions(siteContext) {
     minSegmentLength: Math.max(0.08, baseTolerance * 2.2),
     minPointCount: interval <= 0.1 ? 24 : interval <= 1 ? 18 : 14,
     ratioThreshold: 0.16,
+    sharpAngleThreshold: interval <= 0.1 ? 74 : 78,
+    sharpCornerRatioThreshold: interval <= 0.1 ? 0.12 : 0.14,
+    sharpCornerAbsoluteThreshold: interval <= 0.1 ? 5 : 4,
   };
 }
 
@@ -13529,6 +13589,9 @@ function normalizeContourBoundaryLoop(
     minSegmentLength = 0.08,
     minPointCount = 20,
     ratioThreshold = 0.21,
+    sharpAngleThreshold = 78,
+    sharpCornerRatioThreshold = 0.14,
+    sharpCornerAbsoluteThreshold = 4,
     clipRect = null,
   } = {}
 ) {
@@ -13616,15 +13679,27 @@ function normalizeContourBoundaryLoop(
   };
 
   const axisAlignedRatio = computeLocalLoopAxisAlignedSegmentRatio(polygon);
+  const sharpCornerStats = computeLocalLoopSharpCornerStats(polygon);
+  const hasSharpGeneratedCorners =
+    sharpCornerStats.minAngle <= sharpAngleThreshold ||
+    sharpCornerStats.sharpCornerRatio >= sharpCornerRatioThreshold ||
+    sharpCornerStats.sharpCornerCount >= sharpCornerAbsoluteThreshold;
 
   if (
     smoothGenerated &&
     polygon.length >= minPointCount &&
-    axisAlignedRatio >= ratioThreshold
+    (axisAlignedRatio >= ratioThreshold || hasSharpGeneratedCorners)
   ) {
+    const severeSharpCorners =
+      sharpCornerStats.minAngle <= sharpAngleThreshold * 0.72 ||
+      sharpCornerStats.sharpCornerRatio >= sharpCornerRatioThreshold * 1.55 ||
+      sharpCornerStats.sharpCornerCount >=
+        Math.max(sharpCornerAbsoluteThreshold + 8, minPointCount * 0.28);
     polygon = smoothLocalPolygonChaikin(polygon, {
       iterations:
-        axisAlignedRatio >= ratioThreshold + 0.08 && polygon.length >= minPointCount * 1.5
+        severeSharpCorners ||
+        (axisAlignedRatio >= ratioThreshold + 0.08 &&
+          polygon.length >= minPointCount * 1.5)
           ? 2
           : 1,
       ratio: 0.18,
@@ -13651,11 +13726,19 @@ function normalizeContourBoundaryLoop(
 
   if (smoothGenerated && polygon.length >= 3) {
     const postSnapAxisAlignedRatio = computeLocalLoopAxisAlignedSegmentRatio(polygon);
+    const postSnapSharpCornerStats = computeLocalLoopSharpCornerStats(polygon);
+    const persistsSharpCorners =
+      postSnapSharpCornerStats.minAngle <= sharpAngleThreshold ||
+      postSnapSharpCornerStats.sharpCornerRatio >= sharpCornerRatioThreshold ||
+      postSnapSharpCornerStats.sharpCornerCount >= sharpCornerAbsoluteThreshold;
 
-    if (postSnapAxisAlignedRatio >= ratioThreshold * 0.9) {
+    if (postSnapAxisAlignedRatio >= ratioThreshold * 0.9 || persistsSharpCorners) {
       polygon = simplifyLocalPolygonDouglasPeucker(
         polygon,
-        Math.max(simplifyTolerance * 1.8, minSegmentLength * 1.25)
+        Math.max(
+          simplifyTolerance * (persistsSharpCorners ? 2.6 : 1.8),
+          minSegmentLength * (persistsSharpCorners ? 1.55 : 1.25)
+        )
       );
 
       if (clipRect) {
@@ -14187,6 +14270,15 @@ function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
   const ratioThreshold = shouldSmoothGenerated
     ? generatedNormalization.ratioThreshold
     : 0.21;
+  const sharpAngleThreshold = shouldSmoothGenerated
+    ? generatedNormalization.sharpAngleThreshold
+    : 78;
+  const sharpCornerRatioThreshold = shouldSmoothGenerated
+    ? generatedNormalization.sharpCornerRatioThreshold
+    : 0.14;
+  const sharpCornerAbsoluteThreshold = shouldSmoothGenerated
+    ? generatedNormalization.sharpCornerAbsoluteThreshold
+    : 4;
 
   const normalizedRegions = (regions || [])
     .map((region) => {
@@ -14197,6 +14289,9 @@ function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
           minSegmentLength,
           minPointCount,
           ratioThreshold,
+          sharpAngleThreshold,
+          sharpCornerRatioThreshold,
+          sharpCornerAbsoluteThreshold,
           clipRect,
         })
       );
@@ -14210,6 +14305,9 @@ function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
               minSegmentLength,
               minPointCount,
               ratioThreshold,
+              sharpAngleThreshold,
+              sharpCornerRatioThreshold,
+              sharpCornerAbsoluteThreshold,
               clipRect,
             }
           )
