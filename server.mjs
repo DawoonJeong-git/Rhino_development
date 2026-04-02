@@ -13642,6 +13642,120 @@ function normalizeContourBoundaryLoop(
   return polygon.length >= 3 ? polygon : dedupeLocalPolygonPoints(points, 0.001);
 }
 
+function doLocalBoundsOverlap(leftBounds, rightBounds, toleranceMeters = 0.001) {
+  if (!leftBounds || !rightBounds) {
+    return true;
+  }
+
+  const tolerance = Math.max(0, Number(toleranceMeters) || 0);
+
+  return !(
+    Number(leftBounds.maxX) < Number(rightBounds.minX) - tolerance ||
+    Number(rightBounds.maxX) < Number(leftBounds.minX) - tolerance ||
+    Number(leftBounds.maxY) < Number(rightBounds.minY) - tolerance ||
+    Number(rightBounds.maxY) < Number(leftBounds.minY) - tolerance
+  );
+}
+
+function cleanupNormalizedContourRegions(
+  siteContext,
+  regions,
+  { generatedLevel = false } = {}
+) {
+  const interval = Number(resolveEffectiveContourBandInterval(siteContext) || 0);
+  const sourceContourInterval = Number(resolveSourceContourInterval(siteContext) || 0);
+  const finerThanSource =
+    interval > 0 &&
+    sourceContourInterval > 0 &&
+    interval < sourceContourInterval - 1e-9;
+
+  if (!finerThanSource || !Array.isArray(regions) || !regions.length) {
+    return regions || [];
+  }
+
+  const cleanupThresholdSqm = resolveRawAnchoredContourCleanupAreaThreshold(siteContext);
+  const minimumOuterAreaSqm = generatedLevel
+    ? Math.max(0.2, Math.min(3, cleanupThresholdSqm * 0.55))
+    : Math.max(0.12, Math.min(1.25, cleanupThresholdSqm * 0.3));
+  const minimumHoleAreaSqm = Math.max(
+    0.08,
+    Math.min(minimumOuterAreaSqm, minimumOuterAreaSqm * 0.72)
+  );
+  const preparedRegions = (regions || [])
+    .map((region) => {
+      const filteredHolePoints = (region?.holePoints || []).filter(
+        (holePoints) =>
+          Math.abs(computeLocalPolygonSignedArea(holePoints || [])) >= minimumHoleAreaSqm
+      );
+      const normalizedRegion = {
+        outerPoints: orientLocalPolygonCounterClockwise(region?.outerPoints || []),
+        holePoints: filteredHolePoints.map((holePoints) =>
+          [...orientLocalPolygonCounterClockwise(holePoints || [])].reverse()
+        ),
+      };
+      const multiPolygon = buildPolygonClippingMultiPolygonFromRegions([normalizedRegion]);
+      const areaSqm = computeLocalMultiPolygonArea(multiPolygon);
+      const bounds = computeLocalBoundsFromPoints([
+        normalizedRegion.outerPoints,
+        ...normalizedRegion.holePoints,
+      ].flatMap((ring) => ring || []));
+
+      return {
+        region: normalizedRegion,
+        multiPolygon,
+        areaSqm,
+        bounds,
+      };
+    })
+    .filter((entry) => entry.region.outerPoints.length >= 3)
+    .filter((entry) => entry.areaSqm >= minimumOuterAreaSqm)
+    .sort((left, right) => right.areaSqm - left.areaSqm);
+  const dedupedRegions = [];
+
+  for (const candidate of preparedRegions) {
+    let duplicate = false;
+
+    for (const kept of dedupedRegions) {
+      if (!doLocalBoundsOverlap(candidate.bounds, kept.bounds, 0.05)) {
+        continue;
+      }
+
+      const overlapAreaSqm = computeLocalMultiPolygonArea(
+        intersectLocalMultiPolygon(candidate.multiPolygon, kept.multiPolygon)
+      );
+
+      if (!(overlapAreaSqm > 0)) {
+        continue;
+      }
+
+      const coverageRatio = overlapAreaSqm / Math.max(candidate.areaSqm, 1e-6);
+      const precisionRatio = overlapAreaSqm / Math.max(kept.areaSqm, 1e-6);
+      const areaDeltaRatio =
+        Math.abs(candidate.areaSqm - kept.areaSqm) /
+        Math.max(candidate.areaSqm, kept.areaSqm, 1);
+      const redundantSmallRegion =
+        candidate.areaSqm <= minimumOuterAreaSqm * 4 &&
+        coverageRatio >= 0.92 &&
+        precisionRatio >= 0.15;
+      const nearDuplicateRegion =
+        coverageRatio >= 0.985 ||
+        (coverageRatio >= 0.96 && areaDeltaRatio <= 0.2) ||
+        redundantSmallRegion;
+
+      if (nearDuplicateRegion) {
+        duplicate = true;
+        break;
+      }
+    }
+
+    if (!duplicate) {
+      dedupedRegions.push(candidate);
+    }
+  }
+
+  return dedupedRegions.map((entry) => entry.region);
+}
+
 function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
   const clipRect = buildLocalClipRect(siteContext);
   const levelKey = buildContourLevelKey(elevation);
@@ -13663,7 +13777,7 @@ function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
     ? generatedNormalization.ratioThreshold
     : 0.21;
 
-  return (regions || [])
+  const normalizedRegions = (regions || [])
     .map((region) => {
       const outerPoints = orientLocalPolygonCounterClockwise(
         normalizeContourBoundaryLoop(region?.outerPoints || [], {
@@ -13702,6 +13816,10 @@ function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
       };
     })
     .filter(Boolean);
+
+  return cleanupNormalizedContourRegions(siteContext, normalizedRegions, {
+    generatedLevel: !nativeLevelKeys.has(levelKey),
+  });
 }
 
 function smoothSketchUpSolidLoop(points, toleranceMeters = 0) {
@@ -15982,9 +16100,13 @@ function buildExactNativeContourBandAssembly({
             top: Number(topElevation.toFixed(3)),
           })
         : bottomArea;
+    const cleanedBandMultiPolygon = filterTinyLocalMultiPolygonArtifacts(
+      bandMultiPolygon,
+      Math.max(0.08, cleanupAreaThresholdSqm * 0.45)
+    );
     const regions = normalizeContourRegionsForLevel(
       normalizationSiteContext,
-      buildContourBandRegionsFromMultiPolygon(bandMultiPolygon),
+      buildContourBandRegionsFromMultiPolygon(cleanedBandMultiPolygon),
       bottomElevation
     );
 
@@ -16002,7 +16124,7 @@ function buildExactNativeContourBandAssembly({
           gridAreaAbove: summarizeRawContourBandAssemblyArea([]),
           resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
           resolvedTopArea: summarizeRawContourBandAssemblyArea(topArea),
-          bandArea: summarizeRawContourBandAssemblyArea(bandMultiPolygon),
+          bandArea: summarizeRawContourBandAssemblyArea(cleanedBandMultiPolygon),
           regionCount: 0,
           accepted: false,
           skippedReason: "empty_exact_native_band_regions",
@@ -16036,7 +16158,7 @@ function buildExactNativeContourBandAssembly({
         gridAreaAbove: summarizeRawContourBandAssemblyArea([]),
         resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
         resolvedTopArea: summarizeRawContourBandAssemblyArea(topArea),
-        bandArea: summarizeRawContourBandAssemblyArea(bandMultiPolygon),
+        bandArea: summarizeRawContourBandAssemblyArea(cleanedBandMultiPolygon),
         regionCount: regions.length,
         accepted: true,
         skippedReason: null,
@@ -16487,8 +16609,12 @@ function buildRawAnchoredContourBandAssembly(
             top: Number(topElevation.toFixed(3)),
           })
         : bottomArea;
+    const cleanedBandMultiPolygon = filterTinyLocalMultiPolygonArtifacts(
+      bandMultiPolygon,
+      Math.max(0.08, cleanupAreaThresholdSqm * 0.45)
+    );
 
-    if (!bandMultiPolygon.length) {
+    if (!cleanedBandMultiPolygon.length) {
       if (includeLevelDiagnostics) {
         levelDiagnostics.push({
           bottomElevation,
@@ -16508,7 +16634,7 @@ function buildRawAnchoredContourBandAssembly(
           ),
           resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
           resolvedTopArea: summarizeRawContourBandAssemblyArea(topArea),
-          bandArea: summarizeRawContourBandAssemblyArea(bandMultiPolygon),
+          bandArea: summarizeRawContourBandAssemblyArea(cleanedBandMultiPolygon),
           regionCount: 0,
           accepted: false,
           skippedReason: "empty_band_difference",
@@ -16519,7 +16645,7 @@ function buildRawAnchoredContourBandAssembly(
 
     const regions = normalizeContourRegionsForLevel(
       siteContext,
-      buildContourBandRegionsFromMultiPolygon(bandMultiPolygon),
+      buildContourBandRegionsFromMultiPolygon(cleanedBandMultiPolygon),
       bottomElevation
     );
 
@@ -16543,7 +16669,7 @@ function buildRawAnchoredContourBandAssembly(
           ),
           resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
           resolvedTopArea: summarizeRawContourBandAssemblyArea(topArea),
-          bandArea: summarizeRawContourBandAssemblyArea(bandMultiPolygon),
+          bandArea: summarizeRawContourBandAssemblyArea(cleanedBandMultiPolygon),
           regionCount: 0,
           accepted: false,
           skippedReason: "empty_band_regions",
@@ -16583,7 +16709,7 @@ function buildRawAnchoredContourBandAssembly(
         gridAreaAbove: summarizeRawContourBandAssemblyArea(bottomResolution.gridAreaAbove),
         resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
         resolvedTopArea: summarizeRawContourBandAssemblyArea(topArea),
-        bandArea: summarizeRawContourBandAssemblyArea(bandMultiPolygon),
+        bandArea: summarizeRawContourBandAssemblyArea(cleanedBandMultiPolygon),
         regionCount: regions.length,
         accepted: true,
         skippedReason: null,
