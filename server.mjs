@@ -1427,8 +1427,7 @@ function buildSiteContextCacheKey(location = {}, options = {}, customBounds = nu
     radius: Math.max(30, Number(options.radius) || 120),
     contourInterval: normalizeContourInterval(options.contourInterval),
     terrainMode: options.terrainMode === "flat" ? "flat" : "contour",
-    buildingPlacement:
-      options.buildingPlacement === "embed-lowest" ? "embed-lowest" : "dominant",
+    buildingPlacement: normalizeBuildingPlacementMode(options.buildingPlacement),
     exportFormat: normalizeExportFormat(options.exportFormat),
     includeContours: options.includeContours !== false,
     includeBuildings: options.includeBuildings !== false,
@@ -9685,6 +9684,21 @@ function buildContourElevationKeySet(contourCollection) {
   );
 }
 
+function normalizeBuildingPlacementMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "remove-overlap" || normalized === "embed-lowest"
+    ? "remove-overlap"
+    : "default";
+}
+
+function shouldRemoveTerrainBuildingOverlap(siteContextOrOptions) {
+  const options =
+    siteContextOrOptions?.options && typeof siteContextOrOptions.options === "object"
+      ? siteContextOrOptions.options
+      : siteContextOrOptions;
+  return normalizeBuildingPlacementMode(options?.buildingPlacement) === "remove-overlap";
+}
+
 function buildGeneratedContourLinesFromResolvedAreas(siteContext, contourInterval) {
   if (
     !siteContext?.location ||
@@ -11756,8 +11770,7 @@ async function buildSiteContext(body, config, reportProgress = null) {
       contourInterval: normalizeContourInterval(options.contourInterval),
       terrainMode: options.terrainMode === "flat" ? "flat" : "contour",
       previewOnly: isSelectionPreview,
-      buildingPlacement:
-        options.buildingPlacement === "embed-lowest" ? "embed-lowest" : "dominant",
+      buildingPlacement: normalizeBuildingPlacementMode(options.buildingPlacement),
       exportFormat: options.exportFormat || "obj",
       includeContours: options.includeContours !== false,
       includeBuildings: options.includeBuildings !== false,
@@ -12475,10 +12488,9 @@ function getBuildingPlacementCache(siteContext) {
 }
 
 function buildBuildingPlacementCacheKey(siteContext, ring) {
-  const placementMode =
-    siteContext?.options?.buildingPlacement === "embed-lowest"
-      ? "embed-lowest"
-      : "dominant";
+  const placementMode = normalizeBuildingPlacementMode(
+    siteContext?.options?.buildingPlacement
+  );
   const interval = resolveEffectiveContourBandInterval(siteContext);
   const ringKey = (ring || [])
     .map((point) =>
@@ -12503,10 +12515,10 @@ function resolveBuildingPlacementForRing(siteContext, ring, center, seed) {
     return cache.get(cacheKey);
   }
 
-  const placementMode =
-    siteContext.options?.buildingPlacement === "embed-lowest"
-      ? "embed-lowest"
-      : "dominant";
+  const placementMode = "raw-contour";
+  const overlapMode = normalizeBuildingPlacementMode(
+    siteContext?.options?.buildingPlacement
+  );
   const bandOverlapDominantElevation = estimateBuildingDominantTerraceElevationFromBandOverlap(
     siteContext,
     ring,
@@ -12542,12 +12554,7 @@ function resolveBuildingPlacementForRing(siteContext, ring, center, seed) {
   let finalBaseElevation = null;
   let source = "unresolved";
 
-  if (placementMode === "embed-lowest") {
-    if (Number.isFinite(lowestElevation)) {
-      finalBaseElevation = lowestElevation;
-      source = "lowest-sample";
-    }
-  } else if (Number.isFinite(bandOverlapDominantElevation)) {
+  if (Number.isFinite(bandOverlapDominantElevation)) {
     finalBaseElevation = bandOverlapDominantElevation;
     source = "dominant-band-overlap";
   } else if (Number.isFinite(overlapDominantElevation)) {
@@ -12566,6 +12573,7 @@ function resolveBuildingPlacementForRing(siteContext, ring, center, seed) {
 
   const placementInfo = {
     placementMode,
+    overlapMode,
     source,
     dominantElevation: Number.isFinite(overlapDominantElevation)
       ? Number(overlapDominantElevation.toFixed(3))
@@ -12602,6 +12610,7 @@ function applyBuildingPlacementDebug(feature, placementInfo) {
 
   feature.properties.buildingPlacementDebug = {
     placementMode: placementInfo.placementMode,
+    overlapMode: placementInfo.overlapMode,
     source: placementInfo.source,
     dominantElevation: placementInfo.dominantElevation,
     bandDominantElevation: placementInfo.bandDominantElevation,
@@ -12669,6 +12678,7 @@ function buildBuildingPlacementDiagnostics(siteContext) {
           feature?.properties?.roadAddress ||
           "BUILDING",
         placementMode: placementInfo.placementMode,
+        overlapMode: placementInfo.overlapMode,
         source: placementInfo.source,
         dominantElevation: placementInfo.dominantElevation,
         bandDominantElevation: placementInfo.bandDominantElevation,
@@ -13306,6 +13316,142 @@ function computeLocalLoopAxisAlignedSegmentRatio(points) {
   return segmentCount > 0 ? axisAlignedCount / segmentCount : 0;
 }
 
+function resolveClipRectBoundarySide(point, clipRect, toleranceMeters = 0.05) {
+  if (
+    !Array.isArray(point) ||
+    point.length < 2 ||
+    !Number.isFinite(point[0]) ||
+    !Number.isFinite(point[1]) ||
+    !clipRect
+  ) {
+    return null;
+  }
+
+  const tolerance = Math.max(0.01, Number(toleranceMeters) || 0.05);
+  const candidates = [
+    { side: "bottom", distance: Math.abs(Number(point[1]) - Number(clipRect.minY)) },
+    { side: "right", distance: Math.abs(Number(point[0]) - Number(clipRect.maxX)) },
+    { side: "top", distance: Math.abs(Number(point[1]) - Number(clipRect.maxY)) },
+    { side: "left", distance: Math.abs(Number(point[0]) - Number(clipRect.minX)) },
+  ].sort((left, right) => left.distance - right.distance);
+
+  return candidates[0]?.distance <= tolerance ? candidates[0].side : null;
+}
+
+function computeLocalOpenPolylineLength(points) {
+  let length = 0;
+
+  for (let index = 1; index < (points || []).length; index += 1) {
+    const current = points[index];
+    const previous = points[index - 1];
+
+    if (
+      !Array.isArray(current) ||
+      !Array.isArray(previous) ||
+      current.length < 2 ||
+      previous.length < 2
+    ) {
+      continue;
+    }
+
+    length += Math.hypot(
+      Number(current[0] || 0) - Number(previous[0] || 0),
+      Number(current[1] || 0) - Number(previous[1] || 0)
+    );
+  }
+
+  return Number(length.toFixed(6));
+}
+
+function snapContourBoundaryLoopToClipRect(points, clipRect, toleranceMeters = 0.8) {
+  let polygon = dedupeLocalPolygonPoints(points, 0.001);
+
+  if (polygon.length < 3 || !clipRect) {
+    return polygon;
+  }
+
+  const tolerance = Math.max(0.15, Number(toleranceMeters) || 0.8);
+  const snappedPoints = polygon.map(
+    (point) => snapLocalPointToRectBoundary(point, clipRect, tolerance) || [point[0], point[1]]
+  );
+  const normalized = [];
+
+  for (let index = 0; index < polygon.length; index += 1) {
+    const currentOriginal = polygon[index];
+    const nextOriginal = polygon[(index + 1) % polygon.length];
+    const currentPoint = snappedPoints[index];
+    const nextPoint = snappedPoints[(index + 1) % polygon.length];
+
+    if (
+      !normalized.length ||
+      !pointsMatchInMeters(
+        normalized[normalized.length - 1],
+        currentPoint,
+        Math.max(0.001, tolerance * 0.02)
+      )
+    ) {
+      normalized.push(currentPoint);
+    }
+
+    const currentBoundaryDistance = distanceToClipRectBoundary(
+      currentOriginal,
+      clipRect
+    );
+    const nextBoundaryDistance = distanceToClipRectBoundary(nextOriginal, clipRect);
+    const segmentMidpoint = [
+      Number(((Number(currentOriginal[0]) + Number(nextOriginal[0])) / 2).toFixed(6)),
+      Number(((Number(currentOriginal[1]) + Number(nextOriginal[1])) / 2).toFixed(6)),
+    ];
+    const midpointBoundaryDistance = distanceToClipRectBoundary(
+      segmentMidpoint,
+      clipRect
+    );
+    const currentSide = resolveClipRectBoundarySide(
+      currentPoint,
+      clipRect,
+      Math.max(0.01, tolerance * 0.15)
+    );
+    const nextSide = resolveClipRectBoundarySide(
+      nextPoint,
+      clipRect,
+      Math.max(0.01, tolerance * 0.15)
+    );
+    const segmentStaysNearBoundary =
+      Number.isFinite(currentBoundaryDistance) &&
+      Number.isFinite(nextBoundaryDistance) &&
+      Number.isFinite(midpointBoundaryDistance) &&
+      currentBoundaryDistance <= tolerance &&
+      nextBoundaryDistance <= tolerance &&
+      midpointBoundaryDistance <= tolerance * 1.1;
+
+    if (segmentStaysNearBoundary && currentSide && nextSide && currentSide !== nextSide) {
+      const candidatePaths = [
+        buildLocalRectBoundaryPath(currentPoint, nextPoint, clipRect, "ccw"),
+        buildLocalRectBoundaryPath(currentPoint, nextPoint, clipRect, "cw"),
+      ].filter((path) => Array.isArray(path) && path.length >= 2);
+      const chosenPath = candidatePaths.sort(
+        (left, right) =>
+          computeLocalOpenPolylineLength(left) - computeLocalOpenPolylineLength(right)
+      )[0];
+
+      for (const boundaryPoint of chosenPath?.slice(1, -1) || []) {
+        if (
+          !pointsMatchInMeters(
+            normalized[normalized.length - 1],
+            boundaryPoint,
+            Math.max(0.001, tolerance * 0.02)
+          )
+        ) {
+          normalized.push(boundaryPoint);
+        }
+      }
+    }
+  }
+
+  polygon = dedupeLocalPolygonPoints(normalized, 0.001);
+  return polygon.length >= 3 ? polygon : dedupeLocalPolygonPoints(points, 0.001);
+}
+
 function resolveGeneratedContourLoopNormalizationOptions(siteContext) {
   const interval = Number(resolveEffectiveContourBandInterval(siteContext) || 0);
   const sourceContourInterval = Number(resolveSourceContourInterval(siteContext) || 0);
@@ -13315,20 +13461,20 @@ function resolveGeneratedContourLoopNormalizationOptions(siteContext) {
     sourceContourInterval > 0 &&
     interval < sourceContourInterval - 1e-9;
   const baseTolerance = Math.max(
-    0.02,
+    0.03,
     Math.min(
-      0.09,
-      terrainStep > 0 ? terrainStep * 0.08 : 0.05,
-      interval > 0 ? interval * 0.08 : 0.05
+      0.18,
+      terrainStep > 0 ? terrainStep * 0.18 : 0.08,
+      interval > 0 ? interval * 0.22 : 0.08
     )
   );
 
   return {
     enabled: finerThanSource,
     simplifyTolerance: baseTolerance,
-    minSegmentLength: Math.max(0.05, baseTolerance * 1.5),
-    minPointCount: interval <= 0.1 ? 28 : interval <= 1 ? 22 : 18,
-    ratioThreshold: 0.21,
+    minSegmentLength: Math.max(0.08, baseTolerance * 2.2),
+    minPointCount: interval <= 0.1 ? 24 : interval <= 1 ? 18 : 14,
+    ratioThreshold: 0.16,
   };
 }
 
@@ -13340,6 +13486,7 @@ function normalizeContourBoundaryLoop(
     minSegmentLength = 0.08,
     minPointCount = 20,
     ratioThreshold = 0.21,
+    clipRect = null,
   } = {}
 ) {
   let polygon = dedupeLocalPolygonPoints(
@@ -13365,7 +13512,10 @@ function normalizeContourBoundaryLoop(
     axisAlignedRatio >= ratioThreshold
   ) {
     polygon = smoothLocalPolygonChaikin(polygon, {
-      iterations: 1,
+      iterations:
+        axisAlignedRatio >= ratioThreshold + 0.08 && polygon.length >= minPointCount * 1.5
+          ? 2
+          : 1,
       ratio: 0.18,
       maxPointCount: Math.min(768, Math.max(128, polygon.length * 2)),
       minSegmentLength,
@@ -13377,10 +13527,44 @@ function normalizeContourBoundaryLoop(
     Math.max(0.01, simplifyTolerance)
   );
 
+  if (clipRect) {
+    polygon = snapContourBoundaryLoopToClipRect(
+      polygon,
+      clipRect,
+      Math.max(
+        clipRect.boundarySnapTolerance || 0,
+        simplifyTolerance * (smoothGenerated ? 16 : 12)
+      )
+    );
+  }
+
+  if (smoothGenerated && polygon.length >= 3) {
+    const postSnapAxisAlignedRatio = computeLocalLoopAxisAlignedSegmentRatio(polygon);
+
+    if (postSnapAxisAlignedRatio >= ratioThreshold * 0.9) {
+      polygon = simplifyLocalPolygonDouglasPeucker(
+        polygon,
+        Math.max(simplifyTolerance * 1.8, minSegmentLength * 1.25)
+      );
+
+      if (clipRect) {
+        polygon = snapContourBoundaryLoopToClipRect(
+          polygon,
+          clipRect,
+          Math.max(
+            (clipRect.boundarySnapTolerance || 0) * 1.15,
+            simplifyTolerance * 18
+          )
+        );
+      }
+    }
+  }
+
   return polygon.length >= 3 ? polygon : dedupeLocalPolygonPoints(points, 0.001);
 }
 
 function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
+  const clipRect = buildLocalClipRect(siteContext);
   const levelKey = buildContourLevelKey(elevation);
   const nativeLevelKeys = buildContourElevationKeySet(siteContext?.contourLines);
   const generatedNormalization =
@@ -13409,6 +13593,7 @@ function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
           minSegmentLength,
           minPointCount,
           ratioThreshold,
+          clipRect,
         })
       );
       const holePoints = (region?.holePoints || [])
@@ -13421,6 +13606,7 @@ function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
               minSegmentLength,
               minPointCount,
               ratioThreshold,
+              clipRect,
             }
           )
         )
@@ -14046,8 +14232,8 @@ function buildLocalClipRect(siteContext) {
       (bounds.maxX - bounds.minX) * 2 + (bounds.maxY - bounds.minY) * 2
     ),
     boundarySnapTolerance: Math.max(
-      0.3,
-      Number(siteContext?.terrainGrid?.step || 0) * 1.75
+      0.35,
+      Number(siteContext?.terrainGrid?.step || 0) * 2
     ),
   };
 }
@@ -17221,6 +17407,10 @@ function buildRenderableContourBandGroups(siteContext) {
     return cumulativeGroups;
   }
 
+  if (!shouldRemoveTerrainBuildingOverlap(siteContext)) {
+    return cumulativeGroups;
+  }
+
   const buildingCarveProfiles = buildBuildingFootprintCarveProfiles(siteContext);
 
   if (!buildingCarveProfiles.length) {
@@ -17304,9 +17494,7 @@ function getCachedRenderableContourBandGroups(siteContext) {
   }
 
   const cacheKey = `${getContourBandCacheKey(siteContext)}|${
-    siteContext.options?.buildingPlacement === "embed-lowest"
-      ? "embed-lowest"
-      : "dominant"
+    normalizeBuildingPlacementMode(siteContext?.options?.buildingPlacement)
   }|${siteContext.options?.includeBuildings !== false ? "with-bldg" : "no-bldg"}`;
   const owner = resolveRenderableContourCacheOwner(siteContext);
   const entry = getOrCreateWeakMapEntry(contourRenderableBandGroupCache, owner);

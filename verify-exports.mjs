@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import path from "node:path";
 import process from "node:process";
+import polygonClipping from "polygon-clipping";
 import {
   buildProviderTimeoutConfig,
   buildParcelDataCacheKey,
@@ -66,7 +67,7 @@ const DEFAULT_OPTIONS = {
   includeRoads: true,
   contourInterval: 1,
   terrainMode: "contour",
-  buildingPlacement: "dominant",
+  buildingPlacement: "default",
 };
 
 const CASES = [
@@ -110,6 +111,75 @@ function getLineStringsFromGeometry(geometry) {
   }
 
   return [];
+}
+
+function closeLocalRing(points) {
+  const ring = (points || [])
+    .filter(
+      (point) =>
+        Array.isArray(point) &&
+        point.length >= 2 &&
+        Number.isFinite(point[0]) &&
+        Number.isFinite(point[1])
+    )
+    .map((point) => [Number(point[0]), Number(point[1])]);
+
+  if (ring.length < 3) {
+    return [];
+  }
+
+  const firstPoint = ring[0];
+  const lastPoint = ring[ring.length - 1];
+
+  if (
+    Math.abs(firstPoint[0] - lastPoint[0]) > 1e-9 ||
+    Math.abs(firstPoint[1] - lastPoint[1]) > 1e-9
+  ) {
+    ring.push([...firstPoint]);
+  }
+
+  return ring;
+}
+
+function computeSignedArea(points) {
+  const ring = closeLocalRing(points);
+
+  if (ring.length < 4) {
+    return 0;
+  }
+
+  let area = 0;
+
+  for (let index = 0; index < ring.length - 1; index += 1) {
+    const current = ring[index];
+    const next = ring[index + 1];
+    area += current[0] * next[1] - next[0] * current[1];
+  }
+
+  return area / 2;
+}
+
+function orientLocalRingCounterClockwise(points) {
+  const ring = closeLocalRing(points);
+  return computeSignedArea(ring) >= 0 ? ring : [...ring].reverse();
+}
+
+function computeMultiPolygonAreaSqm(multiPolygon) {
+  let area = 0;
+
+  for (const polygon of multiPolygon || []) {
+    if (!Array.isArray(polygon) || !polygon.length) {
+      continue;
+    }
+
+    area += Math.abs(computeSignedArea(polygon[0] || []));
+
+    for (let ringIndex = 1; ringIndex < polygon.length; ringIndex += 1) {
+      area -= Math.abs(computeSignedArea(polygon[ringIndex] || []));
+    }
+  }
+
+  return Math.max(0, Number(area.toFixed(6)));
 }
 
 function assertDefaultCspShape(csp, label) {
@@ -637,7 +707,7 @@ async function runBaselineVerification() {
         radius: 1000,
         contourInterval: 1,
         terrainMode: "contour",
-        buildingPlacement: "dominant",
+        buildingPlacement: "default",
         includeContours: true,
         includeBuildings: true,
         includeParcelBoundary: true,
@@ -2218,6 +2288,7 @@ async function runBaselineVerification() {
       options: {
         ...syntheticContourSiteContext.options,
         contourInterval: 5,
+        buildingPlacement: "default",
         includeBuildings: true,
       },
       dataSources: {
@@ -2243,8 +2314,8 @@ async function runBaselineVerification() {
               coordinates: [[
                 [126.97808, 37.566435],
                 [126.9782, 37.566435],
-                [126.9782, 37.566505],
-                [126.97808, 37.566505],
+                [126.9782, 37.566585],
+                [126.97808, 37.566585],
                 [126.97808, 37.566435],
               ]],
             },
@@ -2257,11 +2328,33 @@ async function runBaselineVerification() {
       syntheticBuildingPlacementSiteContext.options,
       "3dm"
     );
+    const preparedBuildingPlacementDefaultSiteContext = prepareSiteContextForExport(
+      syntheticBuildingPlacementSiteContext,
+      {
+        ...syntheticBuildingPlacementSiteContext.options,
+        buildingPlacement: "default",
+      },
+      "3dm"
+    );
+    const preparedBuildingPlacementRemoveOverlapSiteContext = prepareSiteContextForExport(
+      syntheticBuildingPlacementSiteContext,
+      {
+        ...syntheticBuildingPlacementSiteContext.options,
+        buildingPlacement: "remove-overlap",
+      },
+      "3dm"
+    );
     const buildingPlacementDebug =
       preparedBuildingPlacementSiteContext?.buildings?.features?.[0]?.properties
         ?.buildingPlacementDebug;
     const buildingPlacementStatsDebug =
       preparedBuildingPlacementSiteContext?.stats?.buildingPlacementDebug?.[0];
+    const defaultPlacementDebug =
+      preparedBuildingPlacementDefaultSiteContext?.buildings?.features?.[0]?.properties
+        ?.buildingPlacementDebug;
+    const removeOverlapPlacementDebug =
+      preparedBuildingPlacementRemoveOverlapSiteContext?.buildings?.features?.[0]?.properties
+        ?.buildingPlacementDebug;
     assert.equal(
       buildingPlacementDebug?.source,
       "dominant-band-overlap",
@@ -2291,6 +2384,79 @@ async function runBaselineVerification() {
       buildingPlacementStatsDebug?.finalBaseElevation,
       15,
       "Prepared export stats should keep building placement diagnostics aligned with the exported building base elevation."
+    );
+    assert.equal(
+      defaultPlacementDebug?.finalBaseElevation,
+      15,
+      "Default building-terrain mode should still keep building Z on the raw contour terrace."
+    );
+    assert.equal(
+      removeOverlapPlacementDebug?.finalBaseElevation,
+      15,
+      "Remove-overlap mode should not change building Z away from the raw contour terrace."
+    );
+    assert.equal(
+      defaultPlacementDebug?.overlapMode,
+      "default",
+      "Default building-terrain mode should be reported as default."
+    );
+    assert.equal(
+      removeOverlapPlacementDebug?.overlapMode,
+      "remove-overlap",
+      "Remove-overlap building-terrain mode should be reported distinctly."
+    );
+    const buildingGeometry =
+      syntheticBuildingPlacementSiteContext?.buildings?.features?.[0]?.geometry?.coordinates?.[0] ||
+      [];
+    const buildingLocalRing = orientLocalRingCounterClockwise(
+      buildingGeometry.map((point) =>
+        localMetersFromLngLat(point, syntheticBuildingPlacementSiteContext.location)
+      )
+    );
+    const buildingMultiPolygon = [[buildingLocalRing]];
+    const defaultTerrainPlan = resolveContourTerrainRenderPlan(
+      preparedBuildingPlacementDefaultSiteContext
+    );
+    const removeOverlapTerrainPlan = resolveContourTerrainRenderPlan(
+      preparedBuildingPlacementRemoveOverlapSiteContext
+    );
+    const defaultOverlapAreaSqm = computeMultiPolygonAreaSqm(
+      polygonClipping.intersection(
+        buildingMultiPolygon,
+        defaultTerrainPlan?.bandGroups
+          ?.filter(
+            (group) =>
+              Number.isFinite(group?.topElevation) &&
+              group.topElevation >
+                Number(defaultPlacementDebug?.finalBaseElevation || 0) + 1e-9 &&
+              Array.isArray(group?.multiPolygon) &&
+              group.multiPolygon.length
+          )
+          .flatMap((group) => group.multiPolygon || [])
+      ) || []
+    );
+    const removeOverlapAreaSqm = computeMultiPolygonAreaSqm(
+      polygonClipping.intersection(
+        buildingMultiPolygon,
+        removeOverlapTerrainPlan?.bandGroups
+          ?.filter(
+            (group) =>
+              Number.isFinite(group?.topElevation) &&
+              group.topElevation >
+                Number(removeOverlapPlacementDebug?.finalBaseElevation || 0) + 1e-9 &&
+              Array.isArray(group?.multiPolygon) &&
+              group.multiPolygon.length
+          )
+          .flatMap((group) => group.multiPolygon || [])
+      ) || []
+    );
+    assert.ok(
+      defaultOverlapAreaSqm > 0.001,
+      "Default building-terrain mode should keep overlapping terrain above the building base."
+    );
+    assert.ok(
+      removeOverlapAreaSqm <= 0.001,
+      "Remove-overlap building-terrain mode should carve overlapping terrain above the building base."
     );
     const refinedSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       refinedSketchUpSiteContext
@@ -2686,7 +2852,7 @@ async function runBaselineVerification() {
       location: serverOwnedSiteContext.location,
       options: {
         ...serverOwnedSiteContext.options,
-        buildingPlacement: "embed-lowest",
+        buildingPlacement: "remove-overlap",
         exportFormat: "skp-payload",
       },
     };

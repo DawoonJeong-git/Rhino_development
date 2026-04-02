@@ -27,7 +27,7 @@ const DEFAULT_OPTIONS = {
   debugRoadDiagnostics: true,
   contourInterval: 1,
   terrainMode: "contour",
-  buildingPlacement: "dominant",
+  buildingPlacement: "default",
 };
 
 function parseArgs(argv) {

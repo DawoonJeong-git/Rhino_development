@@ -3597,17 +3597,21 @@ function syncContourIntervalInput() {
 function collectModelOptions() {
   const formData = new FormData(modelForm);
   const contourInterval = syncContourIntervalInput();
+  const normalizeBuildingPlacementSelection = (value) => {
+    const normalized = String(value || "").toLowerCase();
+    return normalized === "remove-overlap" || normalized === "embed-lowest"
+      ? "remove-overlap"
+      : "default";
+  };
 
   return {
     shape: "rectangle",
     radius: Number(formData.get("radius")),
     contourInterval,
     terrainMode: "contour",
-    buildingPlacement:
-      String(formData.get("buildingPlacement") || "").toLowerCase() ===
-      "embed-lowest"
-        ? "embed-lowest"
-        : "dominant",
+    buildingPlacement: normalizeBuildingPlacementSelection(
+      formData.get("buildingPlacement")
+    ),
     exportFormat: normalizeExportFormat(formData.get("exportFormat")),
     includeContours: true,
     includeBuildings: true,
@@ -3634,9 +3638,11 @@ function buildModelOptionsSignature(
 
   if (includeExportOnly) {
     signature.buildingPlacement =
-      options.buildingPlacement === "embed-lowest"
-        ? "embed-lowest"
-        : "dominant";
+      ["remove-overlap", "embed-lowest"].includes(
+        String(options.buildingPlacement || "").toLowerCase()
+      )
+        ? "remove-overlap"
+        : "default";
     signature.splitParcelBoundary = options.splitParcelBoundary === true;
     signature.exportFormat = normalizeExportFormat(options.exportFormat);
   }
@@ -3674,7 +3680,10 @@ function describeExportFormat(value) {
 }
 
 function describeBuildingPlacement(value) {
-  return value === "embed-lowest" ? "최저 레벨" : "기준 레벨";
+  const normalized = String(value || "").toLowerCase();
+  return normalized === "remove-overlap" || normalized === "embed-lowest"
+    ? "중첩 제거"
+    : "기본";
 }
 
 function buildAppliedModelSummary(
@@ -3701,7 +3710,7 @@ function buildAppliedModelSummary(
   const parts = [
     `범위 ${Number(options.radius) || 0}m`,
     `등고 간격 ${intervalText}`,
-    `건물 배치 ${describeBuildingPlacement(options.buildingPlacement)}`,
+    `건물-대지 처리 ${describeBuildingPlacement(options.buildingPlacement)}`,
   ];
   const stats = siteContext?.stats || {};
 
@@ -4919,13 +4928,13 @@ function ensureModelFormOptionLayout() {
   if (!buildingPlacementLabel) {
     buildingPlacementLabel = createModelOptionLabel(
       "buildingPlacement",
-      "건물 높이 기준",
+      "건물-대지 처리",
       [
-        { value: "dominant", label: "기준 레벨" },
-        { value: "embed-lowest", label: "최저 레벨" },
+        { value: "default", label: "기본" },
+        { value: "remove-overlap", label: "중첩 제거" },
       ],
-      "dominant",
-      "건물 높이를 어떤 지형 기준으로 맞출지 선택합니다."
+      "default",
+      "건물 Z는 원 지형 기준으로 맞추고, 대지모형과 겹친 부분을 제거할지 선택합니다."
     );
   }
 

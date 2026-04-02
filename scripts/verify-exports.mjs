@@ -21,7 +21,7 @@ const CASES = [
       includeRoads: true,
       contourInterval: 1,
       terrainMode: "contour",
-      buildingPlacement: "dominant",
+      buildingPlacement: "default",
     },
   },
   {
@@ -35,7 +35,7 @@ const CASES = [
       includeRoads: true,
       contourInterval: 1,
       terrainMode: "contour",
-      buildingPlacement: "dominant",
+      buildingPlacement: "default",
     },
   },
 ];

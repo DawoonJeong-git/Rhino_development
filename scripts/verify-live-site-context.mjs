@@ -8,7 +8,7 @@ const DEFAULT_OPTIONS = {
   includeRoads: true,
   contourInterval: 1,
   terrainMode: "contour",
-  buildingPlacement: "dominant",
+  buildingPlacement: "default",
 };
 
 const CASES = [
