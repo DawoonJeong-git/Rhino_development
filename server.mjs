@@ -13866,7 +13866,8 @@ function pruneTransientGeneratedRegions(
   elevation,
   regions,
   previousRegions = [],
-  nextRegions = []
+  nextRegions = [],
+  options = {}
 ) {
   const interval = Number(resolveEffectiveContourBandInterval(siteContext) || 0);
   const sourceContourInterval = Number(resolveSourceContourInterval(siteContext) || 0);
@@ -13874,12 +13875,13 @@ function pruneTransientGeneratedRegions(
     interval > 0 &&
     sourceContourInterval > 0 &&
     interval < sourceContourInterval - 1e-9;
+  const allowNativeLevelPruning = options?.allowNativeLevelPruning === true;
   const nativeLevelKeys = buildContourElevationKeySet(siteContext?.contourLines);
   const levelKey = buildContourLevelKey(elevation);
 
   if (
     !finerThanSource ||
-    nativeLevelKeys.has(levelKey) ||
+    (!allowNativeLevelPruning && nativeLevelKeys.has(levelKey)) ||
     !Array.isArray(regions) ||
     regions.length < 2
   ) {
@@ -13898,6 +13900,7 @@ function pruneTransientGeneratedRegions(
   const nextEntries = buildGeneratedRegionCleanupEntries(nextRegions);
   const dominantAreaSqm = Math.max(currentEntries[0]?.areaSqm || 0, 1);
   const absoluteTransientAreaSqm = Math.max(140, cleanupAreaThresholdSqm * 60);
+  const tinyTransientAreaSqm = Math.max(48, cleanupAreaThresholdSqm * 18);
   const keptEntries = [];
 
   for (let index = 0; index < currentEntries.length; index += 1) {
@@ -13917,9 +13920,24 @@ function pruneTransientGeneratedRegions(
       continue;
     }
 
-    const persistsAcrossLevels =
-      hasMeaningfulGeneratedRegionPersistence(entry, previousEntries) ||
-      hasMeaningfulGeneratedRegionPersistence(entry, nextEntries);
+    const persistsInPreviousLevel = hasMeaningfulGeneratedRegionPersistence(
+      entry,
+      previousEntries
+    );
+    const persistsInNextLevel = hasMeaningfulGeneratedRegionPersistence(
+      entry,
+      nextEntries
+    );
+    const persistsAcrossLevels = persistsInPreviousLevel || persistsInNextLevel;
+    const tinyTransientRegion =
+      entry.areaSqm <= tinyTransientAreaSqm || areaRatio <= 0.05;
+
+    if (tinyTransientRegion) {
+      if (persistsInPreviousLevel && persistsInNextLevel) {
+        keptEntries.push(entry);
+      }
+      continue;
+    }
 
     if (persistsAcrossLevels) {
       keptEntries.push(entry);
@@ -13946,7 +13964,10 @@ function pruneTransientGeneratedGroupRegions(siteContext, groups) {
       Number(group?.bottomElevation),
       group?.regions || [],
       groups[index - 1]?.regions || [],
-      groups[index + 1]?.regions || []
+      groups[index + 1]?.regions || [],
+      {
+        allowNativeLevelPruning: true,
+      }
     );
 
     if (prunedRegions.length === (group?.regions || []).length) {
@@ -17846,27 +17867,30 @@ function buildBuildingFootprintCarveProfiles(siteContext) {
 }
 
 function buildRenderableContourBandGroups(siteContext) {
-  const cumulativeGroups = getCachedCumulativeContourBandGroups(siteContext);
+  const sourceBandGroups = pruneTransientGeneratedGroupRegions(
+    siteContext,
+    getCachedContourBandGroups(siteContext)
+  );
   const cleanupAreaThresholdSqm =
     resolveRawAnchoredContourCleanupAreaThreshold(siteContext);
 
-  if (!cumulativeGroups.length) {
-    return cumulativeGroups;
+  if (!sourceBandGroups.length) {
+    return sourceBandGroups;
   }
 
   if (!shouldRemoveTerrainBuildingOverlap(siteContext)) {
-    return cumulativeGroups;
+    return sourceBandGroups;
   }
 
   const buildingCarveProfiles = buildBuildingFootprintCarveProfiles(siteContext);
 
   if (!buildingCarveProfiles.length) {
-    return cumulativeGroups;
+    return sourceBandGroups;
   }
 
   const renderableGroups = [];
 
-  for (const group of cumulativeGroups) {
+  for (const group of sourceBandGroups) {
     const groupMultiPolygon =
       group.multiPolygon || buildPolygonClippingMultiPolygonFromRegions(group.regions);
     let carvedMultiPolygon = groupMultiPolygon;
@@ -17912,26 +17936,26 @@ function buildRenderableContourBandGroups(siteContext) {
     });
   }
 
-  if (cumulativeGroups.rawAnchoredContourTerrainUsed === true) {
+  if (sourceBandGroups.rawAnchoredContourTerrainUsed === true) {
     Object.assign(renderableGroups, {
       rawAnchoredContourTerrainUsed: true,
       rawAnchoredContourBandCount: Number(
-        cumulativeGroups.rawAnchoredContourBandCount || cumulativeGroups.length || 0
+        sourceBandGroups.rawAnchoredContourBandCount || sourceBandGroups.length || 0
       ),
       rawAnchoredContourEntryCount: Number(
-        cumulativeGroups.rawAnchoredContourEntryCount || 0
+        sourceBandGroups.rawAnchoredContourEntryCount || 0
       ),
       rawAnchoredNativeContourLevelCount: Number(
-        cumulativeGroups.rawAnchoredNativeContourLevelCount || 0
+        sourceBandGroups.rawAnchoredNativeContourLevelCount || 0
       ),
       rawAnchoredSourceContourInterval: Number(
-        cumulativeGroups.rawAnchoredSourceContourInterval || 0
+        sourceBandGroups.rawAnchoredSourceContourInterval || 0
       ),
       rawAnchoredGridFallbackBandCount: Number(
-        cumulativeGroups.rawAnchoredGridFallbackBandCount || 0
+        sourceBandGroups.rawAnchoredGridFallbackBandCount || 0
       ),
       rawAnchoredGridFallbackBottomElevations: [
-        ...(cumulativeGroups.rawAnchoredGridFallbackBottomElevations || []),
+        ...(sourceBandGroups.rawAnchoredGridFallbackBottomElevations || []),
       ],
     });
   }
