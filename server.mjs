@@ -9684,6 +9684,23 @@ function buildContourElevationKeySet(contourCollection) {
   );
 }
 
+function buildContourFeatureCountByElevation(contourCollection) {
+  const counts = new Map();
+
+  for (const feature of contourCollection?.features || []) {
+    const elevation = Number(feature?.properties?.elevation);
+
+    if (!Number.isFinite(elevation)) {
+      continue;
+    }
+
+    const levelKey = buildContourLevelKey(elevation);
+    counts.set(levelKey, Number(counts.get(levelKey) || 0) + 1);
+  }
+
+  return counts;
+}
+
 function normalizeBuildingPlacementMode(value) {
   const normalized = String(value || "").trim().toLowerCase();
   return normalized === "remove-overlap" || normalized === "embed-lowest"
@@ -13950,6 +13967,11 @@ function pruneTransientGeneratedGroupRegions(siteContext, groups) {
     interval < sourceContourInterval - 1e-9;
   const cleanupAreaThresholdSqm =
     resolveRawAnchoredContourCleanupAreaThreshold(siteContext);
+  const contourFeatureCountsByElevation = finerThanSource
+    ? buildContourFeatureCountByElevation(
+        siteContext?.exportContourLines || siteContext?.contourLines
+      )
+    : null;
   const prunedGroups = groups.map((group) => ({
     ...group,
     regions: [...(group?.regions || [])],
@@ -14028,6 +14050,80 @@ function pruneTransientGeneratedGroupRegions(siteContext, groups) {
 
       if (supportedEntries.length) {
         normalizedRegions = supportedEntries.map((entry) => entry.region);
+      }
+
+      const contourRegionLimit = Math.max(
+        0,
+        Number(
+          contourFeatureCountsByElevation?.get(
+            buildContourLevelKey(group?.bottomElevation)
+          ) || 0
+        ),
+        Number(
+          contourFeatureCountsByElevation?.get(
+            buildContourLevelKey(group?.topElevation)
+          ) || 0
+        )
+      );
+
+      if (contourRegionLimit > 0 && normalizedRegions.length > contourRegionLimit) {
+        const limitedEntries = buildGeneratedRegionCleanupEntries(normalizedRegions)
+          .map((entry) => {
+            const maximumPreviousOverlap = previousEntries.reduce((maximum, neighborEntry) => {
+              if (!doLocalBoundsOverlap(entry.bounds, neighborEntry?.bounds, 0.05)) {
+                return maximum;
+              }
+
+              const overlapAreaSqm = computeLocalMultiPolygonArea(
+                intersectLocalMultiPolygon(entry.multiPolygon, neighborEntry.multiPolygon)
+              );
+              return Math.max(maximum, overlapAreaSqm);
+            }, 0);
+            const maximumNextOverlap = nextEntries.reduce((maximum, neighborEntry) => {
+              if (!doLocalBoundsOverlap(entry.bounds, neighborEntry?.bounds, 0.05)) {
+                return maximum;
+              }
+
+              const overlapAreaSqm = computeLocalMultiPolygonArea(
+                intersectLocalMultiPolygon(entry.multiPolygon, neighborEntry.multiPolygon)
+              );
+              return Math.max(maximum, overlapAreaSqm);
+            }, 0);
+
+            return {
+              entry,
+              persistenceScore:
+                (maximumPreviousOverlap > 0.001 ? 1 : 0) +
+                (maximumNextOverlap > 0.001 ? 1 : 0),
+              supportAreaSqm: Math.max(maximumPreviousOverlap, maximumNextOverlap),
+              holeCount: Number(entry.region?.holePoints?.length || 0),
+            };
+          })
+          .sort((left, right) => {
+            if (right.persistenceScore !== left.persistenceScore) {
+              return right.persistenceScore - left.persistenceScore;
+            }
+
+            if (right.supportAreaSqm !== left.supportAreaSqm) {
+              return right.supportAreaSqm - left.supportAreaSqm;
+            }
+
+            if (right.entry.outerAreaSqm !== left.entry.outerAreaSqm) {
+              return right.entry.outerAreaSqm - left.entry.outerAreaSqm;
+            }
+
+            if (right.holeCount !== left.holeCount) {
+              return right.holeCount - left.holeCount;
+            }
+
+            return right.entry.areaSqm - left.entry.areaSqm;
+          });
+
+        if (limitedEntries.length > contourRegionLimit) {
+          normalizedRegions = limitedEntries
+            .slice(0, contourRegionLimit)
+            .map(({ entry }) => entry.region);
+        }
       }
     }
 
