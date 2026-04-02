@@ -15884,6 +15884,38 @@ function differenceLocalMultiPolygon(
   }
 }
 
+function normalizeLocalMultiPolygonForBoolean(multiPolygon, minimumAreaSqm = 0.0001) {
+  const regions = buildContourBandRegionsFromMultiPolygon(multiPolygon)
+    .map((region) => ({
+      outerPoints: orientLocalPolygonCounterClockwise(
+        simplifyLocalPolygon(region?.outerPoints || [], 0.01)
+      ),
+      holePoints: (region?.holePoints || [])
+        .map((holePoints) =>
+          orientLocalPolygonClockwise(simplifyLocalPolygon(holePoints || [], 0.01))
+        )
+        .filter(
+          (holePoints) =>
+            holePoints.length >= 3 &&
+            Math.abs(computeLocalPolygonSignedArea(holePoints)) >= minimumAreaSqm
+        ),
+    }))
+    .filter(
+      (region) =>
+        region.outerPoints.length >= 3 &&
+        Math.abs(computeLocalPolygonSignedArea(region.outerPoints)) >= minimumAreaSqm
+    );
+
+  if (!regions.length) {
+    return [];
+  }
+
+  const normalizedMultiPolygon = buildPolygonClippingMultiPolygonFromRegions(regions);
+  return normalizedMultiPolygon.length
+    ? filterTinyLocalMultiPolygonArtifacts(normalizedMultiPolygon, minimumAreaSqm)
+    : [];
+}
+
 function intersectLocalMultiPolygon(baseMultiPolygon, clipMultiPolygon) {
   if (!baseMultiPolygon?.length || !clipMultiPolygon?.length) {
     return [];
@@ -15892,6 +15924,30 @@ function intersectLocalMultiPolygon(baseMultiPolygon, clipMultiPolygon) {
   try {
     return polygonClipping.intersection(baseMultiPolygon, clipMultiPolygon) || [];
   } catch (error) {
+    const normalizedBaseMultiPolygon = normalizeLocalMultiPolygonForBoolean(
+      baseMultiPolygon
+    );
+    const normalizedClipMultiPolygon = normalizeLocalMultiPolygonForBoolean(
+      clipMultiPolygon
+    );
+
+    if (normalizedBaseMultiPolygon.length && normalizedClipMultiPolygon.length) {
+      try {
+        return (
+          polygonClipping.intersection(
+            normalizedBaseMultiPolygon,
+            normalizedClipMultiPolygon
+          ) || []
+        );
+      } catch (retryError) {
+        console.warn(
+          `[terrain-band] raw-contour intersection retry fallback error=${formatErrorForLog(
+            retryError
+          )}`
+        );
+      }
+    }
+
     console.warn(
       `[terrain-band] raw-contour intersection fallback error=${formatErrorForLog(
         error
