@@ -9729,6 +9729,7 @@ function buildGeneratedContourLinesFromResolvedAreas(siteContext, contourInterva
     .map(Number)
     .filter(Number.isFinite)
     .sort((left, right) => left - right);
+  const levelRegionEntries = [];
 
   for (const level of levels) {
     const levelKey = buildContourLevelKey(level);
@@ -9750,7 +9751,32 @@ function buildGeneratedContourLinesFromResolvedAreas(siteContext, contourInterva
       level
     );
 
-    for (const region of regions) {
+    if (!regions.length) {
+      continue;
+    }
+
+    levelRegionEntries.push({
+      level,
+      regions,
+    });
+  }
+
+  const prunedLevelRegionEntries = levelRegionEntries.map((entry, index, entries) => ({
+    level: entry.level,
+    regions: pruneTransientGeneratedRegions(
+      siteContext,
+      entry.level,
+      entry.regions,
+      entries[index - 1]?.regions || [],
+      entries[index + 1]?.regions || []
+    ),
+  }));
+
+  for (const entry of prunedLevelRegionEntries) {
+    const level = Number(entry.level);
+    const levelKey = buildContourLevelKey(level);
+
+    for (const region of entry.regions || []) {
       for (const loop of [region?.outerPoints, ...(region?.holePoints || [])]) {
         const closedLoop = closeRing(dedupeLocalPolygonPoints(loop, 0.001));
 
@@ -13756,6 +13782,212 @@ function cleanupNormalizedContourRegions(
   return dedupedRegions.map((entry) => entry.region);
 }
 
+function buildGeneratedRegionCleanupEntries(regions) {
+  return (regions || [])
+    .map((region) => {
+      const normalizedRegion = {
+        outerPoints: orientLocalPolygonCounterClockwise(region?.outerPoints || []),
+        holePoints: (region?.holePoints || []).map((holePoints) =>
+          orientLocalPolygonClockwise(holePoints || [])
+        ),
+      };
+      const multiPolygon = buildPolygonClippingMultiPolygonFromRegions([normalizedRegion]);
+      const areaSqm = computeLocalMultiPolygonArea(multiPolygon);
+
+      return {
+        region: normalizedRegion,
+        multiPolygon,
+        areaSqm,
+        bounds: computeRegionBounds([normalizedRegion]),
+        interiorPoint: estimateLocalRegionInteriorPoint(normalizedRegion),
+      };
+    })
+    .filter((entry) => entry.region.outerPoints.length >= 3 && entry.areaSqm > 0.001)
+    .sort((left, right) => right.areaSqm - left.areaSqm);
+}
+
+function hasMeaningfulGeneratedRegionPersistence(candidateEntry, neighborEntries) {
+  if (!candidateEntry || !Array.isArray(neighborEntries) || !neighborEntries.length) {
+    return false;
+  }
+
+  for (const neighborEntry of neighborEntries) {
+    if (!neighborEntry) {
+      continue;
+    }
+
+    if (!doLocalBoundsOverlap(candidateEntry.bounds, neighborEntry.bounds, 0.05)) {
+      continue;
+    }
+
+    const overlapAreaSqm = computeLocalMultiPolygonArea(
+      intersectLocalMultiPolygon(
+        candidateEntry.multiPolygon,
+        neighborEntry.multiPolygon
+      )
+    );
+    const coverageRatio = overlapAreaSqm / Math.max(candidateEntry.areaSqm, 1e-6);
+    const precisionRatio = overlapAreaSqm / Math.max(neighborEntry.areaSqm, 1e-6);
+    const overlapThresholdSqm = Math.max(
+      0.8,
+      Math.min(candidateEntry.areaSqm * 0.32, neighborEntry.areaSqm * 0.24)
+    );
+
+    if (
+      overlapAreaSqm >= overlapThresholdSqm &&
+      coverageRatio >= 0.24 &&
+      precisionRatio >= 0.05
+    ) {
+      return true;
+    }
+
+    if (
+      neighborEntry.areaSqm <= candidateEntry.areaSqm * 6 &&
+      candidateEntry.interiorPoint &&
+      isPointInsideOrOnLocalRegion(candidateEntry.interiorPoint, neighborEntry.region)
+    ) {
+      return true;
+    }
+
+    if (
+      candidateEntry.areaSqm <= neighborEntry.areaSqm * 6 &&
+      neighborEntry.interiorPoint &&
+      isPointInsideOrOnLocalRegion(neighborEntry.interiorPoint, candidateEntry.region)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function pruneTransientGeneratedRegions(
+  siteContext,
+  elevation,
+  regions,
+  previousRegions = [],
+  nextRegions = []
+) {
+  const interval = Number(resolveEffectiveContourBandInterval(siteContext) || 0);
+  const sourceContourInterval = Number(resolveSourceContourInterval(siteContext) || 0);
+  const finerThanSource =
+    interval > 0 &&
+    sourceContourInterval > 0 &&
+    interval < sourceContourInterval - 1e-9;
+  const nativeLevelKeys = buildContourElevationKeySet(siteContext?.contourLines);
+  const levelKey = buildContourLevelKey(elevation);
+
+  if (
+    !finerThanSource ||
+    nativeLevelKeys.has(levelKey) ||
+    !Array.isArray(regions) ||
+    regions.length < 2
+  ) {
+    return regions || [];
+  }
+
+  const cleanupAreaThresholdSqm =
+    resolveRawAnchoredContourCleanupAreaThreshold(siteContext);
+  const currentEntries = buildGeneratedRegionCleanupEntries(regions);
+
+  if (currentEntries.length < 2) {
+    return regions || [];
+  }
+
+  const previousEntries = buildGeneratedRegionCleanupEntries(previousRegions);
+  const nextEntries = buildGeneratedRegionCleanupEntries(nextRegions);
+  const dominantAreaSqm = Math.max(currentEntries[0]?.areaSqm || 0, 1);
+  const absoluteTransientAreaSqm = Math.max(140, cleanupAreaThresholdSqm * 60);
+  const keptEntries = [];
+
+  for (let index = 0; index < currentEntries.length; index += 1) {
+    const entry = currentEntries[index];
+
+    if (index === 0) {
+      keptEntries.push(entry);
+      continue;
+    }
+
+    const areaRatio = entry.areaSqm / dominantAreaSqm;
+    const transientSizedRegion =
+      entry.areaSqm <= absoluteTransientAreaSqm || areaRatio <= 0.12;
+
+    if (!transientSizedRegion || areaRatio >= 0.28) {
+      keptEntries.push(entry);
+      continue;
+    }
+
+    const persistsAcrossLevels =
+      hasMeaningfulGeneratedRegionPersistence(entry, previousEntries) ||
+      hasMeaningfulGeneratedRegionPersistence(entry, nextEntries);
+
+    if (persistsAcrossLevels) {
+      keptEntries.push(entry);
+    }
+  }
+
+  return keptEntries.length ? keptEntries.map((entry) => entry.region) : regions || [];
+}
+
+function pruneTransientGeneratedGroupRegions(siteContext, groups) {
+  if (!Array.isArray(groups) || !groups.length) {
+    return groups || [];
+  }
+
+  const prunedGroups = groups.map((group) => ({
+    ...group,
+    regions: [...(group?.regions || [])],
+  }));
+
+  for (let index = 0; index < prunedGroups.length; index += 1) {
+    const group = prunedGroups[index];
+    const prunedRegions = pruneTransientGeneratedRegions(
+      siteContext,
+      Number(group?.bottomElevation),
+      group?.regions || [],
+      groups[index - 1]?.regions || [],
+      groups[index + 1]?.regions || []
+    );
+
+    if (prunedRegions.length === (group?.regions || []).length) {
+      continue;
+    }
+
+    const multiPolygon = buildPolygonClippingMultiPolygonFromRegions(prunedRegions);
+
+    if (!multiPolygon.length) {
+      continue;
+    }
+
+    group.regions = prunedRegions;
+    group.boundaryLoops = prunedRegions.flatMap((region) => [
+      region.outerPoints,
+      ...(region.holePoints || []),
+    ]);
+    group.multiPolygon = multiPolygon;
+    group.bounds = computeRegionBounds(prunedRegions);
+  }
+
+  for (const key of [
+    "rawAnchoredContourTerrainUsed",
+    "rawAnchoredContourBandCount",
+    "rawAnchoredContourEntryCount",
+    "rawAnchoredNativeContourLevelCount",
+    "rawAnchoredSourceContourInterval",
+    "rawAnchoredGridFallbackBandCount",
+    "rawAnchoredGridFallbackBottomElevations",
+    "rawAnchoredExactNativeIntervalUsed",
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(groups, key)) {
+      prunedGroups[key] = Array.isArray(groups[key])
+        ? [...groups[key]]
+        : groups[key];
+    }
+  }
+
+  return prunedGroups;
+}
+
 function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
   const clipRect = buildLocalClipRect(siteContext);
   const levelKey = buildContourLevelKey(elevation);
@@ -17331,7 +17563,12 @@ function buildCumulativeContourBandGroups(siteContext) {
       }
 
       if (directCumulativeGroups.length === bandGroups.length) {
-        Object.assign(directCumulativeGroups, {
+        const prunedDirectCumulativeGroups = pruneTransientGeneratedGroupRegions(
+          siteContext,
+          directCumulativeGroups
+        );
+
+        Object.assign(prunedDirectCumulativeGroups, {
           rawAnchoredContourTerrainUsed: true,
           rawAnchoredContourBandCount: Number(
             bandGroups.rawAnchoredContourBandCount || bandGroups.length || 0
@@ -17353,7 +17590,7 @@ function buildCumulativeContourBandGroups(siteContext) {
           ],
         });
 
-        return directCumulativeGroups;
+        return prunedDirectCumulativeGroups;
       }
     }
   }
@@ -17410,7 +17647,10 @@ function buildCumulativeContourBandGroups(siteContext) {
     cumulativeMultiPolygon = nextMultiPolygon;
   }
 
-  const cumulativeGroups = cumulativeDescending.reverse();
+  const cumulativeGroups = pruneTransientGeneratedGroupRegions(
+    siteContext,
+    cumulativeDescending.reverse()
+  );
 
   if (bandGroups.rawAnchoredContourTerrainUsed === true) {
     Object.assign(cumulativeGroups, {
@@ -17607,6 +17847,8 @@ function buildBuildingFootprintCarveProfiles(siteContext) {
 
 function buildRenderableContourBandGroups(siteContext) {
   const cumulativeGroups = getCachedCumulativeContourBandGroups(siteContext);
+  const cleanupAreaThresholdSqm =
+    resolveRawAnchoredContourCleanupAreaThreshold(siteContext);
 
   if (!cumulativeGroups.length) {
     return cumulativeGroups;
@@ -17649,6 +17891,10 @@ function buildRenderableContourBandGroups(siteContext) {
       }
     }
 
+    carvedMultiPolygon = filterTinyLocalMultiPolygonArtifacts(
+      carvedMultiPolygon,
+      Math.max(0.08, cleanupAreaThresholdSqm * 0.45)
+    );
     const regions = buildContourBandRegionsFromMultiPolygon(carvedMultiPolygon);
 
     if (!regions.length) {
@@ -17946,6 +18192,8 @@ function boundsOverlap(left, right, toleranceMeters = 0) {
 
 function buildContourTopSurfaceGroups(siteContext) {
   const bandGroups = getCachedCumulativeContourBandGroups(siteContext);
+  const cleanupAreaThresholdSqm =
+    resolveRawAnchoredContourCleanupAreaThreshold(siteContext);
 
   if (!bandGroups.length) {
     return [];
@@ -17980,6 +18228,11 @@ function buildContourTopSurfaceGroups(siteContext) {
         }
       );
     }
+
+    topSurfaceMultiPolygon = filterTinyLocalMultiPolygonArtifacts(
+      topSurfaceMultiPolygon,
+      Math.max(0.08, cleanupAreaThresholdSqm * 0.45)
+    );
 
     const areaSqm = computeLocalMultiPolygonArea(topSurfaceMultiPolygon);
 
