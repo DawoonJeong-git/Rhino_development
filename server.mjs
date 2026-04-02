@@ -13504,6 +13504,74 @@ function normalizeContourBoundaryLoop(
     return dedupeLocalPolygonPoints(points, 0.001);
   }
 
+  const baselinePolygon = polygon.map((point) => [Number(point[0]), Number(point[1])]);
+  const selfIntersectionTolerance = Math.max(
+    0.001,
+    Math.min(
+      0.05,
+      Math.max(simplifyTolerance * 0.35, minSegmentLength * 0.18)
+    )
+  );
+  const normalizeSimpleCandidate = (
+    candidate,
+    snapTolerance = Math.max(
+      clipRect?.boundarySnapTolerance || 0,
+      simplifyTolerance * (smoothGenerated ? 16 : 12)
+    )
+  ) => {
+    let normalized = dedupeLocalPolygonPoints(candidate || [], 0.001);
+
+    if (normalized.length < 3) {
+      return null;
+    }
+
+    if (clipRect) {
+      normalized = snapContourBoundaryLoopToClipRect(
+        normalized,
+        clipRect,
+        snapTolerance
+      );
+    }
+
+    if (
+      !hasLocalPolygonSelfIntersection(normalized, selfIntersectionTolerance) &&
+      Math.abs(computeLocalPolygonSignedArea(normalized)) >= 0.01
+    ) {
+      return normalized;
+    }
+
+    const repaired = sanitizeSketchUpSolidLoop(normalized, {
+      orientation: "ccw",
+      minAreaMeters: 0.01,
+      minSegmentMeters: Math.max(0.02, minSegmentLength * 0.55),
+      repairTolerance: Math.max(0.08, simplifyTolerance * 2.4),
+    });
+
+    if (!repaired?.length) {
+      return null;
+    }
+
+    const snappedRepaired = clipRect
+      ? snapContourBoundaryLoopToClipRect(repaired, clipRect, snapTolerance)
+      : repaired;
+
+    if (
+      !hasLocalPolygonSelfIntersection(snappedRepaired, selfIntersectionTolerance) &&
+      Math.abs(computeLocalPolygonSignedArea(snappedRepaired)) >= 0.01
+    ) {
+      return snappedRepaired;
+    }
+
+    if (
+      !hasLocalPolygonSelfIntersection(repaired, selfIntersectionTolerance) &&
+      Math.abs(computeLocalPolygonSignedArea(repaired)) >= 0.01
+    ) {
+      return repaired;
+    }
+
+    return null;
+  };
+
   const axisAlignedRatio = computeLocalLoopAxisAlignedSegmentRatio(polygon);
 
   if (
@@ -13559,6 +13627,17 @@ function normalizeContourBoundaryLoop(
       }
     }
   }
+
+  polygon =
+    normalizeSimpleCandidate(polygon) ||
+    normalizeSimpleCandidate(
+      baselinePolygon,
+      Math.max(
+        clipRect?.boundarySnapTolerance || 0,
+        simplifyTolerance * (smoothGenerated ? 14 : 10)
+      )
+    ) ||
+    baselinePolygon;
 
   return polygon.length >= 3 ? polygon : dedupeLocalPolygonPoints(points, 0.001);
 }
@@ -19987,12 +20066,21 @@ function appendSketchUpTerrainSegmentSolids(
         simplifyTolerance > 0
           ? simplifySketchUpSolidRegion(region, simplifyTolerance)
           : region;
-      const terrainSolid = buildSketchUpRegionSolidDefinition(
+      let terrainSolid = buildSketchUpRegionSolidDefinition(
         exportRegion,
         topElevation,
         bottomElevation,
         sanitizeOptions
       );
+
+      if (!terrainSolid && layerKind === "roads") {
+        terrainSolid = buildSketchUpRegionSolidDefinition(
+          exportRegion,
+          topElevation,
+          bottomElevation,
+          null
+        );
+      }
 
       if (terrainSolid) {
         bucket.push(terrainSolid);
