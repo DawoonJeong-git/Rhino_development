@@ -996,6 +996,34 @@ function resolveNativeContourTerrainRefineStep(siteContext) {
   return Number(targetStep.toFixed(3));
 }
 
+function resolveNativeContourAnchorTerrainGrid(siteContext) {
+  const anchorGrid = siteContext?.nativeContourAnchorGrid;
+  const sourceContourInterval = resolveSourceContourInterval(siteContext);
+
+  if (
+    anchorGrid?.elevations?.length &&
+    Number.isFinite(sourceContourInterval) &&
+    sourceContourInterval >= 5 - 1e-9
+  ) {
+    return anchorGrid;
+  }
+
+  return siteContext?.terrainGrid || null;
+}
+
+function buildNativeContourAnchorSiteContext(siteContext) {
+  const anchorGrid = resolveNativeContourAnchorTerrainGrid(siteContext);
+
+  if (!anchorGrid || anchorGrid === siteContext?.terrainGrid) {
+    return siteContext;
+  }
+
+  return {
+    ...siteContext,
+    terrainGrid: anchorGrid,
+  };
+}
+
 function maybeRefineNativeContourTerrainGrid(siteContext) {
   if (!shouldRefineNativeContourTerrainGrid(siteContext)) {
     return siteContext;
@@ -1018,13 +1046,29 @@ function maybeRefineNativeContourTerrainGrid(siteContext) {
       siteContext.clipBoundary,
       siteContext.contourLines,
       resolveSourceContourInterval(siteContext),
-      { sampleStep: targetStep }
+      {
+        sampleStep: targetStep,
+        referenceTerrainGrid: siteContext.terrainGrid,
+      }
     );
 
     if (refinedGrid?.elevations?.length) {
+      if (
+        !siteContext?.nativeContourAnchorGrid?.elevations?.length &&
+        siteContext?.terrainGrid?.elevations?.length
+      ) {
+        siteContext.nativeContourAnchorGrid = siteContext.terrainGrid;
+      }
+
       siteContext.terrainGrid = refinedGrid;
       siteContext.stats = {
         ...(siteContext?.stats || {}),
+        nativeContourAnchorGridStep:
+          Number(siteContext?.nativeContourAnchorGrid?.step) > 0
+            ? Number(Number(siteContext.nativeContourAnchorGrid.step).toFixed(3))
+            : Number.isFinite(currentStep)
+              ? Number(currentStep.toFixed(3))
+              : null,
         nativeContourTerrainGridRefined: true,
         nativeContourTerrainGridSourceStep: Number.isFinite(currentStep)
           ? Number(currentStep.toFixed(3))
@@ -8916,6 +8960,128 @@ function resolveContourDrivenSampleStep(widthMeters, heightMeters, contourInterv
   );
 }
 
+function buildContourAreaAboveByLevelFromReferenceGrid(
+  location,
+  clipFeature,
+  contourCollection,
+  contourInterval,
+  referenceTerrainGrid
+) {
+  if (
+    !location ||
+    !clipFeature ||
+    !contourCollection?.features?.length ||
+    !referenceTerrainGrid?.elevations?.length
+  ) {
+    return null;
+  }
+
+  const workingSiteContext = {
+    location,
+    clipBoundary: clipFeature,
+    contourLines: contourCollection,
+    terrainGrid: referenceTerrainGrid,
+    options: {
+      terrainMode: "contour",
+      contourInterval: Number(contourInterval || 0),
+    },
+    stats: {},
+  };
+  const clipRect = buildLocalClipRect(workingSiteContext);
+
+  if (!clipRect) {
+    return null;
+  }
+
+  workingSiteContext.stats.clipAreaSqm = Number(
+    computeLocalMultiPolygonArea(clipRect.multiPolygon).toFixed(3)
+  );
+  const contourEntries = buildRawAnchoredContourEntries(
+    workingSiteContext,
+    clipRect,
+    contourCollection
+  );
+
+  if (!contourEntries.length) {
+    return null;
+  }
+
+  const entriesByLevel = new Map();
+  const areaAboveByLevel = new Map();
+  const levels = [...new Set(contourEntries.map((entry) => Number(entry.elevation)))]
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  let cumulativeMultiPolygon = [];
+
+  for (const entry of contourEntries) {
+    const levelKey = buildContourLevelKey(entry.elevation);
+
+    if (!entriesByLevel.has(levelKey)) {
+      entriesByLevel.set(levelKey, []);
+    }
+
+    entriesByLevel.get(levelKey).push(entry.multiPolygon || []);
+  }
+
+  for (const level of [...levels].sort((left, right) => right - left)) {
+    const levelMultiPolygons =
+      (entriesByLevel.get(buildContourLevelKey(level)) || []).filter(
+        (multiPolygon) => Array.isArray(multiPolygon) && multiPolygon.length
+      );
+    cumulativeMultiPolygon = unionLocalMultiPolygons([
+      ...levelMultiPolygons,
+      ...(cumulativeMultiPolygon.length ? [cumulativeMultiPolygon] : []),
+    ]);
+
+    if (cumulativeMultiPolygon.length) {
+      areaAboveByLevel.set(buildContourLevelKey(level), cumulativeMultiPolygon);
+    }
+  }
+
+  return {
+    levels,
+    areaAboveByLevel,
+  };
+}
+
+function resolveContourElevationBracketForLocalPoint(
+  point,
+  contourAreaReference
+) {
+  if (
+    !Array.isArray(point) ||
+    point.length < 2 ||
+    !Number.isFinite(point[0]) ||
+    !Number.isFinite(point[1]) ||
+    !contourAreaReference?.levels?.length ||
+    !(contourAreaReference.areaAboveByLevel instanceof Map)
+  ) {
+    return null;
+  }
+
+  let lowerLevel = null;
+
+  for (const level of contourAreaReference.levels) {
+    const multiPolygon =
+      contourAreaReference.areaAboveByLevel.get(buildContourLevelKey(level)) || [];
+    const regions = buildContourBandRegionsFromMultiPolygon(multiPolygon);
+
+    if (isPointInsideOrOnAnyLocalRegion(point, regions)) {
+      lowerLevel = level;
+    }
+  }
+
+  const upperLevel =
+    lowerLevel === null
+      ? contourAreaReference.levels[0] ?? null
+      : contourAreaReference.levels.find((level) => level > lowerLevel + 0.001) ?? null;
+
+  return {
+    lowerLevel,
+    upperLevel,
+  };
+}
+
 function buildTerrainSampleGridWithExplicitStep(location, clipFeature, step) {
   const clipRing = getOuterRing(clipFeature);
   const bounds = polygonBounds(clipRing);
@@ -9129,6 +9295,13 @@ function buildTerrainGridFromContourCollection(
     clipFeature,
     step
   );
+  const contourAreaReference = buildContourAreaAboveByLevelFromReferenceGrid(
+    location,
+    clipFeature,
+    contourCollection,
+    contourInterval,
+    options?.referenceTerrainGrid || null
+  );
   const elevations = [];
   const numericElevations = [];
 
@@ -9150,8 +9323,23 @@ function buildTerrainGridFromContourCollection(
       );
 
       if (Number.isFinite(elevation)) {
-        elevationRow.push(elevation);
-        numericElevations.push(elevation);
+        const bracket = resolveContourElevationBracketForLocalPoint(
+          [point.x, point.y],
+          contourAreaReference
+        );
+        let constrainedElevation = elevation;
+
+        if (Number.isFinite(bracket?.lowerLevel)) {
+          constrainedElevation = Math.max(constrainedElevation, Number(bracket.lowerLevel));
+        }
+
+        if (Number.isFinite(bracket?.upperLevel)) {
+          constrainedElevation = Math.min(constrainedElevation, Number(bracket.upperLevel));
+        }
+
+        const normalizedElevation = Number(constrainedElevation.toFixed(3));
+        elevationRow.push(normalizedElevation);
+        numericElevations.push(normalizedElevation);
       } else {
         elevationRow.push(null);
       }
@@ -9287,7 +9475,8 @@ async function resolveTerrainContext(location, clipFeature, options, config) {
         location,
         clipFeature,
         contourSource.collection,
-        sourceContourInterval
+        sourceContourInterval,
+        { referenceTerrainGrid: sampleFallbackGrid }
       );
 
       if (contourTerrainGrid?.elevations?.length) {
@@ -17251,6 +17440,7 @@ function resolveHigherContourSideCandidate(
   seed,
   referenceMultiPolygon = null
 ) {
+  const selectionSiteContext = buildNativeContourAnchorSiteContext(siteContext);
   const comparisonTolerance = Math.max(
     0.02,
     resolveEffectiveContourBandInterval(siteContext) * 0.12
@@ -17269,14 +17459,20 @@ function resolveHigherContourSideCandidate(
     referenceAreaSqm > 0
       ? buildContourBandRegionsFromMultiPolygon(normalizedReferenceMultiPolygon)
       : [];
-  const clipAreaSqm = Number(siteContext?.stats?.clipAreaSqm || 0);
+  const clipAreaSqm = Number(
+    selectionSiteContext?.stats?.clipAreaSqm || siteContext?.stats?.clipAreaSqm || 0
+  );
   const rawCandidates = (candidateMultiPolygons || [])
     .map((multiPolygon, index) => ({
       index,
       multiPolygon,
-      sampleElevation: sampleLocalMultiPolygonElevation(siteContext, multiPolygon, seed),
+      sampleElevation: sampleLocalMultiPolygonElevation(
+        selectionSiteContext,
+        multiPolygon,
+        seed
+      ),
       terrainSupport: summarizeLocalMultiPolygonTerrainSupport(
-        siteContext,
+        selectionSiteContext,
         multiPolygon,
         elevation,
         Math.max(0.15, comparisonTolerance * 0.9)
@@ -18073,7 +18269,8 @@ function buildRawAnchoredContourBandAssembly(
   siteContext,
   { includeLevelDiagnostics = false } = {}
 ) {
-  const terrainGrid = siteContext?.terrainGrid;
+  const anchorSiteContext = buildNativeContourAnchorSiteContext(siteContext);
+  const terrainGrid = resolveNativeContourAnchorTerrainGrid(siteContext);
   const cleanupAreaThresholdSqm =
     resolveRawAnchoredContourCleanupAreaThreshold(siteContext);
   const emptyResult = {
@@ -18128,12 +18325,12 @@ function buildRawAnchoredContourBandAssembly(
   const selectionReferenceInterval = interval > 1 ? Math.min(1, interval) : interval;
   const selectionGridAreaResult =
     Math.abs(selectionReferenceInterval - interval) <= 1e-9
-      ? buildGridAreaAboveByLevel(siteContext)
-      : buildGridAreaAboveByLevel(siteContext, {
+      ? buildGridAreaAboveByLevel(anchorSiteContext)
+      : buildGridAreaAboveByLevel(anchorSiteContext, {
           intervalOverride: selectionReferenceInterval,
         });
   const contourEntries = buildRawAnchoredContourEntries(
-    siteContext,
+    anchorSiteContext,
     clipRect,
     nativeContourCollection,
     {
@@ -18656,7 +18853,8 @@ function buildRawAnchoredContourBandAssembly(
 }
 
 function buildRawAnchoredContourBandDiagnostics(siteContext) {
-  const terrainGrid = siteContext?.terrainGrid;
+  const anchorSiteContext = buildNativeContourAnchorSiteContext(siteContext);
+  const terrainGrid = resolveNativeContourAnchorTerrainGrid(siteContext);
   const cleanupAreaThresholdSqm = resolveRawAnchoredContourCleanupAreaThreshold(siteContext);
   const clipRect = buildLocalClipRect(siteContext);
   const nativeContourCollection = featureCollection(
@@ -18668,12 +18866,12 @@ function buildRawAnchoredContourBandDiagnostics(siteContext) {
   const selectionReferenceInterval = interval > 1 ? Math.min(1, interval) : interval;
   const selectionGridAreaResult =
     Math.abs(selectionReferenceInterval - interval) <= 1e-9
-      ? buildGridAreaAboveByLevel(siteContext)
-      : buildGridAreaAboveByLevel(siteContext, {
+      ? buildGridAreaAboveByLevel(anchorSiteContext)
+      : buildGridAreaAboveByLevel(anchorSiteContext, {
           intervalOverride: selectionReferenceInterval,
         });
   const diagnosticContourEntries = clipRect
-    ? buildRawAnchoredContourEntries(siteContext, clipRect, nativeContourCollection, {
+    ? buildRawAnchoredContourEntries(anchorSiteContext, clipRect, nativeContourCollection, {
         resolveReferenceAreaAboveLevel: selectionGridAreaResult.resolveAreaAboveLevel,
         includeSelectionDiagnostics: true,
       })
