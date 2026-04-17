@@ -4,6 +4,8 @@ import {
   build3dmFromSiteContext,
   buildSketchUpPayloadFromSiteContext,
   buildObjFromSiteContext,
+  getRhino3dm,
+  localMetersFromLngLat,
   resolveContourTerrainRenderPlan,
 } from "../server.mjs";
 
@@ -87,6 +89,129 @@ function summarizeExportContext(siteContext, format) {
   };
 }
 
+function computeClipBounds(siteContext) {
+  const ring = siteContext?.clipBoundary?.geometry?.coordinates?.[0];
+
+  if (!Array.isArray(ring) || !siteContext?.location) {
+    return null;
+  }
+
+  const points = ring
+    .map((point) => localMetersFromLngLat(point, siteContext.location))
+    .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+
+  if (points.length < 3) {
+    return null;
+  }
+
+  return points.reduce(
+    (acc, [xMeters, yMeters]) => ({
+      minX: Math.min(acc.minX, xMeters),
+      minY: Math.min(acc.minY, yMeters),
+      maxX: Math.max(acc.maxX, xMeters),
+      maxY: Math.max(acc.maxY, yMeters),
+    }),
+    {
+      minX: Number.POSITIVE_INFINITY,
+      minY: Number.POSITIVE_INFINITY,
+      maxX: Number.NEGATIVE_INFINITY,
+      maxY: Number.NEGATIVE_INFINITY,
+    }
+  );
+}
+
+async function summarize3dmTerrainBands(threeDmBytes, exportSiteContext) {
+  const clipBounds = computeClipBounds(exportSiteContext);
+
+  if (!clipBounds) {
+    return {
+      bandCount: 0,
+      fullFootprintBandCount: 0,
+      leadingFullFootprintBandCount: 0,
+      trailingFullFootprintBandCount: 0,
+      trailingFullFootprintBands: [],
+    };
+  }
+
+  const clipWidth = clipBounds.maxX - clipBounds.minX;
+  const clipHeight = clipBounds.maxY - clipBounds.minY;
+  const rhino = await getRhino3dm();
+  const model = rhino.File3dm.fromByteArray(Uint8Array.from(threeDmBytes));
+  const layers = model.layers();
+  const objects = model.objects();
+  const layerNames = new Map();
+
+  for (let index = 0; index < layers.count; index += 1) {
+    const layer = layers.get(index);
+    layerNames.set(layer.index, layer.name);
+  }
+
+  const terrainBands = [];
+
+  for (let index = 0; index < objects.count; index += 1) {
+    const object = objects.get(index);
+    const attributes = object.attributes();
+    const layerName = layerNames.get(attributes.layerIndex);
+    const objectName = String(attributes.name || "").trim();
+
+    if (layerName !== "terrain" || !objectName.startsWith("TERRAIN_BAND_")) {
+      continue;
+    }
+
+    const geometry = object.geometry();
+    const bbox = geometry?.getBoundingBox ? geometry.getBoundingBox() : null;
+
+    if (!bbox) {
+      continue;
+    }
+
+    const width = Number((bbox.max.x - bbox.min.x).toFixed(3));
+    const height = Number((bbox.max.y - bbox.min.y).toFixed(3));
+    const minZ = Number(bbox.min.z.toFixed(3));
+    const maxZ = Number(bbox.max.z.toFixed(3));
+
+    terrainBands.push({
+      name: objectName,
+      width,
+      height,
+      minZ,
+      maxZ,
+      fullFootprint: width >= clipWidth - 0.5 && height >= clipHeight - 0.5,
+    });
+  }
+
+  terrainBands.sort((left, right) => left.minZ - right.minZ || left.maxZ - right.maxZ);
+
+  let leadingFullFootprintBandCount = 0;
+
+  for (const band of terrainBands) {
+    if (!band.fullFootprint) {
+      break;
+    }
+
+    leadingFullFootprintBandCount += 1;
+  }
+
+  const trailingFullFootprintBands = terrainBands
+    .slice(leadingFullFootprintBandCount)
+    .filter((band) => band.fullFootprint)
+    .map((band) => ({
+      name: band.name,
+      minZ: band.minZ,
+      maxZ: band.maxZ,
+      width: band.width,
+      height: band.height,
+    }));
+
+  return {
+    bandCount: terrainBands.length,
+    fullFootprintBandCount: terrainBands.filter((band) => band.fullFootprint).length,
+    leadingFullFootprintBandCount,
+    trailingFullFootprintBandCount: trailingFullFootprintBands.length,
+    trailingFullFootprintBands,
+  };
+}
+
 async function verifyCase(testCase) {
   const siteContext = await fetchJson("/api/site-context", {
     location: testCase.location,
@@ -98,6 +223,20 @@ async function verifyCase(testCase) {
   const obj = summarizeExportContext(siteContext, "obj");
 
   const threeDmBytes = await build3dmFromSiteContext(threeDm.exportSiteContext);
+  const threeDmTerrainBands = await summarize3dmTerrainBands(
+    threeDmBytes,
+    threeDm.exportSiteContext
+  );
+
+  if (threeDmTerrainBands.trailingFullFootprintBandCount > 0) {
+    throw new Error(
+      `3dm terrain pathology detected for ${testCase.name}: trailing full-footprint bands ` +
+        `${threeDmTerrainBands.trailingFullFootprintBands
+          .map((band) => `${band.name}@${band.minZ}-${band.maxZ}`)
+          .join(", ")}`
+    );
+  }
+
   const skpPayload = buildSketchUpPayloadFromSiteContext(skp.exportSiteContext);
   const objText = buildObjFromSiteContext(obj.exportSiteContext);
 
@@ -125,6 +264,7 @@ async function verifyCase(testCase) {
           threeDm.terrainPlan?.bandGroups?.rawAnchoredGridFallbackBandCount || 0
         ),
         bytes: threeDmBytes.length,
+        terrainBands: threeDmTerrainBands,
       },
       skp: {
         requested: skp.requested,

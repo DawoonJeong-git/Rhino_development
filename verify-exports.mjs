@@ -293,6 +293,7 @@ function summarizeExportContext(siteContext, format) {
     },
     format
   );
+  const terrainPlan = resolveContourTerrainRenderPlan(exportSiteContext);
 
   return {
     exportSiteContext,
@@ -300,6 +301,7 @@ function summarizeExportContext(siteContext, format) {
     source: exportSiteContext.stats?.sourceContourInterval,
     effective: exportSiteContext.stats?.effectiveContourBandInterval,
     contourCount: exportSiteContext?.contourLines?.features?.length || 0,
+    terrainPlan,
   };
 }
 
@@ -332,6 +334,259 @@ async function summarize3dmCurveHeights(threeDmBytes) {
   return {
     curveCount,
     maxAbsZ: Number(maxAbsZ.toFixed(6)),
+  };
+}
+
+function computeClipBounds(siteContext) {
+  const ring = siteContext?.clipBoundary?.geometry?.coordinates?.[0];
+
+  if (!Array.isArray(ring) || !siteContext?.location) {
+    return null;
+  }
+
+  const points = ring
+    .map((point) => localMetersFromLngLat(point, siteContext.location))
+    .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+
+  if (points.length < 3) {
+    return null;
+  }
+
+  return points.reduce(
+    (acc, [xMeters, yMeters]) => ({
+      minX: Math.min(acc.minX, xMeters),
+      minY: Math.min(acc.minY, yMeters),
+      maxX: Math.max(acc.maxX, xMeters),
+      maxY: Math.max(acc.maxY, yMeters),
+    }),
+    {
+      minX: Number.POSITIVE_INFINITY,
+      minY: Number.POSITIVE_INFINITY,
+      maxX: Number.NEGATIVE_INFINITY,
+      maxY: Number.NEGATIVE_INFINITY,
+    }
+  );
+}
+
+async function summarize3dmTerrainBands(threeDmBytes, exportSiteContext) {
+  const clipBounds = computeClipBounds(exportSiteContext);
+
+  if (!clipBounds) {
+    return {
+      bandCount: 0,
+      fullFootprintBandCount: 0,
+      leadingFullFootprintBandCount: 0,
+      trailingFullFootprintBandCount: 0,
+      trailingFullFootprintBands: [],
+    };
+  }
+
+  const clipWidth = clipBounds.maxX - clipBounds.minX;
+  const clipHeight = clipBounds.maxY - clipBounds.minY;
+  const rhino = await getRhino3dm();
+  const doc = rhino.File3dm.fromByteArray(threeDmBytes);
+  const layers = doc.layers();
+  const objects = doc.objects();
+  const layerNames = new Map();
+
+  for (let index = 0; index < layers.count; index += 1) {
+    const layer = layers.get(index);
+    layerNames.set(layer.index, layer.name);
+  }
+
+  const terrainBands = [];
+  const readBBoxAxis = (point, axisIndex, axisName) => {
+    const arrayValue = Number(point?.[axisIndex]);
+
+    if (Number.isFinite(arrayValue)) {
+      return arrayValue;
+    }
+
+    const upperValue = Number(point?.[axisName]);
+
+    if (Number.isFinite(upperValue)) {
+      return upperValue;
+    }
+
+    const lowerValue = Number(point?.[String(axisName || "").toLowerCase()]);
+    return Number.isFinite(lowerValue) ? lowerValue : null;
+  };
+  const boundsFromBox = (bbox) => {
+    if (!bbox) {
+      return null;
+    }
+
+    const minPoint = bbox.min || bbox.Min || null;
+    const maxPoint = bbox.max || bbox.Max || null;
+    const minX = readBBoxAxis(minPoint, 0, "X");
+    const minY = readBBoxAxis(minPoint, 1, "Y");
+    const minZ = readBBoxAxis(minPoint, 2, "Z");
+    const maxX = readBBoxAxis(maxPoint, 0, "X");
+    const maxY = readBBoxAxis(maxPoint, 1, "Y");
+    const maxZ = readBBoxAxis(maxPoint, 2, "Z");
+
+    return [minX, minY, minZ, maxX, maxY, maxZ].every(Number.isFinite)
+      ? { minX, minY, minZ, maxX, maxY, maxZ }
+      : null;
+  };
+  const computeGeometryBounds = (geometry) => {
+    if (!geometry) {
+      return null;
+    }
+
+    const edges = typeof geometry.edges === "function" ? geometry.edges() : null;
+
+    if (edges?.count > 0) {
+      let edgeBounds = null;
+
+      for (let edgeIndex = 0; edgeIndex < edges.count; edgeIndex += 1) {
+        const edge = edges.get(edgeIndex);
+        const currentBounds = boundsFromBox(edge?.getBoundingBox ? edge.getBoundingBox() : null);
+
+        if (!currentBounds) {
+          continue;
+        }
+
+        if (!edgeBounds) {
+          edgeBounds = { ...currentBounds };
+          continue;
+        }
+
+        edgeBounds.minX = Math.min(edgeBounds.minX, currentBounds.minX);
+        edgeBounds.minY = Math.min(edgeBounds.minY, currentBounds.minY);
+        edgeBounds.minZ = Math.min(edgeBounds.minZ, currentBounds.minZ);
+        edgeBounds.maxX = Math.max(edgeBounds.maxX, currentBounds.maxX);
+        edgeBounds.maxY = Math.max(edgeBounds.maxY, currentBounds.maxY);
+        edgeBounds.maxZ = Math.max(edgeBounds.maxZ, currentBounds.maxZ);
+      }
+
+      if (edgeBounds) {
+        return edgeBounds;
+      }
+    }
+
+    return boundsFromBox(geometry?.getBoundingBox ? geometry.getBoundingBox() : null);
+  };
+
+  for (let index = 0; index < objects.count; index += 1) {
+    const object = objects.get(index);
+    const attributes = object.attributes();
+    const layerName = layerNames.get(attributes.layerIndex);
+    const objectName = String(attributes.name || "").trim();
+
+    if (layerName !== "terrain") {
+      continue;
+    }
+
+    const geometry = object.geometry();
+    const geometryBounds = computeGeometryBounds(geometry);
+
+    if (!geometryBounds) {
+      continue;
+    }
+    const width = Number((geometryBounds.maxX - geometryBounds.minX).toFixed(3));
+    const height = Number((geometryBounds.maxY - geometryBounds.minY).toFixed(3));
+    const minZ = Number(geometryBounds.minZ.toFixed(3));
+    const maxZ = Number(geometryBounds.maxZ.toFixed(3));
+
+    terrainBands.push({
+      name: objectName || `terrain_${index + 1}`,
+      width,
+      height,
+      minZ,
+      maxZ,
+      fullFootprint: width >= clipWidth - 0.5 && height >= clipHeight - 0.5,
+    });
+  }
+
+  terrainBands.sort((left, right) => left.minZ - right.minZ || left.maxZ - right.maxZ);
+
+  let leadingFullFootprintBandCount = 0;
+
+  for (const band of terrainBands) {
+    if (!band.fullFootprint) {
+      break;
+    }
+
+    leadingFullFootprintBandCount += 1;
+  }
+
+  const trailingFullFootprintBands = terrainBands
+    .slice(leadingFullFootprintBandCount)
+    .filter((band) => band.fullFootprint)
+    .map((band) => ({
+      name: band.name,
+      minZ: band.minZ,
+      maxZ: band.maxZ,
+      width: band.width,
+      height: band.height,
+    }));
+
+  return {
+    bandCount: terrainBands.length,
+    fullFootprintBandCount: terrainBands.filter((band) => band.fullFootprint).length,
+    leadingFullFootprintBandCount,
+    trailingFullFootprintBandCount: trailingFullFootprintBands.length,
+    trailingFullFootprintBands,
+  };
+}
+
+function summarizeTerrainBandPlan(exportSiteContext, terrainPlan) {
+  const clipBounds = computeClipBounds(exportSiteContext);
+  const bandGroups = terrainPlan?.bandGroups || [];
+
+  if (!clipBounds || !Array.isArray(bandGroups) || !bandGroups.length) {
+    return {
+      bandCount: 0,
+      fullFootprintBandCount: 0,
+      leadingFullFootprintBandCount: 0,
+      trailingFullFootprintBandCount: 0,
+      trailingFullFootprintBands: [],
+    };
+  }
+
+  const clipWidth = clipBounds.maxX - clipBounds.minX;
+  const clipHeight = clipBounds.maxY - clipBounds.minY;
+  const summarizedBands = bandGroups.map((group) => {
+    const bounds = group?.bounds || null;
+    const width = bounds ? Number((bounds.maxX - bounds.minX).toFixed(3)) : 0;
+    const height = bounds ? Number((bounds.maxY - bounds.minY).toFixed(3)) : 0;
+
+    return {
+      bottomElevation: Number(Number(group?.bottomElevation || 0).toFixed(3)),
+      topElevation: Number(Number(group?.topElevation || 0).toFixed(3)),
+      width,
+      height,
+      fullFootprint: width >= clipWidth - 0.5 && height >= clipHeight - 0.5,
+    };
+  });
+
+  let leadingFullFootprintBandCount = 0;
+
+  for (const band of summarizedBands) {
+    if (!band.fullFootprint) {
+      break;
+    }
+
+    leadingFullFootprintBandCount += 1;
+  }
+
+  const trailingFullFootprintBands = summarizedBands
+    .slice(leadingFullFootprintBandCount)
+    .filter((band) => band.fullFootprint)
+    .map((band) => ({
+      bottomElevation: band.bottomElevation,
+      topElevation: band.topElevation,
+      width: band.width,
+      height: band.height,
+    }));
+
+  return {
+    bandCount: summarizedBands.length,
+    fullFootprintBandCount: summarizedBands.filter((band) => band.fullFootprint).length,
+    leadingFullFootprintBandCount,
+    trailingFullFootprintBandCount: trailingFullFootprintBands.length,
+    trailingFullFootprintBands,
   };
 }
 
@@ -393,6 +648,15 @@ function collectFormatFailures(testCase, result) {
     );
   }
 
+  if (result.formats["3dm"].terrainBands.trailingFullFootprintBandCount > 0) {
+    failures.push(
+      `${testCase.name}/3dm: trailing full-footprint terrain bands detected ` +
+        result.formats["3dm"].terrainBands.trailingFullFootprintBands
+          .map((band) => `${band.name}@${band.minZ}-${band.maxZ}`)
+          .join(", ")
+    );
+  }
+
   if (result.formats.skp.groups < expect.minSkpGroups) {
     failures.push(
       `${testCase.name}/skp: groups ${result.formats.skp.groups} below ${expect.minSkpGroups}`
@@ -450,6 +714,14 @@ async function verifyCase(testCase) {
   const skpPayload = buildSketchUpPayloadFromSiteContext(skp.exportSiteContext);
   const objText = buildObjFromSiteContext(obj.exportSiteContext);
   const threeDmCurveSummary = await summarize3dmCurveHeights(threeDmBytes);
+  const threeDmTerrainBands = await summarize3dmTerrainBands(
+    threeDmBytes,
+    threeDm.exportSiteContext
+  );
+  const threeDmTerrainPlanBands = summarizeTerrainBandPlan(
+    threeDm.exportSiteContext,
+    threeDm.terrainPlan
+  );
   const skpCurveSummary = summarizeSketchUpCurveHeights(skpPayload);
   const skpAttemptIntervals = [];
   const skpBytes = FULL_SKP_EXPORT
@@ -492,6 +764,8 @@ async function verifyCase(testCase) {
         bytes: threeDmBytes.length,
         curveCount: threeDmCurveSummary.curveCount,
         curveMaxAbsZ: threeDmCurveSummary.maxAbsZ,
+        terrainBands: threeDmTerrainBands,
+        terrainPlanBands: threeDmTerrainPlanBands,
       },
       skp: {
         requested: skp.requested,

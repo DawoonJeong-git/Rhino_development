@@ -9972,6 +9972,15 @@ function distanceToClipRectBoundary(point, clipRect) {
     return null;
   }
 
+  const boundaryPosition = resolveLocalClipBoundaryPosition(point, clipRect, {
+    direction: "ccw",
+    toleranceMeters: Number.POSITIVE_INFINITY,
+  });
+
+  if (boundaryPosition) {
+    return Number(Number(boundaryPosition.distance || 0).toFixed(6));
+  }
+
   return Number(
     Math.min(
       Math.abs(Number(point[0]) - Number(clipRect.minX)),
@@ -14309,7 +14318,6 @@ function pruneTransientGeneratedGroupRegions(siteContext, groups) {
 }
 
 function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
-  const clipRect = buildLocalClipRect(siteContext);
   const levelKey = buildContourLevelKey(elevation);
   const nativeLevelKeys = buildContourElevationKeySet(siteContext?.contourLines);
   const generatedNormalization =
@@ -14350,7 +14358,6 @@ function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
           sharpAngleThreshold,
           sharpCornerRatioThreshold,
           sharpCornerAbsoluteThreshold,
-          clipRect,
         })
       );
       const holePoints = (region?.holePoints || [])
@@ -14366,7 +14373,6 @@ function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
               sharpAngleThreshold,
               sharpCornerRatioThreshold,
               sharpCornerAbsoluteThreshold,
-              clipRect,
             }
           )
         )
@@ -14979,27 +14985,276 @@ function buildLocalClipRect(siteContext) {
     [bounds.maxX, bounds.maxY],
     [bounds.minX, bounds.maxY],
   ];
-  const multiPolygon = buildLocalMultiPolygonFromOpenRing(rectPolygon);
+  const clipBoundaryPolygon =
+    clipPolygon.length >= 3 ? dedupeLocalPolygonPoints(clipPolygon, 0.001) : [];
+  const clipBoundaryMultiPolygon =
+    clipBoundaryPolygon.length >= 3
+      ? buildLocalMultiPolygonFromOpenRing(clipBoundaryPolygon)
+      : [];
+  const rectMultiPolygon = buildLocalMultiPolygonFromOpenRing(rectPolygon);
+  const multiPolygon = clipBoundaryMultiPolygon.length
+    ? clipBoundaryMultiPolygon
+    : rectMultiPolygon;
 
   if (!multiPolygon.length) {
     return null;
   }
 
+  const boundaryPolygon =
+    clipBoundaryPolygon.length >= 3 ? clipBoundaryPolygon : rectPolygon;
+  const boundaryPolygonCounterClockwise =
+    orientLocalPolygonCounterClockwise(boundaryPolygon);
+  const boundaryPolygonClockwise = orientLocalPolygonClockwise(boundaryPolygon);
+  const buildBoundarySegments = (polygon) => {
+    const normalizedPolygon = dedupeLocalPolygonPoints(polygon, 0.001);
+    const segments = [];
+    let perimeter = 0;
+
+    for (let index = 0; index < normalizedPolygon.length; index += 1) {
+      const startPoint = normalizedPolygon[index];
+      const endPoint = normalizedPolygon[(index + 1) % normalizedPolygon.length];
+      const length = Math.hypot(
+        Number(endPoint?.[0] || 0) - Number(startPoint?.[0] || 0),
+        Number(endPoint?.[1] || 0) - Number(startPoint?.[1] || 0)
+      );
+
+      if (!(length > 1e-9)) {
+        continue;
+      }
+
+      segments.push({
+        segmentIndex: segments.length,
+        startPoint,
+        endPoint,
+        length,
+        startDistance: perimeter,
+      });
+      perimeter += length;
+    }
+
+    return {
+      polygon: normalizedPolygon,
+      segments,
+      perimeter: Number(perimeter.toFixed(6)),
+    };
+  };
+  const ccwBoundary = buildBoundarySegments(boundaryPolygonCounterClockwise);
+  const cwBoundary = buildBoundarySegments(boundaryPolygonClockwise);
+
   return {
     ...bounds,
-    polygon: rectPolygon,
+    polygon: boundaryPolygon,
     multiPolygon,
+    rectPolygon,
+    rectMultiPolygon,
     width: Math.max(0.001, bounds.maxX - bounds.minX),
     height: Math.max(0.001, bounds.maxY - bounds.minY),
     perimeter: Math.max(
       0.004,
       (bounds.maxX - bounds.minX) * 2 + (bounds.maxY - bounds.minY) * 2
     ),
+    boundaryPolygonCounterClockwise: ccwBoundary.polygon,
+    boundaryPolygonClockwise: cwBoundary.polygon,
+    boundarySegmentsCounterClockwise: ccwBoundary.segments,
+    boundarySegmentsClockwise: cwBoundary.segments,
+    boundaryPerimeter: Math.max(
+      0.004,
+      Number(ccwBoundary.perimeter || cwBoundary.perimeter || 0)
+    ),
     boundarySnapTolerance: Math.max(
       0.35,
       Number(siteContext?.terrainGrid?.step || 0) * 2
     ),
   };
+}
+
+function projectLocalPointOntoSegment(point, segmentStart, segmentEnd) {
+  const [px, py] = point || [];
+  const [x1, y1] = segmentStart || [];
+  const [x2, y2] = segmentEnd || [];
+
+  if (
+    !Number.isFinite(px) ||
+    !Number.isFinite(py) ||
+    !Number.isFinite(x1) ||
+    !Number.isFinite(y1) ||
+    !Number.isFinite(x2) ||
+    !Number.isFinite(y2)
+  ) {
+    return null;
+  }
+
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const squaredLength = dx * dx + dy * dy;
+
+  if (squaredLength <= 1e-12) {
+    return {
+      point: [Number(x1.toFixed(6)), Number(y1.toFixed(6))],
+      ratio: 0,
+      distance: Math.hypot(px - x1, py - y1),
+    };
+  }
+
+  const ratio = Math.max(
+    0,
+    Math.min(1, ((px - x1) * dx + (py - y1) * dy) / squaredLength)
+  );
+  const projectedX = x1 + dx * ratio;
+  const projectedY = y1 + dy * ratio;
+
+  return {
+    point: [Number(projectedX.toFixed(6)), Number(projectedY.toFixed(6))],
+    ratio,
+    distance: Math.hypot(px - projectedX, py - projectedY),
+  };
+}
+
+function getClipBoundarySegments(clipRect, direction = "ccw") {
+  const normalizedDirection = String(direction).trim().toLowerCase() === "cw" ? "cw" : "ccw";
+
+  return normalizedDirection === "cw"
+    ? {
+        polygon: clipRect?.boundaryPolygonClockwise || [],
+        segments: clipRect?.boundarySegmentsClockwise || [],
+        perimeter: Number(clipRect?.boundaryPerimeter || 0),
+      }
+    : {
+        polygon: clipRect?.boundaryPolygonCounterClockwise || [],
+        segments: clipRect?.boundarySegmentsCounterClockwise || [],
+        perimeter: Number(clipRect?.boundaryPerimeter || 0),
+      };
+}
+
+function resolveLocalClipBoundaryPosition(
+  point,
+  clipRect,
+  { direction = "ccw", toleranceMeters = 0.8 } = {}
+) {
+  if (
+    !Array.isArray(point) ||
+    point.length < 2 ||
+    !Number.isFinite(point[0]) ||
+    !Number.isFinite(point[1]) ||
+    !clipRect
+  ) {
+    return null;
+  }
+
+  const { segments, perimeter } = getClipBoundarySegments(clipRect, direction);
+
+  if (!(perimeter > 0) || !segments.length) {
+    return null;
+  }
+
+  const tolerance = Number.isFinite(toleranceMeters)
+    ? Math.max(0, Number(toleranceMeters) || 0)
+    : Number.POSITIVE_INFINITY;
+  let bestMatch = null;
+
+  for (const segment of segments) {
+    const projection = projectLocalPointOntoSegment(
+      point,
+      segment.startPoint,
+      segment.endPoint
+    );
+
+    if (!projection || projection.distance > tolerance + 1e-9) {
+      continue;
+    }
+
+    if (
+      !bestMatch ||
+      projection.distance < bestMatch.distance - 1e-9 ||
+      (Math.abs(projection.distance - bestMatch.distance) <= 1e-9 &&
+        segment.length > bestMatch.segmentLength)
+    ) {
+      bestMatch = {
+        point: projection.point,
+        ratio: projection.ratio,
+        distance: projection.distance,
+        segmentIndex: segment.segmentIndex,
+        segmentLength: segment.length,
+        boundaryDistance:
+          Number(segment.startDistance || 0) + Number(segment.length || 0) * projection.ratio,
+      };
+    }
+  }
+
+  return bestMatch;
+}
+
+function snapLocalPointToClipBoundary(point, clipRect, toleranceMeters = 0.8) {
+  return resolveLocalClipBoundaryPosition(point, clipRect, {
+    direction: "ccw",
+    toleranceMeters,
+  })?.point || null;
+}
+
+function extendLocalPointToClipBoundary(point, directionVector, clipRect) {
+  if (
+    !Array.isArray(point) ||
+    !Array.isArray(directionVector) ||
+    point.length < 2 ||
+    directionVector.length < 2 ||
+    !Number.isFinite(point[0]) ||
+    !Number.isFinite(point[1]) ||
+    !Number.isFinite(directionVector[0]) ||
+    !Number.isFinite(directionVector[1]) ||
+    !clipRect
+  ) {
+    return null;
+  }
+
+  const originX = Number(point[0]);
+  const originY = Number(point[1]);
+  const dx = Number(directionVector[0]);
+  const dy = Number(directionVector[1]);
+  const { segments } = getClipBoundarySegments(clipRect, "ccw");
+  let bestMatch = null;
+
+  for (const segment of segments) {
+    const startPoint = segment.startPoint || [];
+    const endPoint = segment.endPoint || [];
+    const sx = Number(endPoint[0] || 0) - Number(startPoint[0] || 0);
+    const sy = Number(endPoint[1] || 0) - Number(startPoint[1] || 0);
+    const denominator = dx * sy - dy * sx;
+
+    if (Math.abs(denominator) <= 1e-9) {
+      continue;
+    }
+
+    const offsetX = Number(startPoint[0] || 0) - originX;
+    const offsetY = Number(startPoint[1] || 0) - originY;
+    const rayDistance = (offsetX * sy - offsetY * sx) / denominator;
+    const segmentRatio = (offsetX * dy - offsetY * dx) / denominator;
+
+    if (
+      !Number.isFinite(rayDistance) ||
+      !Number.isFinite(segmentRatio) ||
+      rayDistance <= 1e-6 ||
+      segmentRatio < -1e-6 ||
+      segmentRatio > 1 + 1e-6
+    ) {
+      continue;
+    }
+
+    const xMeters = originX + dx * rayDistance;
+    const yMeters = originY + dy * rayDistance;
+
+    if (!Number.isFinite(xMeters) || !Number.isFinite(yMeters)) {
+      continue;
+    }
+
+    if (!bestMatch || rayDistance < bestMatch.rayDistance) {
+      bestMatch = {
+        rayDistance,
+        point: [Number(xMeters.toFixed(6)), Number(yMeters.toFixed(6))],
+      };
+    }
+  }
+
+  return bestMatch?.point || null;
 }
 
 function snapLocalPointToRectBoundary(point, clipRect, toleranceMeters = 0.8) {
@@ -15305,6 +15560,53 @@ function buildLocalRectBoundaryPath(startPoint, endPoint, clipRect, direction = 
     )
   ) {
     points.push(normalizedEndPoint);
+  }
+
+  return points.filter(Boolean);
+}
+
+function buildLocalClipBoundaryPath(startPoint, endPoint, clipRect, direction = "ccw") {
+  const normalizedDirection = String(direction).trim().toLowerCase() === "cw" ? "cw" : "ccw";
+  const startPosition = resolveLocalClipBoundaryPosition(startPoint, clipRect, {
+    direction: normalizedDirection,
+    toleranceMeters: Number.POSITIVE_INFINITY,
+  });
+  const endPosition = resolveLocalClipBoundaryPosition(endPoint, clipRect, {
+    direction: normalizedDirection,
+    toleranceMeters: Number.POSITIVE_INFINITY,
+  });
+  const { segments } = getClipBoundarySegments(clipRect, normalizedDirection);
+
+  if (!startPosition || !endPosition || !segments.length) {
+    return [];
+  }
+
+  const tolerance = Math.max(0.001, Number(clipRect?.boundarySnapTolerance || 0.35) * 0.05);
+  const points = [startPosition.point];
+
+  if (startPosition.segmentIndex !== endPosition.segmentIndex) {
+    let segmentIndex = startPosition.segmentIndex;
+    let guard = 0;
+
+    while (segmentIndex !== endPosition.segmentIndex && guard < segments.length) {
+      const boundaryPoint = segments[segmentIndex]?.endPoint;
+
+      if (
+        boundaryPoint &&
+        !pointsMatchInMeters(boundaryPoint, points[points.length - 1], tolerance)
+      ) {
+        points.push(boundaryPoint);
+      }
+
+      segmentIndex = (segmentIndex + 1) % segments.length;
+      guard += 1;
+    }
+  }
+
+  if (
+    !pointsMatchInMeters(endPosition.point, points[points.length - 1], tolerance)
+  ) {
+    points.push(endPosition.point);
   }
 
   return points.filter(Boolean);
@@ -15682,6 +15984,88 @@ function computeLocalMultiPolygonBounds(multiPolygon) {
   return bounds;
 }
 
+function constrainContourAreaWithGridReference(
+  candidateArea,
+  gridAreaAbove,
+  {
+    clipAreaSqm = 0,
+    cleanupAreaThresholdSqm = 0,
+    suppressFailureLog = true,
+  } = {}
+) {
+  const normalizedCandidateArea = Array.isArray(candidateArea) ? candidateArea : [];
+  const normalizedGridArea = Array.isArray(gridAreaAbove) ? gridAreaAbove : [];
+
+  if (!normalizedCandidateArea.length || !normalizedGridArea.length) {
+    return normalizedCandidateArea;
+  }
+
+  const candidateAreaSqm = computeLocalMultiPolygonArea(normalizedCandidateArea);
+  const gridAreaSqm = computeLocalMultiPolygonArea(normalizedGridArea);
+  const candidateBounds = computeLocalMultiPolygonBounds(normalizedCandidateArea);
+  const gridBounds = computeLocalMultiPolygonBounds(normalizedGridArea);
+
+  if (!(candidateAreaSqm > 0) || !(gridAreaSqm > 0)) {
+    return normalizedCandidateArea;
+  }
+
+  const overlapArea = intersectLocalMultiPolygon(
+    normalizedCandidateArea,
+    normalizedGridArea,
+    { suppressFailureLog }
+  );
+  const overlapAreaSqm = computeLocalMultiPolygonArea(overlapArea);
+
+  if (!(overlapAreaSqm > 0)) {
+    return normalizedCandidateArea;
+  }
+
+  const coverageRatio = overlapAreaSqm / gridAreaSqm;
+  const precisionRatio = overlapAreaSqm / candidateAreaSqm;
+  const candidateClipCoverage = clipAreaSqm > 0 ? candidateAreaSqm / clipAreaSqm : 0;
+  const gridClipCoverage = clipAreaSqm > 0 ? gridAreaSqm / clipAreaSqm : 0;
+  const candidateBoundsWidth = candidateBounds ? candidateBounds.maxX - candidateBounds.minX : 0;
+  const candidateBoundsHeight = candidateBounds ? candidateBounds.maxY - candidateBounds.minY : 0;
+  const gridBoundsWidth = gridBounds ? gridBounds.maxX - gridBounds.minX : 0;
+  const gridBoundsHeight = gridBounds ? gridBounds.maxY - gridBounds.minY : 0;
+  const candidateBoundsAreaSqm =
+    candidateBoundsWidth > 0 && candidateBoundsHeight > 0
+      ? candidateBoundsWidth * candidateBoundsHeight
+      : 0;
+  const gridBoundsAreaSqm =
+    gridBoundsWidth > 0 && gridBoundsHeight > 0 ? gridBoundsWidth * gridBoundsHeight : 0;
+  const candidateExceedsGrid = candidateAreaSqm > gridAreaSqm * 1.16;
+  const suspiciousFullClipFill =
+    candidateClipCoverage >= 0.96 &&
+    gridClipCoverage <= 0.9 &&
+    candidateAreaSqm > gridAreaSqm * 1.08;
+  const meaningfullyExtraOutsideGrid =
+    candidateExceedsGrid &&
+    precisionRatio < 0.84 &&
+    coverageRatio >= 0.45;
+  const suspiciousBoundsSpread =
+    candidateAreaSqm > gridAreaSqm * 1.01 &&
+    candidateBoundsAreaSqm > 0 &&
+    gridBoundsAreaSqm > 0 &&
+    boundsOverlap(candidateBounds, gridBounds, 0.001) &&
+    (candidateBoundsAreaSqm > gridBoundsAreaSqm * 1.45 ||
+      candidateBoundsWidth > gridBoundsWidth * 1.28 + 1 ||
+      candidateBoundsHeight > gridBoundsHeight * 1.28 + 1);
+
+  if (
+    !suspiciousFullClipFill &&
+    !meaningfullyExtraOutsideGrid &&
+    !suspiciousBoundsSpread
+  ) {
+    return normalizedCandidateArea;
+  }
+
+  return filterTinyLocalMultiPolygonArtifacts(
+    overlapArea,
+    Math.max(cleanupAreaThresholdSqm, 0.02)
+  );
+}
+
 function filterLocalMultiPolygonByBoundsOverlap(
   multiPolygon,
   referenceBounds,
@@ -15947,6 +16331,44 @@ function constrainUpperContourAreaWithinLower(lowerMultiPolygon, upperMultiPolyg
   return sampledConstrainedUpperArea.length
     ? sampledConstrainedUpperArea
     : overlappingUpperArea;
+}
+
+function clampUpperContourAreaWithinLowerStrict(lowerMultiPolygon, upperMultiPolygon) {
+  if (!upperMultiPolygon?.length) {
+    return upperMultiPolygon || [];
+  }
+
+  if (!lowerMultiPolygon?.length) {
+    return [];
+  }
+
+  const intersectedUpperArea = intersectLocalMultiPolygon(
+    upperMultiPolygon,
+    lowerMultiPolygon,
+    { suppressFailureLog: true }
+  );
+
+  if (intersectedUpperArea.length) {
+    return intersectedUpperArea;
+  }
+
+  const lowerBounds = computeLocalMultiPolygonBounds(lowerMultiPolygon);
+  const overlappingUpperArea = lowerBounds
+    ? filterLocalMultiPolygonByBoundsOverlap(upperMultiPolygon, lowerBounds, 0.001)
+    : upperMultiPolygon;
+
+  if (!overlappingUpperArea.length) {
+    return [];
+  }
+
+  const sampledConstrainedUpperArea =
+    constrainLocalMultiPolygonWithinReferenceBySampling(
+      overlappingUpperArea,
+      lowerMultiPolygon,
+      0.0001
+    );
+
+  return sampledConstrainedUpperArea.length ? sampledConstrainedUpperArea : [];
 }
 
 function finalizeTileDifferenceMultiPolygon(
@@ -16374,12 +16796,29 @@ function resolveOpenContourBoundaryCandidates(localPoints, clipRect) {
       Number(contourPoints[contourPoints.length - 2][1]),
   ];
   const snappedStartPoint =
+    snapLocalPointToClipBoundary(
+      contourPoints[0],
+      clipRect,
+      clipRect.boundarySnapTolerance
+    ) ||
+    extendLocalPointToClipBoundary(contourPoints[0], startDirection, clipRect) ||
     snapLocalPointToRectBoundary(
       contourPoints[0],
       clipRect,
       clipRect.boundarySnapTolerance
-    ) || extendLocalPointToRectBoundary(contourPoints[0], startDirection, clipRect);
+    ) ||
+    extendLocalPointToRectBoundary(contourPoints[0], startDirection, clipRect);
   const snappedEndPoint =
+    snapLocalPointToClipBoundary(
+      contourPoints[contourPoints.length - 1],
+      clipRect,
+      clipRect.boundarySnapTolerance
+    ) ||
+    extendLocalPointToClipBoundary(
+      contourPoints[contourPoints.length - 1],
+      endDirection,
+      clipRect
+    ) ||
     snapLocalPointToRectBoundary(
       contourPoints[contourPoints.length - 1],
       clipRect,
@@ -16437,18 +16876,24 @@ function resolveOpenContourBoundaryCandidates(localPoints, clipRect) {
   } else if (snappedEndPoint) {
     snappedContourPoints[snappedContourPoints.length - 1] = snappedEndPoint;
   }
-  const ccwBoundaryPath = buildLocalRectBoundaryPath(
+  const ccwClipBoundaryPath = buildLocalClipBoundaryPath(
     snappedEndPoint,
     snappedStartPoint,
     clipRect,
     "ccw"
   );
-  const cwBoundaryPath = buildLocalRectBoundaryPath(
+  const cwClipBoundaryPath = buildLocalClipBoundaryPath(
     snappedEndPoint,
     snappedStartPoint,
     clipRect,
     "cw"
   );
+  const ccwBoundaryPath = ccwClipBoundaryPath.length
+    ? ccwClipBoundaryPath
+    : buildLocalRectBoundaryPath(snappedEndPoint, snappedStartPoint, clipRect, "ccw");
+  const cwBoundaryPath = cwClipBoundaryPath.length
+    ? cwClipBoundaryPath
+    : buildLocalRectBoundaryPath(snappedEndPoint, snappedStartPoint, clipRect, "cw");
   const candidatePolygons = [
     dedupeLocalPolygonPoints(
       [...snappedContourPoints, ...ccwBoundaryPath.slice(1)],
@@ -16462,6 +16907,14 @@ function resolveOpenContourBoundaryCandidates(localPoints, clipRect) {
 
   const candidateMultiPolygons = candidatePolygons
     .map((polygon) => buildLocalMultiPolygonFromOpenRing(polygon))
+    .map((multiPolygon) =>
+      clipRect?.multiPolygon?.length
+        ? intersectLocalMultiPolygon(multiPolygon, clipRect.multiPolygon, {
+            suppressFailureLog: true,
+          })
+        : multiPolygon
+    )
+    .map((multiPolygon) => filterTinyLocalMultiPolygonArtifacts(multiPolygon, 0.02))
     .filter((multiPolygon) => multiPolygon.length);
 
   return {
@@ -16490,9 +16943,23 @@ function buildClosedContourSideMultiPolygons(localPoints, clipRect) {
     return [];
   }
 
+  const clippedInsideMultiPolygon = clipRect?.multiPolygon?.length
+    ? intersectLocalMultiPolygon(insideMultiPolygon, clipRect.multiPolygon, {
+        suppressFailureLog: true,
+      })
+    : insideMultiPolygon;
+  const normalizedInsideMultiPolygon = filterTinyLocalMultiPolygonArtifacts(
+    clippedInsideMultiPolygon,
+    0.02
+  );
+
+  if (!normalizedInsideMultiPolygon.length) {
+    return [];
+  }
+
   return [
-    insideMultiPolygon,
-    differenceLocalMultiPolygon(clipRect.multiPolygon, insideMultiPolygon),
+    normalizedInsideMultiPolygon,
+    differenceLocalMultiPolygon(clipRect.multiPolygon, normalizedInsideMultiPolygon),
   ].filter((multiPolygon) => multiPolygon.length);
 }
 
@@ -16661,6 +17128,12 @@ function resolveHigherContourSideCandidate(
       bestReferenceCandidate?.referenceMatch?.precisionRatio || 0
     );
     const bestReferenceIou = Number(bestReferenceCandidate?.referenceMatch?.iouRatio || 0);
+    const bestReferenceOverlap = Number(
+      bestReferenceCandidate?.referenceMatch?.overlapAreaSqm || 0
+    );
+    const nextReferenceOverlap = Number(
+      nextReferenceCandidate?.referenceMatch?.overlapAreaSqm || 0
+    );
     const sampleSelectedIndex = scoredCandidates[0]?.index ?? null;
     const sampleSelectedCandidate =
       sampleSelectedIndex === null
@@ -16670,6 +17143,12 @@ function resolveHigherContourSideCandidate(
     const sampleSelectedReferenceScore = Number(
       sampleSelectedCandidate?.referenceMatch?.score || Number.NEGATIVE_INFINITY
     );
+    const ambiguousSampleTie =
+      scoredCandidates.length > 1 &&
+      Math.abs(
+        Number(scoredCandidates[0].sampleElevation || 0) -
+          Number(scoredCandidates[1].sampleElevation || 0)
+      ) <= comparisonTolerance * 0.5;
     const useReferenceSelection =
       bestReferenceCandidate &&
       (bestReferenceCoverage >= 0.55 ||
@@ -16678,13 +17157,24 @@ function resolveHigherContourSideCandidate(
         bestReferenceScore >= 0.32) &&
       (bestReferenceScore >= sampleSelectedReferenceScore + 0.08 ||
         bestReferenceScore >= nextReferenceScore + 0.05);
+    const useReferenceTieBreak =
+      bestReferenceCandidate &&
+      ambiguousSampleTie &&
+      (bestReferenceCoverage >= 0.18 ||
+        bestReferencePrecision >= 0.12 ||
+        bestReferenceIou >= 0.09 ||
+        bestReferenceScore >= 0.14) &&
+      (bestReferenceScore >= nextReferenceScore + 0.02 ||
+        bestReferenceOverlap >= nextReferenceOverlap * 1.08 + 5);
 
-    if (useReferenceSelection) {
+    if (useReferenceSelection || useReferenceTieBreak) {
       return {
         selectedIndex: bestReferenceCandidate.index,
         selectedMultiPolygon: bestReferenceCandidate.multiPolygon,
         scoredCandidates,
-        reason: "grid_reference_match",
+        reason: useReferenceSelection
+          ? "grid_reference_match"
+          : "grid_reference_tiebreak",
         comparisonTolerance,
       };
     }
@@ -16832,7 +17322,7 @@ function buildRawAnchoredContourEntries(
   siteContext,
   clipRect,
   contourCollection = null,
-  { resolveReferenceAreaAboveLevel = null } = {}
+  { resolveReferenceAreaAboveLevel = null, includeSelectionDiagnostics = false } = {}
 ) {
   const seed = Math.round(
     Math.abs(Number(siteContext?.location?.lat) * 1000) +
@@ -16864,13 +17354,14 @@ function buildRawAnchoredContourEntries(
       typeof resolveReferenceAreaAboveLevel === "function"
         ? resolveReferenceAreaAboveLevel(elevation)
         : [];
-    const higherSideMultiPolygon = selectHigherContourSideMultiPolygon(
+    const selection = resolveHigherContourSideCandidate(
       siteContext,
       elevation,
       candidateMultiPolygons,
       seed,
       referenceAreaAbove
     );
+    const higherSideMultiPolygon = selection.selectedMultiPolygon;
 
     if (higherSideMultiPolygon?.length) {
       entries.push({
@@ -16878,6 +17369,43 @@ function buildRawAnchoredContourEntries(
         closedInput: closedContour,
         localPoints,
         multiPolygon: higherSideMultiPolygon,
+        ...(includeSelectionDiagnostics
+          ? {
+              selectionReason: selection.reason,
+              selectedCandidateIndex: Number.isInteger(selection.selectedIndex)
+                ? selection.selectedIndex
+                : null,
+              candidateSummaries: (selection.scoredCandidates || []).map((candidate) => ({
+                index: candidate.index,
+                sampleElevation: Number(Number(candidate.sampleElevation || 0).toFixed(3)),
+                areaSqm: Number(
+                  computeLocalMultiPolygonArea(candidate.multiPolygon || []).toFixed(3)
+                ),
+                bounds: computeLocalMultiPolygonBounds(candidate.multiPolygon || []),
+                referenceMatch: candidate.referenceMatch
+                  ? {
+                      overlapAreaSqm: Number(
+                        Number(candidate.referenceMatch.overlapAreaSqm || 0).toFixed(3)
+                      ),
+                      coverageRatio: Number(
+                        Number(candidate.referenceMatch.coverageRatio || 0).toFixed(4)
+                      ),
+                      precisionRatio: Number(
+                        Number(candidate.referenceMatch.precisionRatio || 0).toFixed(4)
+                      ),
+                      iouRatio: Number(
+                        Number(candidate.referenceMatch.iouRatio || 0).toFixed(4)
+                      ),
+                      areaDeltaRatio: Number(
+                        Number(candidate.referenceMatch.areaDeltaRatio || 0).toFixed(4)
+                      ),
+                      score: Number(Number(candidate.referenceMatch.score || 0).toFixed(4)),
+                    }
+                  : null,
+              })),
+              referenceAreaSqm: Number(computeLocalMultiPolygonArea(referenceAreaAbove).toFixed(3)),
+            }
+          : {}),
       });
     }
   }
@@ -17024,6 +17552,10 @@ function buildExactNativeContourBandAssembly({
       }
     }
 
+    exactArea = constrainContourAreaWithGridReference(exactArea, referenceArea, {
+      clipAreaSqm,
+      cleanupAreaThresholdSqm,
+    });
     exactArea = filterTinyLocalMultiPolygonArtifacts(
       exactArea,
       cleanupAreaThresholdSqm
@@ -17144,14 +17676,18 @@ function buildExactNativeContourBandAssembly({
         upperAnchorLevel: Number.isFinite(nextLevel) ? nextLevel : null,
         lowerAnchorArea: summarizeRawContourBandAssemblyArea(bottomArea),
         upperAnchorArea: summarizeRawContourBandAssemblyArea(topArea),
-        gridAreaAbove: summarizeRawContourBandAssemblyArea([]),
-        resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
-        resolvedTopArea: summarizeRawContourBandAssemblyArea(topArea),
-        bandArea: summarizeRawContourBandAssemblyArea(cleanedBandMultiPolygon),
-        regionCount: regions.length,
-        accepted: true,
-        skippedReason: null,
-      });
+          gridAreaAbove: summarizeRawContourBandAssemblyArea([]),
+          resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
+          resolvedTopArea: summarizeRawContourBandAssemblyArea(topArea),
+          bandArea: summarizeRawContourBandAssemblyArea(cleanedBandMultiPolygon),
+          resolvedBottomBounds: computeLocalMultiPolygonBounds(bottomArea),
+          resolvedTopBounds: computeLocalMultiPolygonBounds(topArea),
+          bandBounds: computeLocalMultiPolygonBounds(cleanedBandMultiPolygon),
+          normalizedBandBounds: computeRegionBounds(regions),
+          regionCount: regions.length,
+          accepted: true,
+          skippedReason: null,
+        });
     }
   }
 
@@ -17361,18 +17897,14 @@ function buildRawAnchoredContourBandAssembly(
     const gridAreaAbove = resolveGridAreaAboveLevel(level);
     let constrainedAnchorArea =
       exactNativeAnchorAreaByLevel.get(levelKey) || rawAnchorArea;
-
-    if (
-      !exactNativeAnchorAreaByLevel.has(levelKey) &&
-      rawAnchorArea.length &&
-      gridAreaAbove.length
-    ) {
-      const intersectedAnchorArea = intersectLocalMultiPolygon(rawAnchorArea, gridAreaAbove);
-
-      if (intersectedAnchorArea.length) {
-        constrainedAnchorArea = intersectedAnchorArea;
+    constrainedAnchorArea = constrainContourAreaWithGridReference(
+      constrainedAnchorArea,
+      gridAreaAbove,
+      {
+        clipAreaSqm: Number(siteContext?.stats?.clipAreaSqm || 0),
+        cleanupAreaThresholdSqm,
       }
-    }
+    );
 
     constrainedAnchorArea = filterTinyLocalMultiPolygonArtifacts(
       constrainedAnchorArea,
@@ -17531,6 +18063,8 @@ function buildRawAnchoredContourBandAssembly(
   const bandGroups = [];
   const levelDiagnostics = [];
   const resolvedAreaAboveByLevel = new Map();
+  let previousResolvedAreaAbove = null;
+  let hasPreviousResolvedArea = false;
 
   for (
     let bottomElevation = Number(startLevel.toFixed(3));
@@ -17539,8 +18073,21 @@ function buildRawAnchoredContourBandAssembly(
   ) {
     const topElevation = Number(Math.min(bottomElevation + interval, maxElevation).toFixed(3));
     const bottomResolution = resolveConstrainedAreaAboveLevelDetail(bottomElevation);
-    const bottomArea = bottomResolution.resolvedAreaAbove;
+    let bottomArea = bottomResolution.resolvedAreaAbove;
+
+    if (hasPreviousResolvedArea) {
+      bottomArea = previousResolvedAreaAbove?.length
+        ? clampUpperContourAreaWithinLowerStrict(previousResolvedAreaAbove, bottomArea)
+        : [];
+      bottomArea = filterTinyLocalMultiPolygonArtifacts(
+        bottomArea,
+        cleanupAreaThresholdSqm
+      );
+    }
+
     resolvedAreaAboveByLevel.set(buildContourLevelKey(bottomElevation), bottomArea || []);
+    previousResolvedAreaAbove = bottomArea || [];
+    hasPreviousResolvedArea = true;
 
     if (!bottomArea?.length) {
       if (includeLevelDiagnostics) {
@@ -17695,14 +18242,18 @@ function buildRawAnchoredContourBandAssembly(
         upperAnchorArea: summarizeRawContourBandAssemblyArea(
           bottomResolution.upperAnchorArea
         ),
-        gridAreaAbove: summarizeRawContourBandAssemblyArea(bottomResolution.gridAreaAbove),
-        resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
-        resolvedTopArea: summarizeRawContourBandAssemblyArea(topArea),
-        bandArea: summarizeRawContourBandAssemblyArea(cleanedBandMultiPolygon),
-        regionCount: regions.length,
-        accepted: true,
-        skippedReason: null,
-      });
+          gridAreaAbove: summarizeRawContourBandAssemblyArea(bottomResolution.gridAreaAbove),
+          resolvedBottomArea: summarizeRawContourBandAssemblyArea(bottomArea),
+          resolvedTopArea: summarizeRawContourBandAssemblyArea(topArea),
+          bandArea: summarizeRawContourBandAssemblyArea(cleanedBandMultiPolygon),
+          resolvedBottomBounds: computeLocalMultiPolygonBounds(bottomArea),
+          resolvedTopBounds: computeLocalMultiPolygonBounds(topArea),
+          bandBounds: computeLocalMultiPolygonBounds(cleanedBandMultiPolygon),
+          normalizedBandBounds: computeRegionBounds(regions),
+          regionCount: regions.length,
+          accepted: true,
+          skippedReason: null,
+        });
     }
   }
 
@@ -17744,6 +18295,28 @@ function buildRawAnchoredContourBandAssembly(
 }
 
 function buildRawAnchoredContourBandDiagnostics(siteContext) {
+  const terrainGrid = siteContext?.terrainGrid;
+  const cleanupAreaThresholdSqm = resolveRawAnchoredContourCleanupAreaThreshold(siteContext);
+  const clipRect = buildLocalClipRect(siteContext);
+  const nativeContourCollection = featureCollection(
+    (siteContext?.contourLines?.features || []).filter(
+      (feature) => feature?.properties?.generated !== true
+    )
+  );
+  const interval = resolveEffectiveContourBandInterval(siteContext);
+  const selectionReferenceInterval = interval > 1 ? Math.min(1, interval) : interval;
+  const selectionGridAreaResult =
+    Math.abs(selectionReferenceInterval - interval) <= 1e-9
+      ? buildGridAreaAboveByLevel(siteContext)
+      : buildGridAreaAboveByLevel(siteContext, {
+          intervalOverride: selectionReferenceInterval,
+        });
+  const diagnosticContourEntries = clipRect
+    ? buildRawAnchoredContourEntries(siteContext, clipRect, nativeContourCollection, {
+        resolveReferenceAreaAboveLevel: selectionGridAreaResult.resolveAreaAboveLevel,
+        includeSelectionDiagnostics: true,
+      })
+    : [];
   const assembly = buildRawAnchoredContourBandAssembly(siteContext, {
     includeLevelDiagnostics: true,
   });
@@ -17773,11 +18346,20 @@ function buildRawAnchoredContourBandDiagnostics(siteContext) {
         Number(assembly.contourEntryCountsByElevation.get(buildContourLevelKey(level)) || 0),
       ])
     ),
-    contourEntries: (assembly.contourEntries || []).map((entry, index) => ({
+    contourEntries: (diagnosticContourEntries.length
+      ? diagnosticContourEntries
+      : assembly.contourEntries || []
+    ).map((entry, index) => ({
       index: index + 1,
       elevation: Number(entry?.elevation || 0),
       closedInput: entry?.closedInput === true,
       pointCount: Number(entry?.localPoints?.length || 0),
+      selectionReason: entry?.selectionReason || null,
+      selectedCandidateIndex: Number.isInteger(entry?.selectedCandidateIndex)
+        ? entry.selectedCandidateIndex
+        : null,
+      referenceAreaSqm: Number(entry?.referenceAreaSqm || 0),
+      candidateSummaries: entry?.candidateSummaries || [],
       ...summarizeRawContourBandAssemblyArea(entry?.multiPolygon || []),
     })),
     rawAreaAboveByLevel: summarizeAreaLevels(assembly.rawAreaAboveByLevel || new Map()),
