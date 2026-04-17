@@ -39,8 +39,8 @@ const PROPERTY_DATA_CACHE_TTL_MS = 1000 * 60 * 10;
 const PROPERTY_DATA_CACHE_MAX_ENTRIES = 64;
 const EXPORT_ARTIFACT_CACHE_TTL_MS = 1000 * 60 * 5;
 const EXPORT_ARTIFACT_CACHE_MAX_ENTRIES = 8;
-const EXPORT_ARTIFACT_CACHE_MAX_TOTAL_BYTES = 96 * 1024 * 1024;
-const EXPORT_ARTIFACT_CACHE_MAX_ENTRY_BYTES = 32 * 1024 * 1024;
+const EXPORT_ARTIFACT_CACHE_MAX_TOTAL_BYTES = 128 * 1024 * 1024;
+const EXPORT_ARTIFACT_CACHE_MAX_ENTRY_BYTES = 64 * 1024 * 1024;
 const TERRAIN_SOURCE_SPATIAL_RESOLUTION_METERS = 90;
 const MIN_CONTOUR_INTERVAL_METERS = 0.1;
 const TERRAIN_GRID_MIN_STEP_METERS = 10;
@@ -1512,6 +1512,36 @@ function buildSiteContextCacheKey(location = {}, options = {}, customBounds = nu
     terrainMode: options.terrainMode === "flat" ? "flat" : "contour",
     buildingPlacement: normalizeBuildingPlacementMode(options.buildingPlacement),
     exportFormat: normalizeExportFormat(options.exportFormat),
+    includeContours: options.includeContours !== false,
+    includeBuildings: options.includeBuildings !== false,
+    includeParcelBoundary: options.includeParcelBoundary !== false,
+    includeRoads: options.includeRoads === true,
+    previewOnly: options.previewOnly === true,
+  });
+}
+
+function buildReusableSiteContextCacheKey(
+  location = {},
+  options = {},
+  customBounds = null
+) {
+  const normalizedCustomBounds = normalizeCustomBounds(
+    customBounds || location?.customBounds
+  );
+  const selectedParcels = normalizeSelectedParcelFeatures(location?.selectedParcels || []);
+
+  return JSON.stringify({
+    lat: Number(location.lat || 0).toFixed(6),
+    lng: Number(location.lng || 0).toFixed(6),
+    customBounds: normalizedCustomBounds,
+    selectedParcels: selectedParcels.map((feature, index) => ({
+      key: buildParcelSelectionKey(feature, index),
+      groupName: resolveParcelGroupName(feature, index),
+      groupLabel: buildParcelGroupLabel(feature, index),
+    })),
+    radius: Math.max(30, Number(options.radius) || 120),
+    contourInterval: normalizeContourInterval(options.contourInterval),
+    terrainMode: options.terrainMode === "flat" ? "flat" : "contour",
     includeContours: options.includeContours !== false,
     includeBuildings: options.includeBuildings !== false,
     includeParcelBoundary: options.includeParcelBoundary !== false,
@@ -11839,7 +11869,11 @@ async function buildSiteContext(body, config, reportProgress = null) {
   const isMultiParcelSelection =
     !isManualRange && targetParcelGroupFeatures.length > 1;
   assertSiteRequestWithinLimits(normalizedLocation, options, customBounds, config);
-  const cacheKey = buildSiteContextCacheKey(normalizedLocation, options, customBounds);
+  const cacheKey = buildReusableSiteContextCacheKey(
+    normalizedLocation,
+    options,
+    customBounds
+  );
   const now = Date.now();
   pruneCacheEntries(siteContextCache, {
     now,
