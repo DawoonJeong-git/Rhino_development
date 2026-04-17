@@ -20321,10 +20321,33 @@ function mergeNearbyRoadSurfacePolygons(
 }
 
 function buildRoadFootprintMultiPolygonFromFeatures(features, center) {
+  const derivedSurfacePolygons = [];
   const footprintPolygons = [];
 
   for (const feature of features || []) {
-    footprintPolygons.push(...buildRoadFeatureFootprintMultiPolygon(feature, center));
+    const featurePolygons = buildRoadFeatureFootprintMultiPolygon(feature, center);
+
+    if (!featurePolygons.length) {
+      continue;
+    }
+
+    if (
+      feature?.properties?.surfaceDerived === true &&
+      (feature?.geometry?.type === "Polygon" || feature?.geometry?.type === "MultiPolygon")
+    ) {
+      derivedSurfacePolygons.push(...featurePolygons);
+      continue;
+    }
+
+    footprintPolygons.push(...featurePolygons);
+  }
+
+  if (derivedSurfacePolygons.length && !footprintPolygons.length) {
+    return derivedSurfacePolygons;
+  }
+
+  if (derivedSurfacePolygons.length) {
+    footprintPolygons.push(...derivedSurfacePolygons);
   }
 
   if (!footprintPolygons.length) {
@@ -20459,6 +20482,7 @@ function buildRoadContourSurfaceGroups(siteContext, center) {
   }
 
   const roadFootprintMultiPolygon = getCachedRoadFootprintMultiPolygon(siteContext, center);
+  const roadFootprintBounds = computeLocalMultiPolygonBounds(roadFootprintMultiPolygon);
 
   if (!roadFootprintMultiPolygon.length) {
     if (entry instanceof Map) {
@@ -20475,12 +20499,28 @@ function buildRoadContourSurfaceGroups(siteContext, center) {
       continue;
     }
 
+    const surfaceBounds = computeLocalMultiPolygonBounds(surfaceGroup.multiPolygon);
+
+    if (!surfaceBounds || !boundsOverlap(roadFootprintBounds, surfaceBounds, 0.01)) {
+      continue;
+    }
+
+    const candidateRoadFootprint = filterLocalMultiPolygonByBoundsOverlap(
+      roadFootprintMultiPolygon,
+      surfaceBounds,
+      0.01
+    );
+
+    if (!candidateRoadFootprint.length) {
+      continue;
+    }
+
     let overlapMultiPolygon = [];
 
     try {
       overlapMultiPolygon =
         polygonClipping.intersection(
-          roadFootprintMultiPolygon,
+          candidateRoadFootprint,
           surfaceGroup.multiPolygon
         ) || [];
     } catch (error) {
