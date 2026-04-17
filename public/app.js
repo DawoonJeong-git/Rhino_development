@@ -52,6 +52,7 @@ const state = {
     landInfo: new Set(),
     buildingRegister: new Set(),
   },
+  uiVerificationModelOptionOverrides: null,
   history: [],
   layers: {
     buildings: null,
@@ -3604,7 +3605,7 @@ function collectModelOptions() {
       : "default";
   };
 
-  return {
+  return applyUiVerificationModelOptionOverrides({
     shape: "rectangle",
     radius: Number(formData.get("radius")),
     contourInterval,
@@ -3618,7 +3619,7 @@ function collectModelOptions() {
     includeRoads: true,
     includeParcelBoundary: true,
     splitParcelBoundary: formData.get("splitParcelBoundary") === "on",
-  };
+  });
 }
 
 function buildModelOptionsSignature(
@@ -3630,10 +3631,10 @@ function buildModelOptionsSignature(
     radius: Number(options.radius) || 0,
     contourInterval: Number(options.contourInterval) || MIN_CONTOUR_INTERVAL_METERS,
     terrainMode: "contour",
-    includeContours: true,
-    includeBuildings: true,
-    includeRoads: true,
-    includeParcelBoundary: true,
+    includeContours: options.includeContours !== false,
+    includeBuildings: options.includeBuildings !== false,
+    includeRoads: options.includeRoads !== false,
+    includeParcelBoundary: options.includeParcelBoundary !== false,
   };
 
   if (includeExportOnly) {
@@ -5944,6 +5945,45 @@ function isUiVerificationHost() {
   );
 }
 
+function normalizeUiVerificationModelOptionOverrides(overrides = null) {
+  if (!overrides || typeof overrides !== "object") {
+    return null;
+  }
+
+  const normalized = {};
+  const keys = [
+    "includeContours",
+    "includeBuildings",
+    "includeRoads",
+    "includeParcelBoundary",
+  ];
+
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(overrides, key)) {
+      normalized[key] = overrides[key] !== false;
+    }
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : null;
+}
+
+function applyUiVerificationModelOptionOverrides(options = {}) {
+  if (!isUiVerificationHost()) {
+    return options;
+  }
+
+  const overrides = state.uiVerificationModelOptionOverrides;
+
+  if (!overrides) {
+    return options;
+  }
+
+  return {
+    ...options,
+    ...overrides,
+  };
+}
+
 async function resolveUiTestSearchLocation(query) {
   const response = await fetch(
     `/api/geocode?q=${encodeURIComponent(String(query || "").trim())}`
@@ -6005,6 +6045,16 @@ function exposeUiVerificationApi() {
   }
 
   window.__SPACEWORK_UI_TEST__ = {
+    setModelOptionOverrides(overrides = null) {
+      state.uiVerificationModelOptionOverrides =
+        normalizeUiVerificationModelOptionOverrides(overrides);
+      return {
+        ...buildUiTestStateSummary(),
+        modelOptionOverrides: state.uiVerificationModelOptionOverrides
+          ? { ...state.uiVerificationModelOptionOverrides }
+          : null,
+      };
+    },
     setMapSelectionMode(mode) {
       setMapSelectionMode(mode);
       return state.mapSelectionMode;

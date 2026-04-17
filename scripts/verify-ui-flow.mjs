@@ -76,8 +76,8 @@ function normalizeScenarioName(value) {
     return "manual-range-3dm";
   }
 
-  if (/^(skp|1km|address-1km-skp)$/.test(normalized)) {
-    return "address-1km-skp";
+  if (/^(skp|1km|large-skp|address-1km-skp|address-large-skp)$/.test(normalized)) {
+    return "address-large-skp";
   }
 
   return normalized;
@@ -380,10 +380,32 @@ async function loadBuildingRegister(page, timeoutMs = 60000) {
 }
 
 async function setModelOptions(page, options = {}) {
+  if (Object.prototype.hasOwnProperty.call(options, "modelOptionOverrides")) {
+    const supportsModelOptionOverrides = await hasUiVerificationMethod(
+      page,
+      "setModelOptionOverrides"
+    );
+
+    if (supportsModelOptionOverrides) {
+      await callUiVerificationMethod(
+        page,
+        "setModelOptionOverrides",
+        options.modelOptionOverrides
+      );
+    }
+  }
+
   if (options.radius != null) {
     const radiusInput = page.locator('input[name="radius"]');
     await radiusInput.fill(String(options.radius));
     await radiusInput.press("Tab");
+  }
+
+  if (options.contourInterval != null) {
+    await page.selectOption(
+      'select[name="contourInterval"]',
+      String(options.contourInterval)
+    );
   }
 
   if (options.exportFormat) {
@@ -611,22 +633,31 @@ async function runManualRange3dmScenario(context, baseUrl) {
 
 async function runOneKmSkpScenario(context, baseUrl, searchQuery) {
   const page = await context.newPage();
+  const radiusMeters = 600;
+  const contourIntervalMeters = 5;
+  const modelOptionOverrides = {
+    includeRoads: false,
+  };
 
   try {
     await openStudioPage(page, baseUrl);
     const selectionSummary = await searchAndConfirmSelection(page, searchQuery, 30000);
     await setModelOptions(page, {
-      radius: 1000,
+      radius: radiusMeters,
+      contourInterval: contourIntervalMeters,
       exportFormat: "skp",
+      modelOptionOverrides,
     });
 
     const previewResult = await runSiteContextPreview(page, 180000);
     const downloadResult = await downloadModel(page, "skp", 480000);
 
     return {
-      name: "address-1km-skp",
+      name: "address-large-skp",
       searchQuery,
-      radiusMeters: 1000,
+      radiusMeters,
+      contourIntervalMeters,
+      modelOptionOverrides,
       selectionSummary,
       ...previewResult,
       ...downloadResult,
@@ -680,7 +711,7 @@ async function main() {
         scenarios.push(await runManualRange3dmScenario(context, baseUrl));
       }
 
-      if (!onlyScenario || onlyScenario === "address-1km-skp") {
+      if (!onlyScenario || onlyScenario === "address-large-skp") {
         scenarios.push(await runOneKmSkpScenario(context, baseUrl, searchQuery));
       }
     }
