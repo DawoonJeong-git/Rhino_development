@@ -15866,6 +15866,113 @@ function sampleLocalMultiPolygonElevation(siteContext, multiPolygon, seed) {
   return null;
 }
 
+function summarizeLocalMultiPolygonTerrainSupport(
+  siteContext,
+  multiPolygon,
+  elevation,
+  toleranceMeters = 0.15
+) {
+  const terrainGrid = siteContext?.terrainGrid;
+  const xValues = terrainGrid?.xValues || [];
+  const yValues = terrainGrid?.yValues || [];
+  const regions = buildContourBandRegionsFromMultiPolygon(multiPolygon);
+  const bounds = computeLocalMultiPolygonBounds(multiPolygon);
+
+  if (!terrainGrid?.elevations?.length || xValues.length < 2 || yValues.length < 2) {
+    return null;
+  }
+
+  if (!regions.length || !bounds) {
+    return null;
+  }
+
+  const totalCellCount = Math.max(0, (xValues.length - 1) * (yValues.length - 1));
+  const sampleStride =
+    totalCellCount > 90_000 ? 3 : totalCellCount > 30_000 ? 2 : 1;
+  let sampleCount = 0;
+  let aboveCount = 0;
+  let belowCount = 0;
+  let elevationDeltaSum = 0;
+
+  for (let rowIndex = 0; rowIndex < yValues.length - 1; rowIndex += sampleStride) {
+    const cellMinY = yValues[rowIndex];
+    const cellMaxY = yValues[Math.min(rowIndex + 1, yValues.length - 1)];
+
+    if (cellMaxY <= bounds.minY || cellMinY >= bounds.maxY) {
+      continue;
+    }
+
+    for (
+      let columnIndex = 0;
+      columnIndex < xValues.length - 1;
+      columnIndex += sampleStride
+    ) {
+      const cellMinX = xValues[columnIndex];
+      const cellMaxX = xValues[Math.min(columnIndex + 1, xValues.length - 1)];
+
+      if (cellMaxX <= bounds.minX || cellMinX >= bounds.maxX) {
+        continue;
+      }
+
+      const centerPoint = [
+        Number(((cellMinX + cellMaxX) * 0.5).toFixed(6)),
+        Number(((cellMinY + cellMaxY) * 0.5).toFixed(6)),
+      ];
+
+      if (!isPointInsideOrOnAnyLocalRegion(centerPoint, regions)) {
+        continue;
+      }
+
+      const cellValues = [
+        terrainGrid.elevations[rowIndex]?.[columnIndex],
+        terrainGrid.elevations[rowIndex]?.[Math.min(columnIndex + 1, xValues.length - 1)],
+        terrainGrid.elevations[Math.min(rowIndex + 1, yValues.length - 1)]?.[
+          Math.min(columnIndex + 1, xValues.length - 1)
+        ],
+        terrainGrid.elevations[Math.min(rowIndex + 1, yValues.length - 1)]?.[columnIndex],
+      ].filter((value) => Number.isFinite(value));
+      const sampledElevation = cellValues.length
+        ? cellValues.reduce((sum, value) => sum + value, 0) / cellValues.length
+        : resolveRawTerrainHeightAtLocalPoint(
+            siteContext,
+            centerPoint[0],
+            centerPoint[1],
+            0
+          );
+
+      if (!Number.isFinite(sampledElevation)) {
+        continue;
+      }
+
+      sampleCount += 1;
+      const elevationDelta = sampledElevation - elevation;
+      elevationDeltaSum += elevationDelta;
+
+      if (elevationDelta > toleranceMeters) {
+        aboveCount += 1;
+      } else if (elevationDelta < -toleranceMeters) {
+        belowCount += 1;
+      }
+    }
+  }
+
+  if (!sampleCount) {
+    return null;
+  }
+
+  const aboveRatio = aboveCount / sampleCount;
+  const belowRatio = belowCount / sampleCount;
+  const averageDelta = elevationDeltaSum / sampleCount;
+
+  return {
+    sampleCount,
+    aboveRatio: Number(aboveRatio.toFixed(4)),
+    belowRatio: Number(belowRatio.toFixed(4)),
+    averageDelta: Number(averageDelta.toFixed(4)),
+    score: Number((aboveRatio * 1.15 - belowRatio * 1.1 + averageDelta * 0.08).toFixed(4)),
+  };
+}
+
 function computeLocalRegionArea(region) {
   if (!region?.outerPoints?.length) {
     return 0;
@@ -17168,6 +17275,12 @@ function resolveHigherContourSideCandidate(
       index,
       multiPolygon,
       sampleElevation: sampleLocalMultiPolygonElevation(siteContext, multiPolygon, seed),
+      terrainSupport: summarizeLocalMultiPolygonTerrainSupport(
+        siteContext,
+        multiPolygon,
+        elevation,
+        Math.max(0.15, comparisonTolerance * 0.9)
+      ),
       referenceMatch:
         referenceAreaSqm > 0
           ? (() => {
@@ -17250,6 +17363,60 @@ function resolveHigherContourSideCandidate(
   const scoredCandidates = [...rawCandidates].sort(
     (left, right) => right.sampleElevation - left.sampleElevation
   );
+  const terrainSupportCandidates = rawCandidates
+    .filter(
+      (candidate) =>
+        candidate.terrainSupport &&
+        Number(candidate.terrainSupport.sampleCount || 0) >= 3
+    )
+    .sort((left, right) => {
+      const leftScore = Number(left.terrainSupport?.score || Number.NEGATIVE_INFINITY);
+      const rightScore = Number(right.terrainSupport?.score || Number.NEGATIVE_INFINITY);
+
+      if (rightScore !== leftScore) {
+        return rightScore - leftScore;
+      }
+
+      const leftAboveRatio = Number(left.terrainSupport?.aboveRatio || 0);
+      const rightAboveRatio = Number(right.terrainSupport?.aboveRatio || 0);
+
+      if (rightAboveRatio !== leftAboveRatio) {
+        return rightAboveRatio - leftAboveRatio;
+      }
+
+      return right.sampleElevation - left.sampleElevation;
+    });
+  const bestTerrainSupportCandidate = terrainSupportCandidates[0] || null;
+  const nextTerrainSupportCandidate = terrainSupportCandidates[1] || null;
+  const bestTerrainSupportScore = Number(
+    bestTerrainSupportCandidate?.terrainSupport?.score || Number.NEGATIVE_INFINITY
+  );
+  const nextTerrainSupportScore = Number(
+    nextTerrainSupportCandidate?.terrainSupport?.score || Number.NEGATIVE_INFINITY
+  );
+  const bestTerrainAboveRatio = Number(
+    bestTerrainSupportCandidate?.terrainSupport?.aboveRatio || 0
+  );
+  const nextTerrainAboveRatio = Number(
+    nextTerrainSupportCandidate?.terrainSupport?.aboveRatio || 0
+  );
+  const useTerrainSupportSelection =
+    bestTerrainSupportCandidate &&
+    (bestTerrainAboveRatio >= 0.6 || bestTerrainSupportScore >= 0.22) &&
+    (
+      bestTerrainSupportScore >= nextTerrainSupportScore + 0.08 ||
+      bestTerrainAboveRatio >= nextTerrainAboveRatio + 0.12
+    );
+
+  if (useTerrainSupportSelection) {
+    return {
+      selectedIndex: bestTerrainSupportCandidate.index,
+      selectedMultiPolygon: bestTerrainSupportCandidate.multiPolygon,
+      scoredCandidates,
+      reason: "terrain_grid_support",
+      comparisonTolerance,
+    };
+  }
 
   if (referenceAreaSqm > 0) {
     const referenceScoredCandidates = rawCandidates
@@ -17540,6 +17707,21 @@ function buildRawAnchoredContourEntries(
                   computeLocalMultiPolygonArea(candidate.multiPolygon || []).toFixed(3)
                 ),
                 bounds: computeLocalMultiPolygonBounds(candidate.multiPolygon || []),
+                terrainSupport: candidate.terrainSupport
+                  ? {
+                      sampleCount: Number(candidate.terrainSupport.sampleCount || 0),
+                      aboveRatio: Number(
+                        Number(candidate.terrainSupport.aboveRatio || 0).toFixed(4)
+                      ),
+                      belowRatio: Number(
+                        Number(candidate.terrainSupport.belowRatio || 0).toFixed(4)
+                      ),
+                      averageDelta: Number(
+                        Number(candidate.terrainSupport.averageDelta || 0).toFixed(4)
+                      ),
+                      score: Number(Number(candidate.terrainSupport.score || 0).toFixed(4)),
+                    }
+                  : null,
                 referenceMatch: candidate.referenceMatch
                   ? {
                       overlapAreaSqm: Number(
@@ -17562,6 +17744,13 @@ function buildRawAnchoredContourEntries(
                   : null,
               })),
               referenceAreaSqm: Number(computeLocalMultiPolygonArea(referenceAreaAbove).toFixed(3)),
+            }
+          : {}),
+        ...(includeSelectionDiagnostics
+          ? {
+              terrainSupport: selection.scoredCandidates
+                .find((candidate) => candidate.index === selection.selectedIndex)
+                ?.terrainSupport || null,
             }
           : {}),
       });
