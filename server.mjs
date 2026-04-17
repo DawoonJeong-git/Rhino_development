@@ -17993,6 +17993,10 @@ function buildExactNativeContourBandAssembly({
     .map(Number)
     .filter(Number.isFinite)
     .sort((left, right) => left - right);
+  const referenceLevels = [...referenceAreaAboveByLevel.keys()]
+    .map(Number)
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
   const clipAreaSqm = Math.max(
     0,
     ...[...cumulativeByLevel.values()].map((multiPolygon) =>
@@ -18017,6 +18021,20 @@ function buildExactNativeContourBandAssembly({
       cumulativeByLevel.get(levelKey) ||
       [];
     const referenceAreaSqm = computeLocalMultiPolygonArea(referenceArea);
+    const immediateFinerReferenceLevel =
+      referenceLevels.find(
+        (referenceLevel) =>
+          referenceLevel > level + 0.001 &&
+          referenceLevel < level + Math.max(1, interval) - 0.001
+      ) ?? null;
+    const immediateFinerReferenceAreaSqm =
+      Number.isFinite(immediateFinerReferenceLevel)
+        ? computeLocalMultiPolygonArea(
+            referenceAreaAboveByLevel.get(
+              buildContourLevelKey(immediateFinerReferenceLevel)
+            ) || []
+          )
+        : 0;
     const additivePolygons = [];
     const restrictivePolygons = [];
 
@@ -18054,12 +18072,18 @@ function buildExactNativeContourBandAssembly({
         precisionRatio <= 0.92 &&
         areaDeltaRatio >= 0.22 &&
         !(clipAreaSqm > 0 && referenceAreaSqm >= clipAreaSqm * 0.94);
+      const suspiciousClosedShell =
+        entry?.closedInput === true &&
+        clipAreaSqm > 0 &&
+        candidateAreaSqm >= clipAreaSqm * 0.94 &&
+        immediateFinerReferenceAreaSqm > 0 &&
+        immediateFinerReferenceAreaSqm <= Math.min(candidateAreaSqm * 0.35, clipAreaSqm * 0.18);
 
       if (!meaningfulOverlap) {
         continue;
       }
 
-      if (containerLike) {
+      if (containerLike || suspiciousClosedShell) {
         restrictivePolygons.push(candidateMultiPolygon);
       } else {
         additivePolygons.push(candidateMultiPolygon);
