@@ -14345,6 +14345,12 @@ function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
   const sharpCornerAbsoluteThreshold = shouldSmoothGenerated
     ? generatedNormalization.sharpCornerAbsoluteThreshold
     : 4;
+  const normalizeBaseRegion = (region) => ({
+    outerPoints: orientLocalPolygonCounterClockwise(region?.outerPoints || []),
+    holePoints: (region?.holePoints || [])
+      .map((ring) => [...orientLocalPolygonCounterClockwise(ring || [])].reverse())
+      .filter((ring) => ring.length >= 3),
+  });
 
   const normalizedRegions = (regions || [])
     .map((region) => {
@@ -14389,10 +14395,125 @@ function normalizeContourRegionsForLevel(siteContext, regions, elevation) {
       };
     })
     .filter(Boolean);
+  const cleanedNormalizedRegions = cleanupNormalizedContourRegions(
+    siteContext,
+    normalizedRegions,
+    {
+      generatedLevel: !nativeLevelKeys.has(levelKey),
+    }
+  );
+  const cleanedOriginalRegions = cleanupNormalizedContourRegions(
+    siteContext,
+    (regions || []).map(normalizeBaseRegion).filter((region) => region.outerPoints.length >= 3),
+    {
+      generatedLevel: !nativeLevelKeys.has(levelKey),
+    }
+  );
 
-  return cleanupNormalizedContourRegions(siteContext, normalizedRegions, {
-    generatedLevel: !nativeLevelKeys.has(levelKey),
+  if (!cleanedNormalizedRegions.length && cleanedOriginalRegions.length) {
+    return cleanedOriginalRegions;
+  }
+
+  const normalizedAreaSqm = computeLocalMultiPolygonArea(
+    buildPolygonClippingMultiPolygonFromRegions(cleanedNormalizedRegions)
+  );
+  const originalAreaSqm = computeLocalMultiPolygonArea(
+    buildPolygonClippingMultiPolygonFromRegions(cleanedOriginalRegions)
+  );
+
+  if (
+    cleanedOriginalRegions.length &&
+    originalAreaSqm > 0.5 &&
+    normalizedAreaSqm < originalAreaSqm * 0.55
+  ) {
+    return cleanedOriginalRegions;
+  }
+
+  return cleanedNormalizedRegions.length ? cleanedNormalizedRegions : cleanedOriginalRegions;
+}
+
+function summarizeLocalMultiPolygonTopology(multiPolygon) {
+  const regions = buildContourBandRegionsFromMultiPolygon(multiPolygon);
+  let holeCount = 0;
+  let holeAreaSqm = 0;
+
+  for (const region of regions) {
+    const outerAreaSqm = Math.abs(
+      computeLocalPolygonSignedArea(region?.outerPoints || [])
+    );
+    const regionAreaSqm = computeLocalRegionArea(region);
+    holeCount += Number(region?.holePoints?.length || 0);
+    holeAreaSqm += Math.max(0, outerAreaSqm - regionAreaSqm);
+  }
+
+  return {
+    regionCount: regions.length,
+    holeCount,
+    holeAreaSqm: Number(holeAreaSqm.toFixed(6)),
+  };
+}
+
+function computeLocalMultiPolygonHoleCoverageArea(
+  candidateMultiPolygon,
+  referenceMultiPolygon,
+  { suppressFailureLog = true } = {}
+) {
+  if (!candidateMultiPolygon?.length || !referenceMultiPolygon?.length) {
+    return 0;
+  }
+
+  const candidateBounds = computeLocalMultiPolygonBounds(candidateMultiPolygon);
+
+  if (!candidateBounds) {
+    return 0;
+  }
+
+  let coveredHoleAreaSqm = 0;
+
+  for (const region of buildContourBandRegionsFromMultiPolygon(referenceMultiPolygon)) {
+    for (const holePoints of region?.holePoints || []) {
+      const holeMultiPolygon = buildLocalMultiPolygonFromOpenRing(holePoints);
+      const holeBounds = computeLocalMultiPolygonBounds(holeMultiPolygon);
+
+      if (
+        !holeMultiPolygon.length ||
+        !holeBounds ||
+        !boundsOverlap(candidateBounds, holeBounds, 0.001)
+      ) {
+        continue;
+      }
+
+      const overlapArea = intersectLocalMultiPolygon(
+        candidateMultiPolygon,
+        holeMultiPolygon,
+        { suppressFailureLog }
+      );
+      coveredHoleAreaSqm += computeLocalMultiPolygonArea(overlapArea);
+    }
+  }
+
+  return Number(coveredHoleAreaSqm.toFixed(6));
+}
+
+function buildHolePreservingContourArea(
+  candidateArea,
+  gridAreaAbove,
+  minimumAreaSqm = 0.02,
+  suppressFailureLog = true
+) {
+  const overlapArea = intersectLocalMultiPolygon(candidateArea, gridAreaAbove, {
+    suppressFailureLog,
   });
+
+  if (overlapArea.length) {
+    return filterTinyLocalMultiPolygonArtifacts(overlapArea, minimumAreaSqm);
+  }
+
+  return constrainLocalMultiPolygonWithinReferenceBySampling(
+    candidateArea,
+    gridAreaAbove,
+    minimumAreaSqm
+  );
 }
 
 function smoothSketchUpSolidLoop(points, toleranceMeters = 0) {
@@ -16004,6 +16125,16 @@ function constrainContourAreaWithGridReference(
   const gridAreaSqm = computeLocalMultiPolygonArea(normalizedGridArea);
   const candidateBounds = computeLocalMultiPolygonBounds(normalizedCandidateArea);
   const gridBounds = computeLocalMultiPolygonBounds(normalizedGridArea);
+  const candidateTopology = summarizeLocalMultiPolygonTopology(normalizedCandidateArea);
+  const gridTopology = summarizeLocalMultiPolygonTopology(normalizedGridArea);
+  const coveredReferenceHoleAreaSqm =
+    gridTopology.holeCount > 0 && gridTopology.holeAreaSqm > 0
+      ? computeLocalMultiPolygonHoleCoverageArea(
+          normalizedCandidateArea,
+          normalizedGridArea,
+          { suppressFailureLog }
+        )
+      : 0;
 
   if (!(candidateAreaSqm > 0) || !(gridAreaSqm > 0)) {
     return normalizedCandidateArea;
@@ -16051,19 +16182,46 @@ function constrainContourAreaWithGridReference(
     (candidateBoundsAreaSqm > gridBoundsAreaSqm * 1.45 ||
       candidateBoundsWidth > gridBoundsWidth * 1.28 + 1 ||
       candidateBoundsHeight > gridBoundsHeight * 1.28 + 1);
+  const fillsReferenceHoles =
+    gridTopology.holeCount > 0 &&
+    gridTopology.holeAreaSqm >= Math.max(4, gridAreaSqm * 0.01) &&
+    (
+      (
+        candidateTopology.holeCount === 0 &&
+        gridTopology.regionCount >= 2 &&
+        coverageRatio >= 0.74 &&
+        candidateAreaSqm >= gridAreaSqm * 0.68
+      ) ||
+      coveredReferenceHoleAreaSqm >= Math.max(3, gridTopology.holeAreaSqm * 0.08) ||
+      (
+        candidateTopology.holeAreaSqm <= gridTopology.holeAreaSqm * 0.32 &&
+        candidateTopology.holeCount < Math.max(1, Math.ceil(gridTopology.holeCount * 0.35)) &&
+        coverageRatio >= 0.68
+      )
+    );
 
   if (
     !suspiciousFullClipFill &&
     !meaningfullyExtraOutsideGrid &&
-    !suspiciousBoundsSpread
+    !suspiciousBoundsSpread &&
+    !fillsReferenceHoles
   ) {
     return normalizedCandidateArea;
   }
 
-  return filterTinyLocalMultiPolygonArtifacts(
-    overlapArea,
-    Math.max(cleanupAreaThresholdSqm, 0.02)
-  );
+  const constrainedArea = fillsReferenceHoles
+    ? buildHolePreservingContourArea(
+        normalizedCandidateArea,
+        normalizedGridArea,
+        Math.max(cleanupAreaThresholdSqm, 0.02),
+        suppressFailureLog
+      )
+    : filterTinyLocalMultiPolygonArtifacts(
+        overlapArea,
+        Math.max(cleanupAreaThresholdSqm, 0.02)
+      );
+
+  return constrainedArea.length ? constrainedArea : normalizedCandidateArea;
 }
 
 function filterLocalMultiPolygonByBoundsOverlap(
@@ -17771,6 +17929,7 @@ function buildRawAnchoredContourBandAssembly(
   const sourceContourInterval = resolveSourceContourInterval(siteContext);
   const minElevation = Number(terrainGrid.minElevation || 0);
   const maxElevation = Number(terrainGrid.maxElevation || 0);
+  const clipAreaSqm = Number(siteContext?.stats?.clipAreaSqm || 0);
   const startLevel = Math.floor(minElevation / interval) * interval;
   const nativeContourCollection = featureCollection(
     (siteContext?.contourLines?.features || []).filter(
@@ -17901,7 +18060,7 @@ function buildRawAnchoredContourBandAssembly(
       constrainedAnchorArea,
       gridAreaAbove,
       {
-        clipAreaSqm: Number(siteContext?.stats?.clipAreaSqm || 0),
+        clipAreaSqm,
         cleanupAreaThresholdSqm,
       }
     );
@@ -18026,8 +18185,21 @@ function buildRawAnchoredContourBandAssembly(
     }
 
     if (upperAnchorArea.length) {
+      const upperAnchorContribution =
+        gridAreaAbove.length && upperAnchorArea.length
+          ? constrainContourAreaWithGridReference(
+              upperAnchorArea,
+              gridAreaAbove,
+              {
+                clipAreaSqm,
+                cleanupAreaThresholdSqm,
+                suppressFailureLog: true,
+              }
+            )
+          : upperAnchorArea;
+
       constrainedAreaAbove = unionLocalMultiPolygons([
-        upperAnchorArea,
+        upperAnchorContribution,
         constrainedAreaAbove,
       ]);
 
