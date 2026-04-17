@@ -83,6 +83,43 @@ function normalizeScenarioName(value) {
   return normalized;
 }
 
+function wait(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, Number(ms) || 0));
+  });
+}
+
+function isRetriableBrowserLaunchError(error) {
+  const message = String(error?.message || error || "");
+  return /spawn\s+eperm/i.test(message) || /\bEPERM\b/i.test(message);
+}
+
+async function launchBrowserWithRetry(options, attemptCount = 3) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= Math.max(1, attemptCount); attempt += 1) {
+    try {
+      return await chromium.launch(options);
+    } catch (error) {
+      lastError = error;
+
+      if (!isRetriableBrowserLaunchError(error) || attempt >= attemptCount) {
+        throw error;
+      }
+
+      const delayMs = 350 * attempt;
+      console.warn(
+        `[verify-ui] browser launch retry ${attempt}/${attemptCount} after ${delayMs}ms: ${String(
+          error?.message || error
+        )}`
+      );
+      await wait(delayMs);
+    }
+  }
+
+  throw lastError;
+}
+
 async function waitForStableText(
   page,
   selector,
@@ -619,7 +656,7 @@ async function main() {
   assert.equal(healthResponse.ok, true, "UI verification target should be healthy.");
   assert.equal(healthPayload?.ok, true, "Health endpoint should return ok=true.");
 
-  const browser = await chromium.launch({
+  const browser = await launchBrowserWithRetry({
     executablePath,
     headless,
   });

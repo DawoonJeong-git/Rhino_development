@@ -90,6 +90,7 @@ const SEARCH_PRIORITY_GRACE_MS = 750;
 const DEFAULT_MAX_SITE_RADIUS_METERS = 1000;
 const DEFAULT_MAX_MANUAL_RANGE_SIDE_METERS = DEFAULT_MAX_SITE_RADIUS_METERS * 2;
 const DEFAULT_MAX_CONCURRENT_EXPORT_JOBS = 2;
+const terrainIntervalRelaxationLogCache = new Set();
 const DEFAULT_CONTENT_SECURITY_POLICY_DIRECTIVES = Object.freeze([
   "default-src 'self'",
   "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com",
@@ -208,6 +209,10 @@ const contourRenderableBandGroupCache = new WeakMap();
 const contourTopSurfaceCache = new WeakMap();
 const sharedContourBandGroupCache = new Map();
 const sharedContourCumulativeBandGroupCache = new Map();
+const sharedGridContourBandGroupCache = new Map();
+const sharedGridAreaAboveByLevelCache = new Map();
+const sharedContourRenderableBandGroupCache = new Map();
+const sharedContourTopSurfaceCache = new Map();
 const roadFootprintMultiPolygonCache = new WeakMap();
 const roadContourSurfaceGroupCache = new WeakMap();
 const siteContextGeometrySignatureCache = new WeakMap();
@@ -1120,15 +1125,34 @@ function resolveEffectiveContourBandInterval(siteContext) {
   }
 
   if (effectiveInterval > requestedInterval + 1e-9) {
-    console.warn(
-      `[terrain-band] interval relaxed requested=${requestedInterval} effective=${effectiveInterval} source=${sourceContourInterval} bandCount=${estimateContourBandCount(
-        siteContext,
-        effectiveInterval
-      )}/${maxBandCount} complexity=${estimateContourBandComplexity(
-        siteContext,
-        requestedInterval
-      )} format=${exportFormat || "default"}`
-    );
+    const relaxationLogKey = [
+      exportFormat || "default",
+      requestedInterval,
+      effectiveInterval,
+      sourceContourInterval,
+      maxBandCount,
+      buildTerrainGridCacheSignature(siteContext?.terrainGrid),
+      buildContourLineCacheSignature(siteContext?.contourLines),
+    ].join("|");
+
+    if (!terrainIntervalRelaxationLogCache.has(relaxationLogKey)) {
+      terrainIntervalRelaxationLogCache.add(relaxationLogKey);
+
+      if (terrainIntervalRelaxationLogCache.size > 512) {
+        terrainIntervalRelaxationLogCache.clear();
+        terrainIntervalRelaxationLogCache.add(relaxationLogKey);
+      }
+
+      console.warn(
+        `[terrain-band] interval relaxed requested=${requestedInterval} effective=${effectiveInterval} source=${sourceContourInterval} bandCount=${estimateContourBandCount(
+          siteContext,
+          effectiveInterval
+        )}/${maxBandCount} complexity=${estimateContourBandComplexity(
+          siteContext,
+          requestedInterval
+        )} format=${exportFormat || "default"}`
+      );
+    }
   }
 
   return effectiveInterval;
@@ -1151,6 +1175,21 @@ function buildContourLineCacheSignature(contourLines) {
     )
     .digest("hex")
     .slice(0, 16);
+}
+
+function buildGridContourCacheKey(siteContext, intervalOverride = null) {
+  const normalizedIntervalOverride =
+    Number.isFinite(Number(intervalOverride)) && Number(intervalOverride) > 0
+      ? normalizeContourInterval(intervalOverride)
+      : null;
+  const effectiveInterval =
+    normalizedIntervalOverride === null
+      ? resolveEffectiveContourBandInterval(siteContext)
+      : normalizedIntervalOverride;
+
+  return `${Number(effectiveInterval || 0).toFixed(3)}|${buildTerrainGridCacheSignature(
+    siteContext?.terrainGrid
+  )}`;
 }
 
 function getContourBandCacheKey(siteContext) {
@@ -15404,7 +15443,117 @@ function sampleLocalMultiPolygonElevation(siteContext, multiPolygon, seed) {
   return null;
 }
 
-function unionLocalMultiPolygons(multiPolygons) {
+function computeLocalRegionArea(region) {
+  if (!region?.outerPoints?.length) {
+    return 0;
+  }
+
+  let area = Math.abs(computeLocalPolygonSignedArea(region.outerPoints));
+
+  for (const holePoints of region.holePoints || []) {
+    area -= Math.abs(computeLocalPolygonSignedArea(holePoints));
+  }
+
+  return Math.max(0, Number(area.toFixed(6)));
+}
+
+function isPointInsideOrOnAnyLocalRegion(point, regions) {
+  if (!point || !Array.isArray(regions) || !regions.length) {
+    return false;
+  }
+
+  return regions.some((region) => isPointInsideOrOnLocalRegion(point, region));
+}
+
+function estimateLocalMultiPolygonOverlapAreaFromRegions(baseRegions, clipRegions) {
+  if (!Array.isArray(baseRegions) || !baseRegions.length) {
+    return 0;
+  }
+
+  if (!Array.isArray(clipRegions) || !clipRegions.length) {
+    return 0;
+  }
+
+  const summarizeCoveredArea = (sourceRegions, targetRegions) => {
+    let coveredAreaSqm = 0;
+
+    for (const region of sourceRegions) {
+      const regionAreaSqm = computeLocalRegionArea(region);
+
+      if (!(regionAreaSqm > 0)) {
+        continue;
+      }
+
+      const samplePoint = estimateLocalRegionInteriorPoint(region);
+
+      if (!samplePoint || !isPointInsideOrOnAnyLocalRegion(samplePoint, targetRegions)) {
+        continue;
+      }
+
+      coveredAreaSqm += regionAreaSqm;
+    }
+
+    return coveredAreaSqm;
+  };
+
+  return Number(
+    Math.max(
+      summarizeCoveredArea(baseRegions, clipRegions),
+      summarizeCoveredArea(clipRegions, baseRegions)
+    ).toFixed(6)
+  );
+}
+
+function constrainLocalMultiPolygonWithinReferenceBySampling(
+  candidateMultiPolygon,
+  referenceMultiPolygon,
+  minimumAreaSqm = 0.0001
+) {
+  if (!candidateMultiPolygon?.length || !referenceMultiPolygon?.length) {
+    return [];
+  }
+
+  const referenceBounds = computeLocalMultiPolygonBounds(referenceMultiPolygon);
+  const referenceRegions = buildContourBandRegionsFromMultiPolygon(referenceMultiPolygon);
+
+  if (!referenceBounds || !referenceRegions.length) {
+    return [];
+  }
+
+  const constrainedRegions = buildContourBandRegionsFromMultiPolygon(
+    candidateMultiPolygon
+  ).filter((region) => {
+    const regionBounds = computeRegionBounds([region]);
+
+    if (!regionBounds || !boundsOverlap(regionBounds, referenceBounds, 0.001)) {
+      return false;
+    }
+
+    const samplePoint = estimateLocalRegionInteriorPoint(region);
+
+    if (samplePoint && isPointInsideOrOnAnyLocalRegion(samplePoint, referenceRegions)) {
+      return true;
+    }
+
+    return (region?.outerPoints || []).some((point) =>
+      isPointInsideOrOnAnyLocalRegion(point, referenceRegions)
+    );
+  });
+
+  if (!constrainedRegions.length) {
+    return [];
+  }
+
+  const constrainedMultiPolygon = buildPolygonClippingMultiPolygonFromRegions(
+    constrainedRegions
+  );
+
+  return constrainedMultiPolygon.length
+    ? filterTinyLocalMultiPolygonArtifacts(constrainedMultiPolygon, minimumAreaSqm)
+    : [];
+}
+
+function unionLocalMultiPolygons(multiPolygons, depth = 0) {
   const validMultiPolygons = (multiPolygons || []).filter(
     (multiPolygon) => Array.isArray(multiPolygon) && multiPolygon.length
   );
@@ -15420,12 +15569,72 @@ function unionLocalMultiPolygons(multiPolygons) {
   try {
     return polygonClipping.union(...validMultiPolygons) || [];
   } catch (error) {
+    const normalizedMultiPolygons = validMultiPolygons
+      .map((multiPolygon) => normalizeLocalMultiPolygonForBoolean(multiPolygon))
+      .filter((multiPolygon) => multiPolygon.length);
+
+    if (normalizedMultiPolygons.length) {
+      try {
+        return polygonClipping.union(...normalizedMultiPolygons) || [];
+      } catch (retryError) {
+        const flattenedPolygons = validMultiPolygons.flat().filter(
+          (polygon) => Array.isArray(polygon) && polygon.length
+        );
+
+        if (depth < 2 && flattenedPolygons.length >= 8) {
+          const partitionedBuckets = partitionLocalMultiPolygonPolygons(
+            flattenedPolygons,
+            Math.max(4, Math.ceil(flattenedPolygons.length / 3))
+          );
+
+          if (
+            partitionedBuckets.length > 1 &&
+            partitionedBuckets.length < flattenedPolygons.length
+          ) {
+            const bucketResults = partitionedBuckets
+              .map((bucket) =>
+                unionLocalMultiPolygons(
+                  bucket.map((polygon) => [polygon]),
+                  depth + 1
+                )
+              )
+              .filter((multiPolygon) => multiPolygon.length);
+
+            if (bucketResults.length) {
+              const mergedBucketResult =
+                bucketResults.length === 1
+                  ? bucketResults[0]
+                  : unionLocalMultiPolygons(bucketResults, depth + 1);
+
+              if (mergedBucketResult.length) {
+                console.warn(
+                  `[terrain-band] raw-contour union partition fallback count=${validMultiPolygons.length} buckets=${partitionedBuckets.length} depth=${depth + 1}`
+                );
+                return mergedBucketResult;
+              }
+            }
+          }
+        }
+
+        console.warn(
+          `[terrain-band] raw-contour union retry fallback count=${normalizedMultiPolygons.length} error=${formatErrorForLog(
+            retryError
+          )}`
+        );
+      }
+    }
+
+    const normalizedFlatFallback = normalizeLocalMultiPolygonForBoolean(
+      validMultiPolygons.flat()
+    );
     console.warn(
       `[terrain-band] raw-contour union fallback count=${validMultiPolygons.length} error=${formatErrorForLog(
         error
       )}`
     );
-    return validMultiPolygons.flat();
+    return normalizedFlatFallback.length
+      ? normalizedFlatFallback
+      : validMultiPolygons.flat();
   }
 }
 
@@ -15715,7 +15924,67 @@ function constrainUpperContourAreaWithinLower(lowerMultiPolygon, upperMultiPolyg
     lowerMultiPolygon
   );
 
-  return intersectedUpperArea.length ? intersectedUpperArea : upperMultiPolygon;
+  if (intersectedUpperArea.length) {
+    return intersectedUpperArea;
+  }
+
+  const lowerBounds = computeLocalMultiPolygonBounds(lowerMultiPolygon);
+  const overlappingUpperArea = lowerBounds
+    ? filterLocalMultiPolygonByBoundsOverlap(upperMultiPolygon, lowerBounds, 0.001)
+    : upperMultiPolygon;
+
+  if (!overlappingUpperArea.length) {
+    return [];
+  }
+
+  const sampledConstrainedUpperArea =
+    constrainLocalMultiPolygonWithinReferenceBySampling(
+      overlappingUpperArea,
+      lowerMultiPolygon,
+      0.0001
+    );
+
+  return sampledConstrainedUpperArea.length
+    ? sampledConstrainedUpperArea
+    : overlappingUpperArea;
+}
+
+function finalizeTileDifferenceMultiPolygon(
+  tilePartitionedResult,
+  untouchedBaseMultiPolygon,
+  baseCount = 0,
+  subtractCount = 0,
+  depth = 0,
+  context = null
+) {
+  const filteredTileResult = filterTinyLocalMultiPolygonArtifacts(
+    tilePartitionedResult,
+    0.0001
+  );
+  const shouldSkipUnionMerge =
+    filteredTileResult.length > 12 ||
+    String(context?.kind || "").trim() === "top-surface";
+  const mergedTileResult =
+    filteredTileResult.length && !shouldSkipUnionMerge
+      ? unionLocalMultiPolygons(filteredTileResult.map((polygon) => [polygon]))
+      : filteredTileResult;
+  const finalizedTileResult =
+    mergedTileResult.length ? mergedTileResult : filteredTileResult;
+  const contextLabel =
+    context && typeof context === "object"
+      ? Object.entries(context)
+          .filter(([, value]) => value !== null && value !== undefined && value !== "")
+          .map(([key, value]) => `${key}=${value}`)
+          .join(" ")
+      : "";
+
+  console.warn(
+    `[terrain-band] tiled difference fallback base=${baseCount} subtract=${subtractCount} tiles=${depth <= 0 ? 9 : 4} depth=${depth + 1} fragments=${filteredTileResult.length} merged=${finalizedTileResult.length}${shouldSkipUnionMerge ? " merge=skipped" : ""}${contextLabel ? ` ${contextLabel}` : ""}`
+  );
+
+  return untouchedBaseMultiPolygon.length
+    ? [...untouchedBaseMultiPolygon, ...finalizedTileResult]
+    : finalizedTileResult;
 }
 
 function differenceLocalMultiPolygon(
@@ -15807,22 +16076,14 @@ function differenceLocalMultiPolygon(
       );
 
       if (Array.isArray(tilePartitionedResult)) {
-        const mergedTileResult = tilePartitionedResult.length
-          ? unionLocalMultiPolygons(tilePartitionedResult.map((polygon) => [polygon]))
-          : [];
-        const contextLabel =
-          context && typeof context === "object"
-            ? Object.entries(context)
-                .filter(([, value]) => value !== null && value !== undefined && value !== "")
-                .map(([key, value]) => `${key}=${value}`)
-                .join(" ")
-            : "";
-        console.warn(
-          `[terrain-band] tiled difference fallback base=${overlappingBaseMultiPolygon.length} subtract=${normalizedSubtractMultiPolygon.length} tiles=${depth <= 0 ? 9 : 4} depth=${depth + 1}${contextLabel ? ` ${contextLabel}` : ""}`
+        return finalizeTileDifferenceMultiPolygon(
+          tilePartitionedResult,
+          untouchedBaseMultiPolygon,
+          overlappingBaseMultiPolygon.length,
+          normalizedSubtractMultiPolygon.length,
+          depth,
+          context
         );
-        return untouchedBaseMultiPolygon.length
-          ? [...untouchedBaseMultiPolygon, ...mergedTileResult]
-          : mergedTileResult;
       }
     }
 
@@ -15916,26 +16177,22 @@ function differenceLocalMultiPolygon(
 }
 
 function normalizeLocalMultiPolygonForBoolean(multiPolygon, minimumAreaSqm = 0.0001) {
+  const minimumArea = Math.max(0.0001, Number(minimumAreaSqm) || 0.0001);
+  const minimumSegmentMeters = Math.max(
+    0.02,
+    Math.min(0.18, Math.sqrt(minimumArea) * 0.42)
+  );
   const regions = buildContourBandRegionsFromMultiPolygon(multiPolygon)
-    .map((region) => ({
-      outerPoints: orientLocalPolygonCounterClockwise(
-        simplifyLocalPolygon(region?.outerPoints || [], 0.01)
-      ),
-      holePoints: (region?.holePoints || [])
-        .map((holePoints) =>
-          orientLocalPolygonClockwise(simplifyLocalPolygon(holePoints || [], 0.01))
-        )
-        .filter(
-          (holePoints) =>
-            holePoints.length >= 3 &&
-            Math.abs(computeLocalPolygonSignedArea(holePoints)) >= minimumAreaSqm
-        ),
-    }))
-    .filter(
-      (region) =>
-        region.outerPoints.length >= 3 &&
-        Math.abs(computeLocalPolygonSignedArea(region.outerPoints)) >= minimumAreaSqm
-    );
+    .map((region) =>
+      sanitizeSketchUpSolidRegion(region, {
+        minAreaMeters: minimumArea,
+        minSegmentMeters: minimumSegmentMeters,
+        minHoleAreaMeters: Math.max(0.0001, minimumArea * 0.8),
+        minHoleSegmentMeters: Math.max(0.02, minimumSegmentMeters * 0.9),
+        repairTolerance: Math.max(0.08, minimumSegmentMeters * 2.4),
+      })
+    )
+    .filter(Boolean);
 
   if (!regions.length) {
     return [];
@@ -15943,11 +16200,81 @@ function normalizeLocalMultiPolygonForBoolean(multiPolygon, minimumAreaSqm = 0.0
 
   const normalizedMultiPolygon = buildPolygonClippingMultiPolygonFromRegions(regions);
   return normalizedMultiPolygon.length
-    ? filterTinyLocalMultiPolygonArtifacts(normalizedMultiPolygon, minimumAreaSqm)
+    ? filterTinyLocalMultiPolygonArtifacts(normalizedMultiPolygon, minimumArea)
     : [];
 }
 
-function intersectLocalMultiPolygon(baseMultiPolygon, clipMultiPolygon) {
+function intersectSingleLocalPolygons(basePolygon, clipPolygon) {
+  if (!Array.isArray(basePolygon) || !basePolygon.length) {
+    return [];
+  }
+
+  if (!Array.isArray(clipPolygon) || !clipPolygon.length) {
+    return [];
+  }
+
+  try {
+    return polygonClipping.intersection([basePolygon], [clipPolygon]) || [];
+  } catch (error) {
+    const normalizedBaseMultiPolygon = normalizeLocalMultiPolygonForBoolean([
+      basePolygon,
+    ]);
+    const normalizedClipMultiPolygon = normalizeLocalMultiPolygonForBoolean([
+      clipPolygon,
+    ]);
+
+    if (!normalizedBaseMultiPolygon.length || !normalizedClipMultiPolygon.length) {
+      return [];
+    }
+
+    try {
+      return (
+        polygonClipping.intersection(
+          normalizedBaseMultiPolygon,
+          normalizedClipMultiPolygon
+        ) || []
+      );
+    } catch (retryError) {
+      return [];
+    }
+  }
+}
+
+function intersectLocalMultiPolygonsPairwise(baseMultiPolygon, clipMultiPolygon) {
+  const partialIntersections = [];
+
+  for (const basePolygon of baseMultiPolygon || []) {
+    const baseBounds = getLocalMultiPolygonPolygonBounds(basePolygon);
+
+    if (!baseBounds) {
+      continue;
+    }
+
+    for (const clipPolygon of clipMultiPolygon || []) {
+      const clipBounds = getLocalMultiPolygonPolygonBounds(clipPolygon);
+
+      if (!clipBounds || !boundsOverlap(baseBounds, clipBounds, 0.001)) {
+        continue;
+      }
+
+      const intersectionResult = intersectSingleLocalPolygons(basePolygon, clipPolygon);
+
+      if (intersectionResult.length) {
+        partialIntersections.push(...intersectionResult);
+      }
+    }
+  }
+
+  return partialIntersections.length
+    ? unionLocalMultiPolygons(partialIntersections.map((polygon) => [polygon]))
+    : [];
+}
+
+function intersectLocalMultiPolygon(
+  baseMultiPolygon,
+  clipMultiPolygon,
+  { suppressFailureLog = false } = {}
+) {
   if (!baseMultiPolygon?.length || !clipMultiPolygon?.length) {
     return [];
   }
@@ -15961,29 +16288,61 @@ function intersectLocalMultiPolygon(baseMultiPolygon, clipMultiPolygon) {
     const normalizedClipMultiPolygon = normalizeLocalMultiPolygonForBoolean(
       clipMultiPolygon
     );
+    let normalizedIntersection = [];
 
     if (normalizedBaseMultiPolygon.length && normalizedClipMultiPolygon.length) {
       try {
-        return (
+        normalizedIntersection =
           polygonClipping.intersection(
             normalizedBaseMultiPolygon,
             normalizedClipMultiPolygon
-          ) || []
-        );
+          ) || [];
       } catch (retryError) {
-        console.warn(
-          `[terrain-band] raw-contour intersection retry fallback error=${formatErrorForLog(
-            retryError
-          )}`
-        );
+        normalizedIntersection = [];
+      }
+
+      if (normalizedIntersection.length) {
+        return normalizedIntersection;
       }
     }
 
-    console.warn(
-      `[terrain-band] raw-contour intersection fallback error=${formatErrorForLog(
-        error
-      )}`
+    const pairwiseIntersection = intersectLocalMultiPolygonsPairwise(
+      baseMultiPolygon,
+      clipMultiPolygon
     );
+
+    if (pairwiseIntersection.length) {
+      if (!suppressFailureLog) {
+        console.warn(
+          `[terrain-band] raw-contour intersection pairwise fallback base=${baseMultiPolygon.length} clip=${clipMultiPolygon.length}`
+        );
+      }
+      return pairwiseIntersection;
+    }
+
+    if (normalizedBaseMultiPolygon.length && normalizedClipMultiPolygon.length) {
+      const normalizedPairwiseIntersection = intersectLocalMultiPolygonsPairwise(
+        normalizedBaseMultiPolygon,
+        normalizedClipMultiPolygon
+      );
+
+      if (normalizedPairwiseIntersection.length) {
+        if (!suppressFailureLog) {
+          console.warn(
+            `[terrain-band] raw-contour intersection normalized-pairwise fallback base=${normalizedBaseMultiPolygon.length} clip=${normalizedClipMultiPolygon.length}`
+          );
+        }
+        return normalizedPairwiseIntersection;
+      }
+    }
+
+    if (!suppressFailureLog) {
+      console.warn(
+        `[terrain-band] raw-contour intersection fallback error=${formatErrorForLog(
+          error
+        )}`
+      );
+    }
     return [];
   }
 }
@@ -16170,6 +16529,14 @@ function resolveHigherContourSideCandidate(
   const referenceAreaSqm = normalizedReferenceMultiPolygon.length
     ? computeLocalMultiPolygonArea(normalizedReferenceMultiPolygon)
     : 0;
+  const referenceBounds =
+    referenceAreaSqm > 0
+      ? computeLocalMultiPolygonBounds(normalizedReferenceMultiPolygon)
+      : null;
+  const referenceRegions =
+    referenceAreaSqm > 0
+      ? buildContourBandRegionsFromMultiPolygon(normalizedReferenceMultiPolygon)
+      : [];
   const clipAreaSqm = Number(siteContext?.stats?.clipAreaSqm || 0);
   const rawCandidates = (candidateMultiPolygons || [])
     .map((multiPolygon, index) => ({
@@ -16180,6 +16547,8 @@ function resolveHigherContourSideCandidate(
         referenceAreaSqm > 0
           ? (() => {
               const candidateAreaSqm = computeLocalMultiPolygonArea(multiPolygon);
+              const candidateBounds =
+                candidateAreaSqm > 0 ? computeLocalMultiPolygonBounds(multiPolygon) : null;
 
               if (!(candidateAreaSqm > 0)) {
                 return null;
@@ -16187,9 +16556,33 @@ function resolveHigherContourSideCandidate(
 
               const overlapMultiPolygon = intersectLocalMultiPolygon(
                 multiPolygon,
-                normalizedReferenceMultiPolygon
+                normalizedReferenceMultiPolygon,
+                { suppressFailureLog: true }
               );
-              const overlapAreaSqm = computeLocalMultiPolygonArea(overlapMultiPolygon);
+              let overlapAreaSqm = computeLocalMultiPolygonArea(overlapMultiPolygon);
+
+              if (
+                !(overlapAreaSqm > 0) &&
+                candidateBounds &&
+                referenceBounds &&
+                boundsOverlap(candidateBounds, referenceBounds, 0.001)
+              ) {
+                const candidateRegions = buildContourBandRegionsFromMultiPolygon(multiPolygon);
+                const estimatedOverlapAreaSqm =
+                  estimateLocalMultiPolygonOverlapAreaFromRegions(
+                    candidateRegions,
+                    referenceRegions
+                  );
+
+                if (estimatedOverlapAreaSqm > overlapAreaSqm) {
+                  overlapAreaSqm = Math.min(
+                    candidateAreaSqm,
+                    referenceAreaSqm,
+                    estimatedOverlapAreaSqm
+                  );
+                }
+              }
+
               const coverageRatio =
                 referenceAreaSqm > 0 ? overlapAreaSqm / referenceAreaSqm : 0;
               const precisionRatio =
@@ -17636,6 +18029,16 @@ function buildContourBandGroupFromMultiPolygon(
 }
 
 function buildGridContourBandGroups(siteContext) {
+  const cacheKey = buildGridContourCacheKey(siteContext);
+  const sharedCachedBandGroups = readSharedDerivedCache(
+    sharedGridContourBandGroupCache,
+    cacheKey
+  );
+
+  if (sharedCachedBandGroups) {
+    return sharedCachedBandGroups;
+  }
+
   const rawSlices = buildContourBandSlices(siteContext);
 
   if (!rawSlices.length) {
@@ -17680,6 +18083,7 @@ function buildGridContourBandGroups(siteContext) {
     bandGroups.push(bandGroup);
   }
 
+  writeSharedDerivedCache(sharedGridContourBandGroupCache, cacheKey, bandGroups);
   return bandGroups;
 }
 
@@ -17704,8 +18108,20 @@ function buildGridAreaAboveByLevel(
             ...(siteContext?.stats || {}),
             requestedContourInterval: normalizedIntervalOverride,
             effectiveContourBandInterval: normalizedIntervalOverride,
-          },
-        };
+        },
+      };
+  const cacheKey = buildGridContourCacheKey(
+    workingSiteContext,
+    normalizedIntervalOverride
+  );
+  const sharedCachedAreaResult = readSharedDerivedCache(
+    sharedGridAreaAboveByLevelCache,
+    cacheKey
+  );
+
+  if (sharedCachedAreaResult) {
+    return sharedCachedAreaResult;
+  }
   const gridBandGroups = buildGridContourBandGroups(workingSiteContext);
   const gridAreaAboveByLevel = new Map();
   let cumulativeGridMultiPolygon = [];
@@ -17732,13 +18148,16 @@ function buildGridAreaAboveByLevel(
     }
   }
 
-  return {
+  const areaResult = {
     gridBandGroups,
     gridAreaAboveByLevel,
     resolveAreaAboveLevel(level) {
       return gridAreaAboveByLevel.get(buildContourLevelKey(level)) || [];
     },
   };
+
+  writeSharedDerivedCache(sharedGridAreaAboveByLevelCache, cacheKey, areaResult);
+  return areaResult;
 }
 
 function buildContourBandGroups(siteContext) {
@@ -18314,6 +18733,15 @@ function getCachedRenderableContourBandGroups(siteContext) {
   const cacheKey = `${getContourBandCacheKey(siteContext)}|${
     normalizeBuildingPlacementMode(siteContext?.options?.buildingPlacement)
   }|${siteContext.options?.includeBuildings !== false ? "with-bldg" : "no-bldg"}`;
+  const sharedCachedBandGroups = readSharedDerivedCache(
+    sharedContourRenderableBandGroupCache,
+    cacheKey
+  );
+
+  if (sharedCachedBandGroups) {
+    return applyContourBandGroupStats(siteContext, sharedCachedBandGroups);
+  }
+
   const owner = resolveRenderableContourCacheOwner(siteContext);
   const entry = getOrCreateWeakMapEntry(contourRenderableBandGroupCache, owner);
 
@@ -18326,6 +18754,7 @@ function getCachedRenderableContourBandGroups(siteContext) {
   if (entry instanceof Map) {
     entry.set(cacheKey, bandGroups);
   }
+  writeSharedDerivedCache(sharedContourRenderableBandGroupCache, cacheKey, bandGroups);
 
   return applyContourBandGroupStats(siteContext, bandGroups);
 }
@@ -18623,6 +19052,15 @@ function getCachedContourTopSurfaceGroups(siteContext) {
   }
 
   const cacheKey = getContourBandCacheKey(siteContext);
+  const sharedCachedTopSurfaceGroups = readSharedDerivedCache(
+    sharedContourTopSurfaceCache,
+    cacheKey
+  );
+
+  if (sharedCachedTopSurfaceGroups) {
+    return sharedCachedTopSurfaceGroups;
+  }
+
   const owner = resolveContourCacheOwner(siteContext);
   const entry = getOrCreateWeakMapEntry(contourTopSurfaceCache, owner);
 
@@ -18635,6 +19073,7 @@ function getCachedContourTopSurfaceGroups(siteContext) {
   if (entry instanceof Map) {
     entry.set(cacheKey, topSurfaceGroups);
   }
+  writeSharedDerivedCache(sharedContourTopSurfaceCache, cacheKey, topSurfaceGroups);
 
   return topSurfaceGroups;
 }
