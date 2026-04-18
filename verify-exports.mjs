@@ -44,6 +44,7 @@ import {
   sanitizeSketchUpSolidRegion,
   simplifySketchUpSolidRegion,
   buildRawAnchoredContourBandDiagnostics,
+  buildTerrainPipelineDiagnostics,
   localMetersFromLngLat,
 } from "./server.mjs";
 
@@ -302,6 +303,53 @@ function summarizeExportContext(siteContext, format) {
     effective: exportSiteContext.stats?.effectiveContourBandInterval,
     contourCount: exportSiteContext?.contourLines?.features?.length || 0,
     terrainPlan,
+  };
+}
+
+function summarizePlacementDiagnostics(exportSiteContext) {
+  const diagnostics =
+    exportSiteContext?.stats?.terrainPipelineDiagnostics ||
+    buildTerrainPipelineDiagnostics(exportSiteContext) ||
+    null;
+  const buildingPlacement = diagnostics?.buildingPlacement || null;
+  const roadPlacement = diagnostics?.roadPlacement || null;
+
+  return {
+    buildingPlacement: buildingPlacement
+      ? {
+          sampleCount: Number(buildingPlacement.sampleCount || 0),
+          unresolvedCount: Number(buildingPlacement.unresolvedCount || 0),
+          terrainBasisAvailableCount: Number(
+            buildingPlacement.terrainBasisAvailableCount || 0
+          ),
+          terrainBasisMismatchCount: Number(
+            buildingPlacement.terrainBasisMismatchCount || 0
+          ),
+          terrainBasisFallbackCount: Number(
+            buildingPlacement.terrainBasisFallbackCount || 0
+          ),
+          terrainBasisMaxDelta: Number(
+            buildingPlacement.terrainBasisMaxDelta || 0
+          ),
+        }
+      : null,
+    roadPlacement: roadPlacement
+      ? {
+          roadFeatureCount: Number(roadPlacement.roadFeatureCount || 0),
+          groupCount: Number(roadPlacement.groupCount || 0),
+          footprintAreaSqm: Number(roadPlacement.footprintAreaSqm || 0),
+          coveredAreaSqm: Number(roadPlacement.coveredAreaSqm || 0),
+          uncoveredAreaSqm: Number(roadPlacement.uncoveredAreaSqm || 0),
+          coverageRatio: Number(roadPlacement.coverageRatio || 0),
+          elevationCount: Number(roadPlacement.elevationCount || 0),
+          minElevation: Number.isFinite(roadPlacement.minElevation)
+            ? Number(roadPlacement.minElevation)
+            : null,
+          maxElevation: Number.isFinite(roadPlacement.maxElevation)
+            ? Number(roadPlacement.maxElevation)
+            : null,
+        }
+      : null,
   };
 }
 
@@ -664,6 +712,52 @@ function collectFormatFailures(testCase, result) {
     );
   }
 
+  const buildingPlacement = result.formats["3dm"].buildingPlacement;
+
+  if (Number(buildingPlacement?.sampleCount || 0) > 0) {
+    if (Number(buildingPlacement?.unresolvedCount || 0) > 0) {
+      failures.push(
+        `${testCase.name}/3dm: unresolved building placement samples ` +
+          `${buildingPlacement.unresolvedCount}/${buildingPlacement.sampleCount}`
+      );
+    }
+
+    if (Number(buildingPlacement?.terrainBasisMismatchCount || 0) > 0) {
+      failures.push(
+        `${testCase.name}/3dm: building terrain-basis mismatches ` +
+          `${buildingPlacement.terrainBasisMismatchCount}/${buildingPlacement.sampleCount}`
+      );
+    }
+
+    if (Number(buildingPlacement?.terrainBasisMaxDelta || 0) > 0.001) {
+      failures.push(
+        `${testCase.name}/3dm: building terrain-basis max delta ` +
+          `${buildingPlacement.terrainBasisMaxDelta} should stay at 0`
+      );
+    }
+  }
+
+  const roadPlacement = result.formats["3dm"].roadPlacement;
+
+  if (
+    Number(roadPlacement?.roadFeatureCount || 0) > 0 &&
+    Number(roadPlacement?.footprintAreaSqm || 0) > 0.001
+  ) {
+    if (Number(roadPlacement?.groupCount || 0) <= 0) {
+      failures.push(
+        `${testCase.name}/3dm: road placement produced no terrain surface groups ` +
+          `for ${roadPlacement.roadFeatureCount} road features`
+      );
+    }
+
+    if (Number(roadPlacement?.coverageRatio || 0) <= 0) {
+      failures.push(
+        `${testCase.name}/3dm: road terrain coverage ratio ` +
+          `${roadPlacement.coverageRatio} should be positive`
+      );
+    }
+  }
+
   if (result.formats.skp.groups < expect.minSkpGroups) {
     failures.push(
       `${testCase.name}/skp: groups ${result.formats.skp.groups} below ${expect.minSkpGroups}`
@@ -729,6 +823,13 @@ async function verifyCase(testCase) {
     threeDm.exportSiteContext,
     threeDm.terrainPlan
   );
+  const threeDmTerrainDiagnostics =
+    threeDm.exportSiteContext?.stats?.terrainPipelineDiagnostics ||
+    buildTerrainPipelineDiagnostics(threeDm.exportSiteContext) ||
+    null;
+  const threeDmPlacementDiagnostics = summarizePlacementDiagnostics(
+    threeDm.exportSiteContext
+  );
   const skpCurveSummary = summarizeSketchUpCurveHeights(skpPayload);
   const skpAttemptIntervals = [];
   const skpBytes = FULL_SKP_EXPORT
@@ -772,9 +873,10 @@ async function verifyCase(testCase) {
         curveCount: threeDmCurveSummary.curveCount,
         curveMaxAbsZ: threeDmCurveSummary.maxAbsZ,
         terrainBasisMismatchLevels: Number(
-          threeDm.exportSiteContext?.stats?.terrainPipelineDiagnostics?.curveTerrainAlignment
-            ?.mismatchLevelCount || 0
+          threeDmTerrainDiagnostics?.curveTerrainAlignment?.mismatchLevelCount || 0
         ),
+        buildingPlacement: threeDmPlacementDiagnostics.buildingPlacement,
+        roadPlacement: threeDmPlacementDiagnostics.roadPlacement,
         terrainBands: threeDmTerrainBands,
         terrainPlanBands: threeDmTerrainPlanBands,
       },
@@ -2764,6 +2866,70 @@ async function runBaselineVerification() {
     assert.ok(
       removeOverlapAreaSqm <= 0.001,
       "Remove-overlap building-terrain mode should carve overlapping terrain above the building base."
+    );
+    const syntheticRoadPlacementSiteContext = cloneJsonValue({
+      ...syntheticBuildingPlacementSiteContext,
+      options: {
+        ...syntheticBuildingPlacementSiteContext.options,
+        includeBuildings: false,
+        includeRoads: true,
+      },
+      buildings: {
+        type: "FeatureCollection",
+        features: [],
+      },
+      roads: {
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            properties: {
+              roadId: "R-1",
+              roadName: "Terrain Basis Road",
+              surfaceDerived: true,
+            },
+            geometry: {
+              type: "Polygon",
+              coordinates: [[
+                [126.97822, 37.56664],
+                [126.97825, 37.56664],
+                [126.97825, 37.56666],
+                [126.97822, 37.56666],
+                [126.97822, 37.56664],
+              ]],
+            },
+          },
+        ],
+      },
+    });
+    const preparedRoadPlacementSiteContext = prepareSiteContextForExport(
+      syntheticRoadPlacementSiteContext,
+      syntheticRoadPlacementSiteContext.options,
+      "3dm"
+    );
+    const roadPlacementDiagnostics = buildTerrainPipelineDiagnostics(
+      preparedRoadPlacementSiteContext
+    )?.roadPlacement;
+    assert.equal(
+      roadPlacementDiagnostics?.roadFeatureCount,
+      1,
+      "Road placement diagnostics should report the synthetic road footprint."
+    );
+    assert.ok(
+      Number(roadPlacementDiagnostics?.groupCount || 0) >= 1,
+      "Road placement diagnostics should produce at least one terrain surface group for the road footprint."
+    );
+    assert.ok(
+      Number(roadPlacementDiagnostics?.coverageRatio || 0) > 0.99,
+      "Road placement diagnostics should cover the full synthetic road footprint with terrain-basis surfaces."
+    );
+    assert.ok(
+      Number(roadPlacementDiagnostics?.uncoveredAreaSqm || 0) <= 0.01,
+      "Road placement diagnostics should leave essentially no uncovered road footprint in the synthetic regression."
+    );
+    assert.ok(
+      Number(roadPlacementDiagnostics?.elevationCount || 0) >= 1,
+      "Road placement diagnostics should record at least one terrain elevation for the synthetic road footprint."
     );
     const refinedSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       refinedSketchUpSiteContext

@@ -31,9 +31,11 @@ Last updated: 2026-04-19
   - Added export verification that fails if export curves diverge from the terrain basis
   - Added building Z diagnostics against the terrain basis
   - Added road terrain-basis coverage diagnostics
+  - Added export-side placement summaries and regression gates for synthetic building/road terrain-basis alignment
+  - Fixed flat-fallback road placement so contour-road surfaces still cover road footprints when top-surface groups are empty
 - `In Progress`
   - Reconnecting building/road Z placement to the same terrain basis
-  - Turning the new placement diagnostics into stricter export-side failures where appropriate
+  - Turning live-case placement diagnostics into stricter export-side failures where upstream data is actually available
 - `Next`
   - Validate buildings and roads against the final terrain basis, not parallel fallback logic
   - Add explicit export-side checks for building/road terrain-base mismatches
@@ -139,6 +141,13 @@ For requested `1m` contour models from `5m` source:
 8. Added placement diagnostics:
    - building placement now records terrain-basis elevation, delta, and alignment state
    - road placement now records terrain-basis coverage over the road footprint
+9. Promoted placement diagnostics into export verification where safe:
+   - `verify:exports` now carries 3DM building/road placement summaries in the result object
+   - export verification now fails if sampled building placements disagree with the terrain basis
+   - baseline synthetic road regression now fails if the road footprint is not covered by terrain-basis surfaces
+10. Fixed flat contour-road fallback:
+   - when contour top-surface groups are empty but the terrain falls back to a flat contour cap, road surfaces now intersect against that flat cap instead of disappearing
+   - road coverage diagnostics now clamp numeric over-coverage so `coverageRatio` stays within the real footprint
 
 ## Latest Snapshot
 
@@ -182,17 +191,18 @@ Interpretation:
 - `gyeyang-large` now also satisfies the export-vs-terrain-basis rule even with `effective=2m`.
 - The next real issue is no longer contour-basis alignment itself; it is downstream Z placement validation for buildings and roads.
 - We now have the diagnostics needed to tell whether a building base elevation matched the terrain basis and how much of the road footprint actually received terrain-basis coverage.
+- After promoting placement gates, `seoul-center` exposed a real flat-fallback road bug (`roadCoverage=0` with `roadFeatureCount=3`), and that fallback is now fixed so current `verify:exports` is green again.
 
 ## What This Turn Still Does Not Claim
 
 - This does not mean the terrain algorithm is fully fixed.
 - This is a structural alignment step plus stronger instrumentation.
-- The remaining work is to validate building/road Z against that same basis and catch those failures automatically.
-- Some of that validation is now instrumented, but the project still needs stronger failure gates for real-world building/road Z regressions.
+- The remaining work is to validate building/road Z against that same basis on real upstream-fed cases and catch those failures automatically.
+- Synthetic placement regressions are now stricter, but real-case road/building gates still depend on upstream data availability in the verification environment.
 
 ## Next Steps
 
-1. Promote the new building placement diagnostics into stronger export checks once we confirm acceptable fallback behavior on real parcels.
-2. Decide a failure threshold for road terrain-basis coverage and wire that into export verification.
-3. Keep export contour curves flat on the bottom reference plane across 3DM/SKP/OBJ and verify that with tests.
+1. Capture real upstream-fed building/road placement diagnostics from representative parcels and set tighter live-case failure thresholds.
+2. Keep export contour curves flat on the bottom reference plane across 3DM/SKP/OBJ and verify that with tests.
+3. Reduce band-boundary mismatch noise so terrain diagnostics focus on true geometry errors instead of expected cumulative-vs-boundary differences.
 4. Keep updating this file every work session so the next conversation can resume from the same state quickly.

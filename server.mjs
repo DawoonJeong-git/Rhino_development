@@ -13396,7 +13396,11 @@ function buildRoadPlacementDiagnostics(siteContext) {
       : groupMultiPolygon;
   }
 
-  const coveredAreaSqm = computeLocalMultiPolygonArea(coveredRoadMultiPolygon);
+  const rawCoveredAreaSqm = computeLocalMultiPolygonArea(coveredRoadMultiPolygon);
+  const coveredAreaSqm =
+    footprintAreaSqm > 0
+      ? Math.min(footprintAreaSqm, rawCoveredAreaSqm)
+      : rawCoveredAreaSqm;
   const uncoveredAreaSqm = Math.max(0, footprintAreaSqm - coveredAreaSqm);
   const sortedElevations = [...new Set(surfaceElevations)]
     .filter(Number.isFinite)
@@ -22111,6 +22115,7 @@ function buildRoadContourSurfaceGroups(siteContext, center) {
 
   const roadFootprintMultiPolygon = getCachedRoadFootprintMultiPolygon(siteContext, center);
   const roadFootprintBounds = computeLocalMultiPolygonBounds(roadFootprintMultiPolygon);
+  const terrainPlan = resolveContourTerrainRenderPlan(siteContext);
 
   if (!roadFootprintMultiPolygon.length) {
     if (entry instanceof Map) {
@@ -22121,6 +22126,54 @@ function buildRoadContourSurfaceGroups(siteContext, center) {
 
   const topSurfaceGroups = getCachedContourTopSurfaceGroups(siteContext);
   const roadSurfaceGroups = [];
+
+  if (
+    !topSurfaceGroups.length &&
+    terrainPlan?.useFlatFallback === true &&
+    Array.isArray(terrainPlan?.clipPolygon) &&
+    terrainPlan.clipPolygon.length >= 3 &&
+    Number.isFinite(terrainPlan?.flatTopElevation)
+  ) {
+    const flatClipMultiPolygon = buildLocalMultiPolygonFromOpenRing(
+      terrainPlan.clipPolygon
+    );
+    let overlapMultiPolygon = [];
+
+    try {
+      overlapMultiPolygon =
+        polygonClipping.intersection(
+          roadFootprintMultiPolygon,
+          flatClipMultiPolygon
+        ) || [];
+    } catch (error) {
+      console.warn(
+        `[roads] contour flat intersection fallback elevation=${Number(
+          terrainPlan.flatTopElevation || 0
+        ).toFixed(3)} error=${formatErrorForLog(error)}`
+      );
+      overlapMultiPolygon = roadFootprintMultiPolygon;
+    }
+
+    const areaSqm = computeLocalMultiPolygonArea(overlapMultiPolygon);
+
+    if (areaSqm > 0.001) {
+      const regions = buildContourRegionsFromMultiPolygon(overlapMultiPolygon);
+
+      if (regions.length) {
+        roadSurfaceGroups.push({
+          elevation: Number(Number(terrainPlan.flatTopElevation).toFixed(3)),
+          areaSqm: Number(areaSqm.toFixed(3)),
+          regions,
+        });
+      }
+    }
+
+    if (entry instanceof Map) {
+      entry.set(cacheKey, roadSurfaceGroups);
+    }
+
+    return roadSurfaceGroups;
+  }
 
   for (const surfaceGroup of topSurfaceGroups) {
     if (!surfaceGroup.multiPolygon?.length) {
