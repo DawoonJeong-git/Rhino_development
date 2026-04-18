@@ -129,7 +129,29 @@ function summarizeDiagnostics(siteContext, exportSiteContext, include3dmBytes = 
           mismatchExampleLevels: mismatchLevels.slice(0, 12),
         }
       : null,
+    bandBoundaryAlignment: diagnostics
+      ? {
+          mismatchLevelCount: Number(
+            diagnostics?.bandBoundaryAlignment?.mismatchLevelCount || 0
+          ),
+          mismatchExampleLevels: Array.isArray(
+            diagnostics?.bandBoundaryAlignment?.mismatchLevels
+          )
+            ? diagnostics.bandBoundaryAlignment.mismatchLevels.slice(0, 12)
+            : [],
+        }
+      : null,
     nativeClosedLoops: diagnostics?.nativeClosedLoops || null,
+    terrainBasisContours: diagnostics
+      ? {
+          featureCount: Number(
+            diagnostics?.terrainBasisContours?.featureCount || 0
+          ),
+          levelCount: Number(
+            diagnostics?.terrainBasisContours?.levels?.length || 0
+          ),
+        }
+      : null,
     bandCounts: {
       source: Number(diagnostics?.sourceBandGroups?.length || 0),
       cumulative: Number(diagnostics?.cumulativeBandGroups?.length || 0),

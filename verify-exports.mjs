@@ -2350,10 +2350,12 @@ async function runBaselineVerification() {
       generatedExportContours.every(
         (feature) =>
           feature?.properties?.closedLoop === true &&
-          String(feature?.properties?.provider || "").trim() ===
-            "derived-contours-resolved-area"
+          [
+            "resolved-area-above-contour",
+            "top-surface-cap-contour",
+          ].includes(String(feature?.properties?.exportDerived || "").trim())
       ),
-      "Generated intermediate contours should reuse the terrain-aligned resolved contour plan so the display curves and terrace edges stay in sync."
+      "Generated intermediate contours should come directly from the terrain contour basis so the display curves and terrace edges stay in sync."
     );
     const refined3dmTerrainPlan = resolveContourTerrainRenderPlan(refined3dmSiteContext);
     assert.equal(

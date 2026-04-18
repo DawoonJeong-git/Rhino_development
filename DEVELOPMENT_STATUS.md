@@ -4,10 +4,10 @@ Last updated: 2026-04-18
 
 ## Workflow
 
-- `develop`에서 수정하고 검증한다.
-- `git`에 반영한다.
-- `C:\SpaceWork_deploy`를 fast-forward 한다.
-- 웹 배포를 실행하고 공개 URL을 확인한다.
+- Modify and verify in `develop`.
+- Commit and push with `git`.
+- Fast-forward `C:\SpaceWork_deploy`.
+- Run web deployment and verify the public URLs.
 
 ## Progress Tracking
 
@@ -15,7 +15,7 @@ Last updated: 2026-04-18
 - Progress snapshot command:
   - `node scripts/report-terrain-progress.mjs --case seoul-hillside,gyeyang-large`
 - Notes:
-  - Use the snapshot script to see current contour closure counts, curve/terrain mismatch counts, band counts, and placement status.
+  - Use the snapshot script to see contour closure counts, export-vs-terrain-basis mismatch counts, band-boundary mismatch counts, band counts, and placement status.
   - Update this file every working session so the next conversation can resume from here.
 
 ## Current Board
@@ -25,12 +25,13 @@ Last updated: 2026-04-18
   - Added terrain pipeline diagnostics in export preparation
   - Added progress snapshot script
   - Added persistent top-level status document
+  - Switched export contour assembly to terrain-basis-first generation
+  - Flattened 3DM contour display curves onto the bottom reference plane
 - `In Progress`
-  - Replacing “display-generated contour reuse” with a terrain-basis-first export path
-  - Identifying the first levels where export curves and terrain cumulative bands diverge
+  - Reconnecting every native 5m closed loop to the terrain basis on heavy cases
+  - Identifying why some native contour anchor levels still vanish from the terrain basis on `gyeyang-large`
   - Reconnecting building/road Z placement to the same terrain basis
 - `Next`
-  - Rebuild terrain bands from one closed contour basis instead of separate display/band paths
   - Make 5m closed raw contours the root of both export curves and terrain solids
   - Generate intermediate 1m curves only from that closed 5m basis
   - Validate buildings and roads against the final terrain basis, not parallel fallback logic
@@ -78,7 +79,7 @@ For requested `1m` contour models from `5m` source:
 
 - `prepareSiteContextForExport()` may refine the terrain grid and may augment display contours for finer requested intervals.
 - `normalizeContourFeatureCollection()` merges and normalizes contour inputs.
-- `buildClosedContourExportCollection()` closes native open contours against the clip boundary and prepares export contour curves.
+- `buildClosedContourExportCollection()` now assembles export curves from the terrain contour basis first, then uses native closed loops only as level-gap fallback.
 
 ### Terrain solid generation
 
@@ -95,18 +96,18 @@ For requested `1m` contour models from `5m` source:
 
 ## Confirmed Structural Problems
 
-1. Export curves and terrain solids have been allowed to diverge.
+1. Export curves and terrain solids were allowed to diverge.
    - Export curves could reuse generated contour features that did not come from the same contour-band basis as the final terrain solid.
    - Terrain solids come from contour band groups, but display curves could come from a different generated contour path.
 
 2. Open contour closure is central and needs first-class diagnostics.
-   - The important step is not only “can we close the curve” but also “did we choose the correct higher side”.
+   - The important step is not only "can we close the curve" but also "did we choose the correct higher side."
 
 3. Building and road Z placement are downstream consumers.
    - If terrain bands are wrong, Z placement will also be wrong.
    - We still need more explicit diagnostics that compare placement results against the final terrain basis.
 
-4. Debug visibility has been too weak.
+4. Debug visibility had been too weak.
    - The code had many helper paths, but not enough one-shot summaries that clearly say whether curves, terrain, and placement still agree.
 
 ## Changes Introduced In This Turn
@@ -118,19 +119,23 @@ For requested `1m` contour models from `5m` source:
    - open contour closure counts
    - native closed loop counts
    - export contour counts by level
+   - terrain-basis contour counts by level
    - cumulative/renderable band summaries
-   - curve-vs-terrain mismatch level summary
+   - export-vs-terrain-basis mismatch summary
+   - export-vs-band-boundary mismatch summary
    - building placement source summary
-4. Tightened export contour reuse:
-   - generated contour features are only reused when they are terrain-aligned generated contours
-   - arbitrary generated display contours are no longer treated as trusted export contour sources
+4. Switched export contour assembly to terrain-basis-first output:
+   - export curves now prefer `resolvedAreaAboveByLevel` / top-surface terrain basis output
+   - native closed loops only fill levels that the terrain basis still does not cover
+5. Flattened 3DM contour display curves:
+   - 3DM contour curves now sit on the flat reference plane instead of floating through the terrain solid
 
 ## Latest Snapshot
 
 Source:
 
 - `node scripts/report-terrain-progress.mjs --case seoul-hillside,gyeyang-large`
-- generated at `2026-04-18T04:53:50.450Z`
+- generated at `2026-04-18T05:19:25.367Z`
 
 Summary:
 
@@ -140,36 +145,39 @@ Summary:
   - accepted closures: `16`
   - rejected closures: `2`
   - native closed loops: `17`
+  - terrain-basis contours: `58 features / 51 levels`
   - source/cumulative/renderable/top-surface bands: `15 / 15 / 15 / 15`
-  - curve-terrain mismatch level count: `37`
-  - first mismatches appear immediately from `85m` upward
+  - export-vs-terrain-basis mismatch level count: `0`
+  - export-vs-band-boundary mismatch level count: `39`
 - `gyeyang-large`
   - requested/source/effective interval: `1 / 5 / 2`
   - native open contours: `76`
   - accepted closures: `60`
   - rejected closures: `16`
   - native closed loops: `60`
+  - terrain-basis contours: `253 features / 92 levels`
   - source/cumulative/renderable/top-surface bands: `12 / 12 / 12 / 6`
-  - curve-terrain mismatch level count: `98`
-  - first mismatches appear immediately from `35m` upward
+  - export-vs-terrain-basis mismatch level count: `12`
+  - remaining mismatches are native source levels like `35, 45, 55, ... 145`
+  - export-vs-band-boundary mismatch level count: `100`
 
 Interpretation:
 
-- The main structural problem is still present.
-- Export contour curves are still much denser than the cumulative terrain band boundaries.
-- That means the current model still does not satisfy the intended rule:
-  - “Use the same closed contour basis for both the bottom reference curves and the terrain solid.”
-- This is now measurable and visible instead of hidden.
+- The export contour path is now structurally tied to the terrain basis instead of reusing a separate display contour path.
+- `seoul-hillside` now satisfies the intended rule at the export-vs-terrain-basis level.
+- `gyeyang-large` still exposes the next real issue:
+  - some native 5m source levels are still not represented inside the final terrain basis
+  - this is the next place to fix before building/road Z can be trusted on heavy parcels
 
 ## What This Turn Still Does Not Claim
 
 - This does not mean the terrain algorithm is fully fixed.
-- This is a structural cleanup plus instrumentation step so the next terrain fix can be made against a clearly visible pipeline.
-- The remaining work is to make terrain band generation fully follow the intended “raw closed contour basis first” model.
+- This is a structural alignment step plus stronger instrumentation.
+- The remaining work is to make the terrain basis absorb every native closed source level on heavy cases, then validate building/road Z against that same basis.
 
 ## Next Steps
 
-1. Use the new terrain diagnostics on the broken live cases and identify which levels diverge first.
-2. Rework terrain band generation so native closed contours and generated intermediate contours are derived from one contour basis.
-3. Validate building and road Z against that same terrain basis.
+1. Fix `gyeyang-large` so native source contour levels like `35, 45, 55, ...` are preserved inside the terrain basis instead of being dropped.
+2. Add placement diagnostics that compare building/road base Z against the final terrain basis, not only against the raw terrain grid.
+3. Keep export contour curves flat on the bottom reference plane across 3DM/SKP/OBJ and verify that with tests.
 4. Keep updating this file every work session so the next conversation can resume from the same state quickly.
