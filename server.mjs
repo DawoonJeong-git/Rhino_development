@@ -19178,6 +19178,23 @@ function buildRawAnchoredContourBandAssembly(
     }
   }
 
+  // Preserve exact native contour anchor levels inside the resolved terrain
+  // basis even when the exported/rendered band interval is coarser.
+  for (const level of anchorLevels) {
+    const levelKey = buildContourLevelKey(level);
+
+    if (!constrainedAnchorAreaByLevel.has(levelKey)) {
+      continue;
+    }
+
+    if (!resolvedAreaAboveByLevel.has(levelKey)) {
+      resolvedAreaAboveByLevel.set(
+        levelKey,
+        constrainedAnchorAreaByLevel.get(levelKey) || []
+      );
+    }
+  }
+
   if (bandGroups.length) {
     Object.assign(bandGroups, {
       rawAnchoredContourTerrainUsed: true,

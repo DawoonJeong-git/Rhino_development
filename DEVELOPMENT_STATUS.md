@@ -1,6 +1,6 @@
 # Development Status
 
-Last updated: 2026-04-18
+Last updated: 2026-04-19
 
 ## Workflow
 
@@ -27,14 +27,15 @@ Last updated: 2026-04-18
   - Added persistent top-level status document
   - Switched export contour assembly to terrain-basis-first generation
   - Flattened 3DM contour display curves onto the bottom reference plane
+  - Preserved native 5m anchor levels inside the resolved terrain basis when the render interval relaxes
+  - Added export verification that fails if export curves diverge from the terrain basis
 - `In Progress`
-  - Reconnecting every native 5m closed loop to the terrain basis on heavy cases
-  - Identifying why some native contour anchor levels still vanish from the terrain basis on `gyeyang-large`
   - Reconnecting building/road Z placement to the same terrain basis
+  - Adding placement diagnostics that show when XY is correct but Z comes from the wrong source
 - `Next`
-  - Make 5m closed raw contours the root of both export curves and terrain solids
-  - Generate intermediate 1m curves only from that closed 5m basis
   - Validate buildings and roads against the final terrain basis, not parallel fallback logic
+  - Add explicit export-side checks for building/road terrain-base mismatches
+  - Keep reducing band-boundary mismatch noise so the diagnostics point only at real geometry errors
 
 ## Current Focus
 
@@ -129,13 +130,17 @@ For requested `1m` contour models from `5m` source:
    - native closed loops only fill levels that the terrain basis still does not cover
 5. Flattened 3DM contour display curves:
    - 3DM contour curves now sit on the flat reference plane instead of floating through the terrain solid
+6. Preserved native contour anchor levels in heavy relaxed-interval cases:
+   - `resolvedAreaAboveByLevel` now keeps native 5m anchor levels even when the render interval is coarser
+7. Added regression coverage for export-vs-terrain-basis mismatch:
+   - `verify:exports` now fails if 3DM export curves diverge from the terrain basis
 
 ## Latest Snapshot
 
 Source:
 
 - `node scripts/report-terrain-progress.mjs --case seoul-hillside,gyeyang-large`
-- generated at `2026-04-18T05:19:25.367Z`
+- generated at `2026-04-18T15:10:08.330Z`
 
 Summary:
 
@@ -155,29 +160,27 @@ Summary:
   - accepted closures: `60`
   - rejected closures: `16`
   - native closed loops: `60`
-  - terrain-basis contours: `253 features / 92 levels`
+  - terrain-basis contours: `266 features / 104 levels`
   - source/cumulative/renderable/top-surface bands: `12 / 12 / 12 / 6`
-  - export-vs-terrain-basis mismatch level count: `12`
-  - remaining mismatches are native source levels like `35, 45, 55, ... 145`
+  - export-vs-terrain-basis mismatch level count: `0`
   - export-vs-band-boundary mismatch level count: `100`
 
 Interpretation:
 
 - The export contour path is now structurally tied to the terrain basis instead of reusing a separate display contour path.
 - `seoul-hillside` now satisfies the intended rule at the export-vs-terrain-basis level.
-- `gyeyang-large` still exposes the next real issue:
-  - some native 5m source levels are still not represented inside the final terrain basis
-  - this is the next place to fix before building/road Z can be trusted on heavy parcels
+- `gyeyang-large` now also satisfies the export-vs-terrain-basis rule even with `effective=2m`.
+- The next real issue is no longer contour-basis alignment itself; it is downstream Z placement validation for buildings and roads.
 
 ## What This Turn Still Does Not Claim
 
 - This does not mean the terrain algorithm is fully fixed.
 - This is a structural alignment step plus stronger instrumentation.
-- The remaining work is to make the terrain basis absorb every native closed source level on heavy cases, then validate building/road Z against that same basis.
+- The remaining work is to validate building/road Z against that same basis and catch those failures automatically.
 
 ## Next Steps
 
-1. Fix `gyeyang-large` so native source contour levels like `35, 45, 55, ...` are preserved inside the terrain basis instead of being dropped.
-2. Add placement diagnostics that compare building/road base Z against the final terrain basis, not only against the raw terrain grid.
+1. Add placement diagnostics that compare building/road base Z against the final terrain basis, not only against the raw terrain grid.
+2. Add export checks that fail when buildings or roads use a base elevation source other than the final terrain basis.
 3. Keep export contour curves flat on the bottom reference plane across 3DM/SKP/OBJ and verify that with tests.
 4. Keep updating this file every work session so the next conversation can resume from the same state quickly.

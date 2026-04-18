@@ -648,6 +648,13 @@ function collectFormatFailures(testCase, result) {
     );
   }
 
+  if (result.formats["3dm"].terrainBasisMismatchLevels > 0) {
+    failures.push(
+      `${testCase.name}/3dm: export-vs-terrain-basis mismatch levels ` +
+        `${result.formats["3dm"].terrainBasisMismatchLevels} should be 0`
+    );
+  }
+
   if (result.formats["3dm"].terrainBands.trailingFullFootprintBandCount > 0) {
     failures.push(
       `${testCase.name}/3dm: trailing full-footprint terrain bands detected ` +
@@ -764,6 +771,10 @@ async function verifyCase(testCase) {
         bytes: threeDmBytes.length,
         curveCount: threeDmCurveSummary.curveCount,
         curveMaxAbsZ: threeDmCurveSummary.maxAbsZ,
+        terrainBasisMismatchLevels: Number(
+          threeDm.exportSiteContext?.stats?.terrainPipelineDiagnostics?.curveTerrainAlignment
+            ?.mismatchLevelCount || 0
+        ),
         terrainBands: threeDmTerrainBands,
         terrainPlanBands: threeDmTerrainPlanBands,
       },
