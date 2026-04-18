@@ -13039,9 +13039,39 @@ function estimateBuildingDominantTerraceElevationFromBandOverlap(
     }
   }
 
-  return dominantArea > 0 && Number.isFinite(dominantElevation)
-    ? Number(dominantElevation.toFixed(3))
-    : null;
+  if (dominantArea > 0 && Number.isFinite(dominantElevation)) {
+    return Number(dominantElevation.toFixed(3));
+  }
+
+  const terrainPlan = resolveContourTerrainRenderPlan(siteContext);
+
+  if (
+    terrainPlan?.useFlatFallback === true &&
+    Array.isArray(terrainPlan?.clipPolygon) &&
+    terrainPlan.clipPolygon.length >= 3 &&
+    Number.isFinite(terrainPlan?.flatTopElevation)
+  ) {
+    try {
+      const overlapMultiPolygon =
+        polygonClipping.intersection(
+          buildingMultiPolygon,
+          buildLocalMultiPolygonFromOpenRing(terrainPlan.clipPolygon)
+        ) || [];
+      const overlapArea = computeLocalMultiPolygonArea(overlapMultiPolygon);
+
+      if (overlapArea > 0.001) {
+        return Number(Number(terrainPlan.flatTopElevation).toFixed(3));
+      }
+    } catch (error) {
+      console.warn(
+        `[building-terrain] flat-basis fallback elevation=${Number(
+          terrainPlan.flatTopElevation || 0
+        ).toFixed(3)} error=${formatErrorForLog(error)}`
+      );
+    }
+  }
+
+  return null;
 }
 
 function estimateBuildingDominantTerraceElevation(

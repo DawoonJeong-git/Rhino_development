@@ -722,6 +722,12 @@ function collectFormatFailures(testCase, result) {
       );
     }
 
+    if (Number(buildingPlacement?.terrainBasisAvailableCount || 0) <= 0) {
+      failures.push(
+        `${testCase.name}/3dm: no sampled building placements resolved against the terrain basis`
+      );
+    }
+
     if (Number(buildingPlacement?.terrainBasisMismatchCount || 0) > 0) {
       failures.push(
         `${testCase.name}/3dm: building terrain-basis mismatches ` +
@@ -2930,6 +2936,105 @@ async function runBaselineVerification() {
     assert.ok(
       Number(roadPlacementDiagnostics?.elevationCount || 0) >= 1,
       "Road placement diagnostics should record at least one terrain elevation for the synthetic road footprint."
+    );
+    const syntheticFlatFallbackBuildingSiteContext = cloneJsonValue({
+      ...syntheticContourSiteContext,
+      contourLines: {
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            properties: { provider: "synthetic-test", elevation: 30 },
+            geometry: {
+              type: "LineString",
+              coordinates: [
+                [126.97802, 37.56655],
+                [126.9784, 37.56655],
+              ],
+            },
+          },
+        ],
+      },
+      terrainGrid: {
+        step: 1,
+        xValues: [0, 20, 40],
+        yValues: [0, 20, 40],
+        elevations: [
+          [30, 30, 30],
+          [30, 30, 30],
+          [30, 30, 30],
+        ],
+        minElevation: 30,
+        maxElevation: 30,
+      },
+      options: {
+        ...syntheticContourSiteContext.options,
+        includeBuildings: true,
+        includeRoads: false,
+        contourInterval: 1,
+      },
+      dataSources: {
+        contours: {
+          provider: "synthetic-test",
+          mode: "derived",
+          interval: 1,
+        },
+      },
+      buildings: {
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            properties: {
+              buildingId: "B-flat",
+              buildingName: "Flat Fallback Placement",
+              heightMeters: 10,
+              isTarget: true,
+            },
+            geometry: {
+              type: "Polygon",
+              coordinates: [[
+                [126.97818, 37.5665],
+                [126.97822, 37.5665],
+                [126.97822, 37.56654],
+                [126.97818, 37.56654],
+                [126.97818, 37.5665],
+              ]],
+            },
+          },
+        ],
+      },
+      roads: {
+        type: "FeatureCollection",
+        features: [],
+      },
+    });
+    const preparedFlatFallbackBuildingSiteContext = prepareSiteContextForExport(
+      syntheticFlatFallbackBuildingSiteContext,
+      syntheticFlatFallbackBuildingSiteContext.options,
+      "3dm"
+    );
+    const flatFallbackBuildingPlacementDebug =
+      preparedFlatFallbackBuildingSiteContext?.stats?.buildingPlacementDebug?.[0];
+    assert.equal(
+      flatFallbackBuildingPlacementDebug?.finalBaseElevation,
+      30,
+      "Flat fallback contour terrain should still place the building on the flat contour cap elevation."
+    );
+    assert.equal(
+      flatFallbackBuildingPlacementDebug?.terrainBasisElevation,
+      30,
+      "Flat fallback contour terrain should expose the flat contour cap as the building terrain basis."
+    );
+    assert.equal(
+      flatFallbackBuildingPlacementDebug?.terrainBasisDelta,
+      0,
+      "Flat fallback contour terrain should keep building placement aligned with the flat terrain basis."
+    );
+    assert.equal(
+      flatFallbackBuildingPlacementDebug?.terrainBasisAligned,
+      true,
+      "Flat fallback contour terrain should mark building placement as terrain-basis-aligned."
     );
     const refinedSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       refinedSketchUpSiteContext

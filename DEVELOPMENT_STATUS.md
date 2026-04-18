@@ -33,6 +33,7 @@ Last updated: 2026-04-19
   - Added road terrain-basis coverage diagnostics
   - Added export-side placement summaries and regression gates for synthetic building/road terrain-basis alignment
   - Fixed flat-fallback road placement so contour-road surfaces still cover road footprints when top-surface groups are empty
+  - Fixed flat-fallback building placement so sampled buildings resolve against the same flat terrain cap basis
 - `In Progress`
   - Reconnecting building/road Z placement to the same terrain basis
   - Turning live-case placement diagnostics into stricter export-side failures where upstream data is actually available
@@ -148,6 +149,9 @@ For requested `1m` contour models from `5m` source:
 10. Fixed flat contour-road fallback:
    - when contour top-surface groups are empty but the terrain falls back to a flat contour cap, road surfaces now intersect against that flat cap instead of disappearing
    - road coverage diagnostics now clamp numeric over-coverage so `coverageRatio` stays within the real footprint
+11. Fixed flat contour-building fallback:
+   - when contour band overlap is unavailable but the terrain falls back to a flat contour cap, building placement now treats that flat cap as the terrain basis
+   - export verification now fails if sampled buildings never resolve against the terrain basis
 
 ## Latest Snapshot
 
@@ -192,6 +196,7 @@ Interpretation:
 - The next real issue is no longer contour-basis alignment itself; it is downstream Z placement validation for buildings and roads.
 - We now have the diagnostics needed to tell whether a building base elevation matched the terrain basis and how much of the road footprint actually received terrain-basis coverage.
 - After promoting placement gates, `seoul-center` exposed a real flat-fallback road bug (`roadCoverage=0` with `roadFeatureCount=3`), and that fallback is now fixed so current `verify:exports` is green again.
+- `seoul-center` also exposed that flat-fallback buildings were still using sampled Z without a terrain-basis reference (`terrainBasisAvailableCount=0`), and that is now fixed so current `verify:exports` reports `terrainBasisAvailableCount=3`.
 
 ## What This Turn Still Does Not Claim
 
