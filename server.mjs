@@ -10588,7 +10588,7 @@ function buildClosedContourExportCollection(siteContext) {
   }
 
   for (const feature of siteContext?.contourLines?.features || []) {
-    if (feature?.properties?.generated !== true) {
+    if (!shouldReuseGeneratedExportContourFeature(feature)) {
       continue;
     }
 
@@ -10824,6 +10824,257 @@ function getExportContourFeatureCollection(siteContext) {
   }
 
   return siteContext?.contourLines || featureCollection([]);
+}
+
+function shouldReuseGeneratedExportContourFeature(feature) {
+  if (feature?.properties?.generated !== true) {
+    return false;
+  }
+
+  const exportDerived = String(feature?.properties?.exportDerived || "")
+    .trim()
+    .toLowerCase();
+  const provider = String(feature?.properties?.provider || "")
+    .trim()
+    .toLowerCase();
+
+  return (
+    exportDerived === "generated-terrain-aligned" ||
+    exportDerived === "resolved-area-above-contour" ||
+    exportDerived === "top-surface-cap-contour" ||
+    provider === "derived-contours-resolved-area"
+  );
+}
+
+function summarizeContourFeatureCollectionLevels(siteContext, contourCollection) {
+  const features = contourCollection?.features || [];
+  const levels = new Map();
+  let closedFeatureCount = 0;
+  let generatedFeatureCount = 0;
+
+  const appendSummary = (levelKey, feature) => {
+    if (!levels.has(levelKey)) {
+      levels.set(levelKey, {
+        elevation: Number(levelKey),
+        featureCount: 0,
+        closedFeatureCount: 0,
+        generatedFeatureCount: 0,
+        exportDerivedKinds: new Set(),
+        providers: new Set(),
+      });
+    }
+
+    const summary = levels.get(levelKey);
+    const closedLoop = feature?.properties?.closedLoop === true;
+    const generated = feature?.properties?.generated === true;
+    const exportDerived = String(feature?.properties?.exportDerived || "").trim();
+    const provider = String(feature?.properties?.provider || "").trim();
+
+    summary.featureCount += 1;
+    summary.closedFeatureCount += closedLoop ? 1 : 0;
+    summary.generatedFeatureCount += generated ? 1 : 0;
+    if (exportDerived) {
+      summary.exportDerivedKinds.add(exportDerived);
+    }
+    if (provider) {
+      summary.providers.add(provider);
+    }
+  };
+
+  for (const feature of features) {
+    const elevation = Number(feature?.properties?.elevation);
+
+    if (!Number.isFinite(elevation)) {
+      continue;
+    }
+
+    const levelKey = buildContourLevelKey(elevation);
+    appendSummary(levelKey, feature);
+    closedFeatureCount += feature?.properties?.closedLoop === true ? 1 : 0;
+    generatedFeatureCount += feature?.properties?.generated === true ? 1 : 0;
+  }
+
+  return {
+    featureCount: features.length,
+    closedFeatureCount,
+    generatedFeatureCount,
+    levels: [...levels.values()]
+      .map((summary) => ({
+        elevation: Number(Number(summary.elevation || 0).toFixed(3)),
+        featureCount: Number(summary.featureCount || 0),
+        closedFeatureCount: Number(summary.closedFeatureCount || 0),
+        generatedFeatureCount: Number(summary.generatedFeatureCount || 0),
+        exportDerivedKinds: [...summary.exportDerivedKinds].sort(),
+        providers: [...summary.providers].sort(),
+      }))
+      .sort((left, right) => left.elevation - right.elevation),
+  };
+}
+
+function summarizeContourBandLevels(bandGroups) {
+  const safeGroups = Array.isArray(bandGroups) ? bandGroups : [];
+
+  return safeGroups
+    .map((group) => ({
+      bottomElevation: Number(Number(group?.bottomElevation || 0).toFixed(3)),
+      topElevation: Number(Number(group?.topElevation || 0).toFixed(3)),
+      regionCount: Number(group?.regions?.length || 0),
+      boundaryLoopCount: Number(group?.boundaryLoops?.length || 0),
+      areaSqm: Number(
+        computeLocalMultiPolygonArea(
+          group?.multiPolygon || buildPolygonClippingMultiPolygonFromRegions(group?.regions || [])
+        ).toFixed(3)
+      ),
+    }))
+    .sort(
+      (left, right) =>
+        left.bottomElevation - right.bottomElevation ||
+        left.topElevation - right.topElevation
+    );
+}
+
+function buildTerrainPipelineDiagnostics(siteContext) {
+  if (
+    !siteContext?.location ||
+    siteContext?.options?.terrainMode !== "contour" ||
+    !siteContext?.terrainGrid?.elevations?.length
+  ) {
+    return null;
+  }
+
+  const canonicalContourInput =
+    siteContext?.canonicalContourInput ||
+    buildCanonicalContourInput(siteContext, siteContext?.contourLines);
+  const openContourClosure = buildOpenContourClosureDiagnostics(
+    siteContext,
+    siteContext?.contourLines
+  );
+  const nativeClosedLoops = buildNativeContourLoopEntries(
+    siteContext,
+    siteContext?.contourLines
+  );
+  const exportContourSummary = summarizeContourFeatureCollectionLevels(
+    siteContext,
+    getExportContourFeatureCollection(siteContext)
+  );
+  const sourceBandGroups = getCachedContourBandGroups(siteContext);
+  const cumulativeBandGroups = getCachedCumulativeContourBandGroups(siteContext);
+  const renderableBandGroups = getCachedRenderableContourBandGroups(siteContext);
+  const topSurfaceGroups = getCachedContourTopSurfaceGroups(siteContext);
+  const buildingPlacementDiagnostics = Array.isArray(
+    siteContext?.stats?.buildingPlacementDebug
+  )
+    ? siteContext.stats.buildingPlacementDebug
+    : [];
+  const buildingPlacementSourceCounts = buildingPlacementDiagnostics.reduce(
+    (result, entry) => {
+      const key = String(entry?.source || "unknown");
+      result[key] = Number(result[key] || 0) + 1;
+      return result;
+    },
+    {}
+  );
+  const alignmentLevels = new Set([
+    ...exportContourSummary.levels.map((summary) => buildContourLevelKey(summary.elevation)),
+    ...cumulativeBandGroups.map((group) => buildContourLevelKey(group?.bottomElevation)),
+  ]);
+  const cumulativeByLevel = new Map(
+    summarizeContourBandLevels(cumulativeBandGroups).map((summary) => [
+      buildContourLevelKey(summary.bottomElevation),
+      summary,
+    ])
+  );
+  const exportByLevel = new Map(
+    exportContourSummary.levels.map((summary) => [
+      buildContourLevelKey(summary.elevation),
+      summary,
+    ])
+  );
+  const mismatchLevels = [...alignmentLevels]
+    .map((levelKey) => {
+      const exportSummary = exportByLevel.get(levelKey) || null;
+      const cumulativeSummary = cumulativeByLevel.get(levelKey) || null;
+      const exportClosedFeatureCount = Number(exportSummary?.closedFeatureCount || 0);
+      const cumulativeBoundaryLoopCount = Number(
+        cumulativeSummary?.boundaryLoopCount || 0
+      );
+
+      if (exportClosedFeatureCount === cumulativeBoundaryLoopCount) {
+        return null;
+      }
+
+      return {
+        elevation: Number(levelKey),
+        exportClosedFeatureCount,
+        cumulativeBoundaryLoopCount,
+        exportDerivedKinds: exportSummary?.exportDerivedKinds || [],
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.elevation - right.elevation);
+  const sourceContourInterval = resolveSourceContourInterval(siteContext);
+  const effectiveContourBandInterval = resolveEffectiveContourBandInterval(siteContext);
+  const requestedContourInterval = normalizeContourInterval(
+    siteContext?.options?.contourInterval
+  );
+
+  return {
+    requestedContourInterval: Number(
+      Number(requestedContourInterval || 0).toFixed(3)
+    ),
+    sourceContourInterval: Number(
+      Number(sourceContourInterval || 0).toFixed(3)
+    ),
+    effectiveContourBandInterval: Number(
+      Number(effectiveContourBandInterval || 0).toFixed(3)
+    ),
+    canonicalInput: {
+      entryCount: Number(canonicalContourInput?.entryCount || 0),
+      nativeEntryCount: Number(canonicalContourInput?.nativeEntryCount || 0),
+      generatedEntryCount: Number(canonicalContourInput?.generatedEntryCount || 0),
+      openEntryCount: Number(canonicalContourInput?.openEntryCount || 0),
+      closedEntryCount: Number(canonicalContourInput?.closedEntryCount || 0),
+      nativeLevels: [...(canonicalContourInput?.nativeLevels || [])],
+      generatedLevels: [...(canonicalContourInput?.generatedLevels || [])],
+    },
+    openContourClosure: {
+      nativeOpenContourCount: Number(openContourClosure?.nativeOpenContourCount || 0),
+      acceptedCount: Number(openContourClosure?.acceptedCount || 0),
+      rejectedCount: Number(openContourClosure?.rejectedCount || 0),
+      acceptedElevations: [...(openContourClosure?.acceptedElevations || [])],
+      rejectedElevations: [...(openContourClosure?.rejectedElevations || [])],
+    },
+    nativeClosedLoops: {
+      count: nativeClosedLoops.length,
+      levels: [
+        ...new Set(
+          nativeClosedLoops
+            .map((entry) => Number(entry?.elevation))
+            .filter(Number.isFinite)
+            .sort((left, right) => left - right)
+        ),
+      ],
+    },
+    exportContours: exportContourSummary,
+    sourceBandGroups: summarizeContourBandLevels(sourceBandGroups),
+    cumulativeBandGroups: summarizeContourBandLevels(cumulativeBandGroups),
+    renderableBandGroups: summarizeContourBandLevels(renderableBandGroups),
+    topSurfaceGroups: topSurfaceGroups.map((group) => ({
+      elevation: Number(Number(group?.elevation || 0).toFixed(3)),
+      areaSqm: Number(Number(group?.areaSqm || 0).toFixed(3)),
+    })),
+    curveTerrainAlignment: {
+      mismatchLevelCount: mismatchLevels.length,
+      mismatchLevels,
+    },
+    buildingPlacement: {
+      sampleCount: buildingPlacementDiagnostics.length,
+      unresolvedCount: buildingPlacementDiagnostics.filter(
+        (entry) => !Number.isFinite(entry?.finalBaseElevation)
+      ).length,
+      sourceCounts: buildingPlacementSourceCounts,
+    },
+  };
 }
 
 async function resolveParcelBoundary(location, config) {
@@ -26516,6 +26767,30 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
   exportSiteContext.stats.buildingPlacementDebug = buildBuildingPlacementDiagnostics(
     exportSiteContext
   );
+  exportSiteContext.stats.terrainPipelineDiagnostics = buildTerrainPipelineDiagnostics(
+    exportSiteContext
+  );
+
+  if (exportSiteContext.stats.terrainPipelineDiagnostics) {
+    const diagnostics = exportSiteContext.stats.terrainPipelineDiagnostics;
+    console.log(
+      `[terrain-debug] nativeOpen=${Number(
+        diagnostics?.openContourClosure?.nativeOpenContourCount || 0
+      )} accepted=${Number(
+        diagnostics?.openContourClosure?.acceptedCount || 0
+      )} rejected=${Number(
+        diagnostics?.openContourClosure?.rejectedCount || 0
+      )} exportClosed=${Number(
+        diagnostics?.exportContours?.closedFeatureCount || 0
+      )} cumulativeBands=${Number(
+        diagnostics?.cumulativeBandGroups?.length || 0
+      )} renderableBands=${Number(
+        diagnostics?.renderableBandGroups?.length || 0
+      )} curveTerrainMismatchLevels=${Number(
+        diagnostics?.curveTerrainAlignment?.mismatchLevelCount || 0
+      )}`
+    );
+  }
 
   console.log(
     `[export-terrain] format=${format} requested=${requestedContourInterval} source=${sourceContourInterval} effective=${effectiveContourBandInterval} display=${exportSiteContext.stats.effectiveContourDisplayInterval} preserveNativeContours=${preserveNativeContourDisplayLines} terrainStep=${Number(exportSiteContext?.terrainGrid?.step || 0).toFixed(3)} refined=${exportSiteContext?.stats?.nativeContourTerrainGridRefined === true}`
@@ -28105,6 +28380,7 @@ export {
   buildCanonicalContourInput,
   buildClipBoundary,
   buildOpenContourClosureDiagnostics,
+  buildTerrainPipelineDiagnostics,
   buildRawAnchoredContourBandDiagnostics,
   buildRoadContourSurfaceGroups,
   buildParcelDataCacheKey,
