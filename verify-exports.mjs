@@ -2663,6 +2663,21 @@ async function runBaselineVerification() {
       "Contour-terrain building placement should keep the building on the matching 5m terrace instead of floating it one band too high."
     );
     assert.equal(
+      buildingPlacementDebug?.terrainBasisElevation,
+      15,
+      "Building placement diagnostics should expose the terrain-basis elevation used for the terrace comparison."
+    );
+    assert.equal(
+      buildingPlacementDebug?.terrainBasisDelta,
+      0,
+      "Building placement diagnostics should report zero delta when the selected base elevation matches the terrain basis."
+    );
+    assert.equal(
+      buildingPlacementDebug?.terrainBasisAligned,
+      true,
+      "Building placement diagnostics should mark the placement as terrain-basis-aligned when the base elevation matches the terrace."
+    );
+    assert.equal(
       buildingPlacementStatsDebug?.source,
       "dominant-band-overlap",
       "Prepared export stats should expose the same dominant terrace source as the per-building placement debug."
@@ -2671,6 +2686,11 @@ async function runBaselineVerification() {
       buildingPlacementStatsDebug?.finalBaseElevation,
       15,
       "Prepared export stats should keep building placement diagnostics aligned with the exported building base elevation."
+    );
+    assert.equal(
+      buildingPlacementStatsDebug?.terrainBasisDelta,
+      0,
+      "Prepared export stats should retain the terrain-basis delta for the sampled building placement diagnostics."
     );
     assert.equal(
       defaultPlacementDebug?.finalBaseElevation,

@@ -167,6 +167,7 @@ function summarizeDiagnostics(siteContext, exportSiteContext, include3dmBytes = 
       ),
       sourceCounts: {},
     },
+    roadPlacement: diagnostics?.roadPlacement || null,
     include3dmBytes,
   };
 }

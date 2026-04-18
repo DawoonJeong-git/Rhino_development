@@ -10981,6 +10981,7 @@ function buildTerrainPipelineDiagnostics(siteContext) {
   )
     ? siteContext.stats.buildingPlacementDebug
     : [];
+  const roadPlacementDiagnostics = buildRoadPlacementDiagnostics(siteContext);
   const buildingPlacementSourceCounts = buildingPlacementDiagnostics.reduce(
     (result, entry) => {
       const key = String(entry?.source || "unknown");
@@ -10988,6 +10989,24 @@ function buildTerrainPipelineDiagnostics(siteContext) {
       return result;
     },
     {}
+  );
+  const buildingTerrainBasisAvailableCount = buildingPlacementDiagnostics.filter((entry) =>
+    Number.isFinite(entry?.terrainBasisElevation)
+  ).length;
+  const buildingTerrainBasisMismatchEntries = buildingPlacementDiagnostics.filter(
+    (entry) => entry?.terrainBasisAligned === false
+  );
+  const buildingTerrainBasisFallbackCount = buildingPlacementDiagnostics.filter(
+    (entry) =>
+      Number.isFinite(entry?.finalBaseElevation) &&
+      String(entry?.source || "") !== "dominant-band-overlap"
+  ).length;
+  const buildingTerrainBasisMaxDelta = buildingPlacementDiagnostics.reduce(
+    (maxDelta, entry) =>
+      Number.isFinite(entry?.terrainBasisDelta)
+        ? Math.max(maxDelta, Math.abs(Number(entry.terrainBasisDelta)))
+        : maxDelta,
+    0
   );
   const alignmentLevels = new Set([
     ...exportContourSummary.levels.map((summary) => buildContourLevelKey(summary.elevation)),
@@ -11127,7 +11146,21 @@ function buildTerrainPipelineDiagnostics(siteContext) {
         (entry) => !Number.isFinite(entry?.finalBaseElevation)
       ).length,
       sourceCounts: buildingPlacementSourceCounts,
+      terrainBasisAvailableCount: buildingTerrainBasisAvailableCount,
+      terrainBasisMismatchCount: buildingTerrainBasisMismatchEntries.length,
+      terrainBasisFallbackCount: buildingTerrainBasisFallbackCount,
+      terrainBasisMaxDelta: Number(buildingTerrainBasisMaxDelta.toFixed(3)),
+      terrainBasisMismatchExamples: buildingTerrainBasisMismatchEntries
+        .slice(0, 8)
+        .map((entry) => ({
+          name: entry?.name || "BUILDING",
+          source: entry?.source || "unknown",
+          finalBaseElevation: Number(entry?.finalBaseElevation || 0),
+          terrainBasisElevation: Number(entry?.terrainBasisElevation || 0),
+          terrainBasisDelta: Number(entry?.terrainBasisDelta || 0),
+        })),
     },
+    roadPlacement: roadPlacementDiagnostics,
   };
 }
 
@@ -13215,6 +13248,19 @@ function resolveBuildingPlacementForRing(siteContext, ring, center, seed) {
     finalBaseElevation: Number.isFinite(finalBaseElevation)
       ? Number(finalBaseElevation.toFixed(3))
       : null,
+    terrainBasisElevation: Number.isFinite(bandOverlapDominantElevation)
+      ? Number(bandOverlapDominantElevation.toFixed(3))
+      : null,
+    terrainBasisDelta:
+      Number.isFinite(finalBaseElevation) &&
+      Number.isFinite(bandOverlapDominantElevation)
+        ? Number((finalBaseElevation - bandOverlapDominantElevation).toFixed(3))
+        : null,
+    terrainBasisAligned:
+      Number.isFinite(finalBaseElevation) &&
+      Number.isFinite(bandOverlapDominantElevation)
+        ? Math.abs(finalBaseElevation - bandOverlapDominantElevation) <= 0.001
+        : null,
     effectiveContourInterval: resolveEffectiveContourBandInterval(siteContext),
   };
 
@@ -13238,6 +13284,9 @@ function applyBuildingPlacementDebug(feature, placementInfo) {
     fallbackDominantElevation: placementInfo.fallbackDominantElevation,
     lowestElevation: placementInfo.lowestElevation,
     finalBaseElevation: placementInfo.finalBaseElevation,
+    terrainBasisElevation: placementInfo.terrainBasisElevation,
+    terrainBasisDelta: placementInfo.terrainBasisDelta,
+    terrainBasisAligned: placementInfo.terrainBasisAligned,
     effectiveContourInterval: placementInfo.effectiveContourInterval,
   };
 }
@@ -13306,10 +13355,68 @@ function buildBuildingPlacementDiagnostics(siteContext) {
         fallbackDominantElevation: placementInfo.fallbackDominantElevation,
         lowestElevation: placementInfo.lowestElevation,
         finalBaseElevation: placementInfo.finalBaseElevation,
+        terrainBasisElevation: placementInfo.terrainBasisElevation,
+        terrainBasisDelta: placementInfo.terrainBasisDelta,
+        terrainBasisAligned: placementInfo.terrainBasisAligned,
         effectiveContourInterval: placementInfo.effectiveContourInterval,
       };
     })
     .filter(Boolean);
+}
+
+function buildRoadPlacementDiagnostics(siteContext) {
+  if (
+    siteContext?.options?.terrainMode !== "contour" ||
+    siteContext?.options?.includeRoads !== true ||
+    !siteContext?.location
+  ) {
+    return null;
+  }
+
+  const center = siteContext.location;
+  const roadFootprintMultiPolygon = getCachedRoadFootprintMultiPolygon(siteContext, center);
+  const footprintAreaSqm = computeLocalMultiPolygonArea(roadFootprintMultiPolygon);
+  const roadSurfaceGroups = buildRoadContourSurfaceGroups(siteContext, center);
+  const surfaceElevations = [];
+  let coveredRoadMultiPolygon = [];
+
+  for (const group of roadSurfaceGroups) {
+    if (Number.isFinite(group?.elevation)) {
+      surfaceElevations.push(Number(group.elevation));
+    }
+
+    const groupMultiPolygon = buildPolygonClippingMultiPolygonFromRegions(group?.regions || []);
+
+    if (!groupMultiPolygon.length) {
+      continue;
+    }
+
+    coveredRoadMultiPolygon = coveredRoadMultiPolygon.length
+      ? unionLocalMultiPolygons([coveredRoadMultiPolygon, groupMultiPolygon])
+      : groupMultiPolygon;
+  }
+
+  const coveredAreaSqm = computeLocalMultiPolygonArea(coveredRoadMultiPolygon);
+  const uncoveredAreaSqm = Math.max(0, footprintAreaSqm - coveredAreaSqm);
+  const sortedElevations = [...new Set(surfaceElevations)]
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+
+  return {
+    roadFeatureCount: Number(siteContext?.roads?.features?.length || 0),
+    groupCount: Number(roadSurfaceGroups.length || 0),
+    footprintAreaSqm: Number(footprintAreaSqm.toFixed(3)),
+    coveredAreaSqm: Number(coveredAreaSqm.toFixed(3)),
+    uncoveredAreaSqm: Number(uncoveredAreaSqm.toFixed(3)),
+    coverageRatio: Number(
+      (footprintAreaSqm > 0 ? coveredAreaSqm / footprintAreaSqm : 0).toFixed(4)
+    ),
+    elevationCount: sortedElevations.length,
+    minElevation: sortedElevations.length ? Number(sortedElevations[0].toFixed(3)) : null,
+    maxElevation: sortedElevations.length
+      ? Number(sortedElevations[sortedElevations.length - 1].toFixed(3))
+      : null,
+  };
 }
 
 function sanitizeObjName(value, fallback) {
@@ -26863,7 +26970,11 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
         diagnostics?.curveTerrainAlignment?.mismatchLevelCount || 0
       )} bandBoundaryMismatchLevels=${Number(
         diagnostics?.bandBoundaryAlignment?.mismatchLevelCount || 0
-      )}`
+      )} buildingBasisMismatches=${Number(
+        diagnostics?.buildingPlacement?.terrainBasisMismatchCount || 0
+      )} roadCoverage=${Number(
+        diagnostics?.roadPlacement?.coverageRatio || 0
+      ).toFixed(4)}`
     );
   }
 
