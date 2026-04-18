@@ -9,6 +9,32 @@ Last updated: 2026-04-18
 - `C:\SpaceWork_deploy`를 fast-forward 한다.
 - 웹 배포를 실행하고 공개 URL을 확인한다.
 
+## Progress Tracking
+
+- Primary document: this file
+- Progress snapshot command:
+  - `node scripts/report-terrain-progress.mjs --case seoul-hillside,gyeyang-large`
+- Notes:
+  - Use the snapshot script to see current contour closure counts, curve/terrain mismatch counts, band counts, and placement status.
+  - Update this file every working session so the next conversation can resume from here.
+
+## Current Board
+
+- `Completed`
+  - Pipeline audit: source contours -> export contours -> terrain bands -> terrain solids -> placement flow
+  - Added terrain pipeline diagnostics in export preparation
+  - Added progress snapshot script
+  - Added persistent top-level status document
+- `In Progress`
+  - Replacing “display-generated contour reuse” with a terrain-basis-first export path
+  - Identifying the first levels where export curves and terrain cumulative bands diverge
+  - Reconnecting building/road Z placement to the same terrain basis
+- `Next`
+  - Rebuild terrain bands from one closed contour basis instead of separate display/band paths
+  - Make 5m closed raw contours the root of both export curves and terrain solids
+  - Generate intermediate 1m curves only from that closed 5m basis
+  - Validate buildings and roads against the final terrain basis, not parallel fallback logic
+
 ## Current Focus
 
 - Terrain contour algorithm audit
@@ -98,6 +124,42 @@ For requested `1m` contour models from `5m` source:
 4. Tightened export contour reuse:
    - generated contour features are only reused when they are terrain-aligned generated contours
    - arbitrary generated display contours are no longer treated as trusted export contour sources
+
+## Latest Snapshot
+
+Source:
+
+- `node scripts/report-terrain-progress.mjs --case seoul-hillside,gyeyang-large`
+- generated at `2026-04-18T04:53:50.450Z`
+
+Summary:
+
+- `seoul-hillside`
+  - requested/source/effective interval: `1 / 5 / 1`
+  - native open contours: `18`
+  - accepted closures: `16`
+  - rejected closures: `2`
+  - native closed loops: `17`
+  - source/cumulative/renderable/top-surface bands: `15 / 15 / 15 / 15`
+  - curve-terrain mismatch level count: `37`
+  - first mismatches appear immediately from `85m` upward
+- `gyeyang-large`
+  - requested/source/effective interval: `1 / 5 / 2`
+  - native open contours: `76`
+  - accepted closures: `60`
+  - rejected closures: `16`
+  - native closed loops: `60`
+  - source/cumulative/renderable/top-surface bands: `12 / 12 / 12 / 6`
+  - curve-terrain mismatch level count: `98`
+  - first mismatches appear immediately from `35m` upward
+
+Interpretation:
+
+- The main structural problem is still present.
+- Export contour curves are still much denser than the cumulative terrain band boundaries.
+- That means the current model still does not satisfy the intended rule:
+  - “Use the same closed contour basis for both the bottom reference curves and the terrain solid.”
+- This is now measurable and visible instead of hidden.
 
 ## What This Turn Still Does Not Claim
 
