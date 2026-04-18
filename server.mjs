@@ -20056,17 +20056,18 @@ function buildCumulativeContourBandGroups(siteContext) {
     let nextMultiPolygon = groupMultiPolygon;
 
     if (cumulativeMultiPolygon.length) {
-      try {
-        nextMultiPolygon =
-          polygonClipping.union(groupMultiPolygon, cumulativeMultiPolygon) || [];
-      } catch (error) {
+      const mergedMultiPolygon = unionLocalMultiPolygons([
+        groupMultiPolygon,
+        cumulativeMultiPolygon,
+      ]);
+
+      if (!mergedMultiPolygon.length) {
         console.warn(
-          `[terrain-band] cumulative union fallback elevation=${group.topElevation} error=${formatErrorForLog(
-            error
-          )}`
+          `[terrain-band] cumulative union produced empty result elevation=${group.topElevation}`
         );
-        nextMultiPolygon = [...groupMultiPolygon, ...cumulativeMultiPolygon];
       }
+
+      nextMultiPolygon = mergedMultiPolygon;
     }
 
     const regions = normalizeContourRegionsForLevel(

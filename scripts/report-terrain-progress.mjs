@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import process from "node:process";
 import {
   createApp,
@@ -49,6 +51,10 @@ const DEFAULT_CASES = [
       buildingPlacement: "default",
     },
   },
+  {
+    name: "muak-live-cache",
+    siteContextPath: "tmp_muak_live_site_context.json",
+  },
 ];
 
 function parseArgs(argv) {
@@ -94,6 +100,18 @@ async function fetchJson(baseUrl, pathname, payload) {
   }
 
   return json;
+}
+
+async function loadCaseSiteContext(baseUrl, testCase) {
+  if (typeof testCase?.siteContextPath === "string" && testCase.siteContextPath.trim()) {
+    const siteContextPath = path.resolve(testCase.siteContextPath);
+    return JSON.parse(await readFile(siteContextPath, "utf8"));
+  }
+
+  return fetchJson(baseUrl, "/api/site-context", {
+    location: testCase.location,
+    options: testCase.options,
+  });
 }
 
 function summarizeDiagnostics(siteContext, exportSiteContext, include3dmBytes = false) {
@@ -196,10 +214,7 @@ async function main() {
 
     for (const testCase of cases) {
       const startedAt = Date.now();
-      const siteContext = await fetchJson(baseUrl, "/api/site-context", {
-        location: testCase.location,
-        options: testCase.options,
-      });
+      const siteContext = await loadCaseSiteContext(baseUrl, testCase);
       const exportSiteContext = prepareSiteContextForExport(
         siteContext,
         {

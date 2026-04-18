@@ -91,6 +91,11 @@ const CASES = [
     expect: { maxEffective: 5, min3dmBytes: 100_000, minSkpGroups: 1, minObjLength: 10_000 },
   },
   {
+    name: "muak-live-cache",
+    siteContextPath: "tmp_muak_live_site_context.json",
+    expect: { maxEffective: 5, min3dmBytes: 500_000, minSkpGroups: 5, minObjLength: 100_000 },
+  },
+  {
     name: "chungnam-rural",
     location: { lat: 36.427297, lng: 126.780739 },
     options: { radius: 150 },
@@ -279,6 +284,21 @@ async function fetchJson(pathname, payload = null, retryCount = 0) {
 
     throw error;
   }
+}
+
+async function loadCaseSiteContext(testCase) {
+  if (typeof testCase?.siteContextPath === "string" && testCase.siteContextPath.trim()) {
+    const siteContextPath = path.resolve(testCase.siteContextPath);
+    return JSON.parse(await readFile(siteContextPath, "utf8"));
+  }
+
+  return fetchJson("/api/site-context", {
+    location: testCase.location,
+    options: {
+      ...DEFAULT_OPTIONS,
+      ...(testCase.options || {}),
+    },
+  });
 }
 
 function cloneJsonValue(value) {
@@ -705,9 +725,18 @@ function collectFormatFailures(testCase, result) {
 
   if (result.formats["3dm"].terrainBands.trailingFullFootprintBandCount > 0) {
     failures.push(
-      `${testCase.name}/3dm: trailing full-footprint terrain bands detected ` +
+      `${testCase.name}/3dm: non-leading full-footprint terrain bands detected ` +
         result.formats["3dm"].terrainBands.trailingFullFootprintBands
           .map((band) => `${band.name}@${band.minZ}-${band.maxZ}`)
+          .join(", ")
+    );
+  }
+
+  if (result.formats["3dm"].terrainPlanBands.trailingFullFootprintBandCount > 0) {
+    failures.push(
+      `${testCase.name}/3dm-plan: non-leading full-footprint terrain plan bands detected ` +
+        result.formats["3dm"].terrainPlanBands.trailingFullFootprintBands
+          .map((band) => `${band.bottomElevation}-${band.topElevation}`)
           .join(", ")
     );
   }
@@ -805,13 +834,7 @@ function collectFormatFailures(testCase, result) {
 }
 
 async function verifyCase(testCase) {
-  const siteContext = await fetchJson("/api/site-context", {
-    location: testCase.location,
-    options: {
-      ...DEFAULT_OPTIONS,
-      ...(testCase.options || {}),
-    },
-  });
+  const siteContext = await loadCaseSiteContext(testCase);
 
   const threeDm = summarizeExportContext(siteContext, "3dm");
   const skp = summarizeExportContext(siteContext, "skp");

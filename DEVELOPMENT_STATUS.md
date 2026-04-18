@@ -13,7 +13,7 @@ Last updated: 2026-04-19
 
 - Primary document: this file
 - Progress snapshot command:
-  - `node scripts/report-terrain-progress.mjs --case seoul-hillside,gyeyang-large`
+  - `node scripts/report-terrain-progress.mjs --case seoul-hillside,gyeyang-large,muak-live-cache`
 - Notes:
   - Use the snapshot script to see contour closure counts, export-vs-terrain-basis mismatch counts, band-boundary mismatch counts, band counts, and placement status.
   - Update this file every working session so the next conversation can resume from here.
@@ -34,6 +34,8 @@ Last updated: 2026-04-19
   - Added export-side placement summaries and regression gates for synthetic building/road terrain-basis alignment
   - Fixed flat-fallback road placement so contour-road surfaces still cover road footprints when top-surface groups are empty
   - Fixed flat-fallback building placement so sampled buildings resolve against the same flat terrain cap basis
+  - Replaced cumulative contour-band union's array-concatenation fallback with the normalized local-union helper so boolean failures do not inflate into whole-site slab bands
+  - Added a cached `muak-live-cache` terrain export regression case so the known Muak hillside failure mode is checked every export verification run
 - `In Progress`
   - Reconnecting building/road Z placement to the same terrain basis
   - Turning live-case placement diagnostics into stricter export-side failures where upstream data is actually available
@@ -152,13 +154,19 @@ For requested `1m` contour models from `5m` source:
 11. Fixed flat contour-building fallback:
    - when contour band overlap is unavailable but the terrain falls back to a flat contour cap, building placement now treats that flat cap as the terrain basis
    - export verification now fails if sampled buildings never resolve against the terrain basis
+12. Hardened cumulative contour-band union:
+   - `buildCumulativeContourBandGroups()` now uses `unionLocalMultiPolygons()` instead of falling back to raw array concatenation when polygon boolean union fails
+   - this specifically targets mid-stack whole-site slab bands like the ones seen in Muak 3DM exports
+13. Added a cached Muak regression case:
+   - `verify:exports` and `report-terrain-progress` now include `muak-live-cache`
+   - this uses `tmp_muak_live_site_context.json` so the known hillside geometry can be checked without depending on a fresh upstream geocode/provider lookup
 
 ## Latest Snapshot
 
 Source:
 
-- `node scripts/report-terrain-progress.mjs --case seoul-hillside,gyeyang-large`
-- generated at `2026-04-18T15:10:08.330Z`
+- `node scripts/report-terrain-progress.mjs --case seoul-hillside,gyeyang-large,muak-live-cache`
+- generated at `2026-04-18T17:34:58.654Z`
 
 Summary:
 
@@ -182,6 +190,15 @@ Summary:
   - source/cumulative/renderable/top-surface bands: `12 / 12 / 12 / 6`
   - export-vs-terrain-basis mismatch level count: `0`
   - export-vs-band-boundary mismatch level count: `100`
+- `muak-live-cache`
+  - requested/source/effective interval: `1 / 5 / 1`
+  - native open contours: `16`
+  - accepted closures: `12`
+  - rejected closures: `4`
+  - terrain-basis contours: `85 features / 56 levels`
+  - source/cumulative/renderable/top-surface bands: `55 / 55 / 55 / 55`
+  - export-vs-terrain-basis mismatch level count: `0`
+  - export-vs-band-boundary mismatch level count: `6`
 
 Placement notes:
 
@@ -197,6 +214,7 @@ Interpretation:
 - We now have the diagnostics needed to tell whether a building base elevation matched the terrain basis and how much of the road footprint actually received terrain-basis coverage.
 - After promoting placement gates, `seoul-center` exposed a real flat-fallback road bug (`roadCoverage=0` with `roadFeatureCount=3`), and that fallback is now fixed so current `verify:exports` is green again.
 - `seoul-center` also exposed that flat-fallback buildings were still using sampled Z without a terrain-basis reference (`terrainBasisAvailableCount=0`), and that is now fixed so current `verify:exports` reports `terrainBasisAvailableCount=3`.
+- `muak-live-cache` is now part of the default export regression set, and current verification shows `3dm terrainBands.trailingFullFootprintBandCount = 0` there after the cumulative-union fix.
 
 ## What This Turn Still Does Not Claim
 
