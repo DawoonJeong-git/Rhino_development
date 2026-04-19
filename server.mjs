@@ -10332,6 +10332,76 @@ function averageLocalPointSet(points) {
   ];
 }
 
+function computeContourLoopContainmentRatio(loopPoints, samplePoints) {
+  if (!Array.isArray(loopPoints) || loopPoints.length < 3 || !Array.isArray(samplePoints)) {
+    return 0;
+  }
+
+  let insideCount = 0;
+  let sampleCount = 0;
+
+  for (const point of samplePoints) {
+    if (
+      !Array.isArray(point) ||
+      point.length < 2 ||
+      !Number.isFinite(point[0]) ||
+      !Number.isFinite(point[1])
+    ) {
+      continue;
+    }
+
+    sampleCount += 1;
+
+    if (pointInRing(point, loopPoints)) {
+      insideCount += 1;
+    }
+  }
+
+  return sampleCount > 0 ? Number((insideCount / sampleCount).toFixed(6)) : 0;
+}
+
+function computeInterpolatedBandViolationRatio(
+  lowerLoopPoints,
+  upperLoopPoints,
+  lowerSamples,
+  upperSamples
+) {
+  if (
+    !Array.isArray(lowerLoopPoints) ||
+    lowerLoopPoints.length < 3 ||
+    !Array.isArray(upperLoopPoints) ||
+    upperLoopPoints.length < 3 ||
+    !Array.isArray(lowerSamples) ||
+    !Array.isArray(upperSamples) ||
+    lowerSamples.length !== upperSamples.length ||
+    !lowerSamples.length
+  ) {
+    return 1;
+  }
+
+  const ratios = [0.2, 0.4, 0.6, 0.8];
+  let violationCount = 0;
+  let probeCount = 0;
+
+  for (let pointIndex = 0; pointIndex < lowerSamples.length; pointIndex += 1) {
+    const lowerPoint = lowerSamples[pointIndex];
+    const upperPoint = upperSamples[pointIndex];
+
+    for (const ratio of ratios) {
+      const probePoint = interpolateLocalSegmentPoint(lowerPoint, upperPoint, ratio);
+      const insideLower = pointInRing(probePoint, lowerLoopPoints);
+      const insideUpper = pointInRing(probePoint, upperLoopPoints);
+      probeCount += 1;
+
+      if (!insideLower || insideUpper) {
+        violationCount += 1;
+      }
+    }
+  }
+
+  return probeCount > 0 ? Number((violationCount / probeCount).toFixed(6)) : 1;
+}
+
 function alignOpenContourPairSamples(lowerMetric, upperMetric, sampleCount) {
   const lowerSamples = resampleLocalPolylineMetric(lowerMetric, sampleCount);
   const upperForwardSamples = resampleLocalPolylineMetric(upperMetric, sampleCount);
@@ -10426,21 +10496,22 @@ function buildGeneratedContourInterpolationSourceEntries(siteContext) {
       (feature) => feature?.properties?.generated !== true
     )
   );
-  const normalizedNativeContours = normalizeContourFeatureCollection(
+  const nativeLoopEntries = buildNativeContourLoopEntries(
     siteContext,
-    nativeContourCollection
+    nativeContourCollection,
+    { allowAmbiguousFallback: true }
   );
 
-  return buildCanonicalContourInputEntries(
-    siteContext,
-    normalizedNativeContours,
-    { includeLocalPoints: true }
-  )
-    .filter((entry) => entry.source === "native")
-    .map((entry) => ({
-      ...entry,
-      bounds: computeLocalBoundsFromPoints(entry.localPoints || []),
-    }));
+  return nativeLoopEntries.map((entry, index) => ({
+    contourId: `native-loop-${index + 1}`,
+    elevation: Number(Number(entry?.elevation || 0).toFixed(3)),
+    source: "native",
+    closedInput: true,
+    localPoints: entry?.loopPoints || [],
+    bounds: computeLocalBoundsFromPoints(entry?.loopPoints || []),
+    closureSelectionReason: entry?.closureSelectionReason || null,
+    closureFallbackUsed: entry?.closureFallbackUsed === true,
+  }));
 }
 
 function buildGeneratedContourPairCandidates(lowerEntries, upperEntries) {
@@ -10492,6 +10563,25 @@ function buildGeneratedContourPairCandidates(lowerEntries, upperEntries) {
         upperCenter[0] - lowerCenter[0],
         upperCenter[1] - lowerCenter[1]
       );
+      const containmentRatio = computeContourLoopContainmentRatio(
+        lowerEntry?.localPoints || [],
+        alignment.upperSamples
+      );
+      const reverseContainmentRatio = computeContourLoopContainmentRatio(
+        upperEntry?.localPoints || [],
+        alignment.lowerSamples
+      );
+      const bandViolationRatio = computeInterpolatedBandViolationRatio(
+        lowerEntry?.localPoints || [],
+        upperEntry?.localPoints || [],
+        alignment.lowerSamples,
+        alignment.upperSamples
+      );
+
+      if (containmentRatio < 0.18) {
+        continue;
+      }
+
       const overlapPenalty = boundsOverlap(lowerEntry?.bounds, upperEntry?.bounds, 0)
         ? 0
         : 20;
@@ -10503,7 +10593,19 @@ function buildGeneratedContourPairCandidates(lowerEntries, upperEntries) {
         upperEntry,
         lowerSamples: alignment.lowerSamples,
         upperSamples: alignment.upperSamples,
-        score: Number((alignment.score + centerDistance * 0.08 + overlapPenalty).toFixed(6)),
+        containmentRatio,
+        reverseContainmentRatio,
+        bandViolationRatio,
+        score: Number(
+          (
+            alignment.score +
+            centerDistance * 0.08 +
+            overlapPenalty +
+            (1 - containmentRatio) * 80 +
+            reverseContainmentRatio * 120 +
+            bandViolationRatio * 240
+          ).toFixed(6)
+        ),
       });
     }
   }
@@ -10615,6 +10717,22 @@ function buildGeneratedContourLinesFromNativeAnchorBands(siteContext, contourInt
           : mergeContourPolylinePoints(interpolatedPoints, 0.001);
 
         if (normalizedPoints.length < (closedLoop ? 4 : 2)) {
+          continue;
+        }
+
+        const generatedLowerContainment = computeContourLoopContainmentRatio(
+          candidate.lowerEntry?.localPoints || [],
+          normalizedPoints
+        );
+        const generatedUpperContainment = computeContourLoopContainmentRatio(
+          candidate.upperEntry?.localPoints || [],
+          normalizedPoints
+        );
+
+        if (
+          generatedLowerContainment < 0.45 ||
+          generatedUpperContainment > 0.55
+        ) {
           continue;
         }
 
