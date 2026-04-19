@@ -2502,6 +2502,7 @@ async function runBaselineVerification() {
         (feature) =>
           [
             "native-band-interpolation",
+            "native-band-area-above-contour",
             "resolved-area-above-contour",
             "generated-terrain-grid-fallback",
             "top-surface-cap-contour",
