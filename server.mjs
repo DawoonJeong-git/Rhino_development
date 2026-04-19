@@ -10161,250 +10161,354 @@ function distancePointToLocalBoundarySegments(point, segments) {
   return Number.isFinite(bestDistance) ? Number(bestDistance.toFixed(6)) : 0;
 }
 
-function buildGeneratedContourBandRecordsFromNativeAreas(
-  siteContext,
-  sourceContourInterval
-) {
-  if (
-    !siteContext?.clipBoundary ||
-    !siteContext?.contourLines?.features?.length ||
-    !Number.isFinite(sourceContourInterval) ||
-    sourceContourInterval <= 0
-  ) {
-    return [];
+function buildLocalPolylineMetric(points, closed = false) {
+  const normalizedPoints = closed
+    ? dedupeLocalPolygonPoints(points, 0.001)
+    : mergeContourPolylinePoints(points, 0.001);
+
+  if (normalizedPoints.length < (closed ? 3 : 2)) {
+    return null;
   }
 
-  const nativeIntervalStats = {
-    ...(siteContext?.stats || {}),
-  };
-  nativeIntervalStats.requestedContourInterval = sourceContourInterval;
-  nativeIntervalStats.effectiveContourBandInterval = sourceContourInterval;
-  nativeIntervalStats.effectiveContourDisplayInterval = sourceContourInterval;
-  const nativeIntervalSiteContext = {
-    ...siteContext,
-    options: {
-      ...(siteContext?.options || {}),
-      contourInterval: sourceContourInterval,
-    },
-    stats: nativeIntervalStats,
-  };
-  const nativeAssembly = buildRawAnchoredContourBandAssembly(nativeIntervalSiteContext);
-  const anchorLevels = [...(nativeAssembly?.anchorLevels || [])]
-    .map(Number)
-    .filter(Number.isFinite)
-    .sort((left, right) => left - right);
+  const segments = [];
+  let totalLength = 0;
+  const segmentCount = closed
+    ? normalizedPoints.length
+    : normalizedPoints.length - 1;
 
-  if (
-    !(nativeAssembly?.resolvedAreaAboveByLevel instanceof Map) ||
-    anchorLevels.length < 2
-  ) {
-    return [];
-  }
+  for (let index = 0; index < segmentCount; index += 1) {
+    const startPoint = normalizedPoints[index];
+    const endPoint = closed
+      ? normalizedPoints[(index + 1) % normalizedPoints.length]
+      : normalizedPoints[index + 1];
+    const length = Math.hypot(
+      Number(endPoint?.[0] || 0) - Number(startPoint?.[0] || 0),
+      Number(endPoint?.[1] || 0) - Number(startPoint?.[1] || 0)
+    );
 
-  const bandGroupByBottom = new Map(
-    (nativeAssembly?.bandGroups || []).map((group) => [
-      buildContourLevelKey(group?.bottomElevation),
-      group,
-    ])
-  );
-  const records = [];
-
-  for (let index = 0; index < anchorLevels.length - 1; index += 1) {
-    const bottomElevation = Number(anchorLevels[index].toFixed(3));
-    const topElevation = Number(anchorLevels[index + 1].toFixed(3));
-
-    if (!(topElevation > bottomElevation + 0.001)) {
+    if (!(length > 1e-9)) {
       continue;
     }
 
-    const levelKey = buildContourLevelKey(bottomElevation);
-    const lowerArea =
-      nativeAssembly.resolvedAreaAboveByLevel.get(levelKey) || [];
-    const upperArea =
-      nativeAssembly.resolvedAreaAboveByLevel.get(
-        buildContourLevelKey(topElevation)
-      ) || [];
-    const bandGroup = bandGroupByBottom.get(levelKey) || null;
-
-    if (!lowerArea.length || !upperArea.length || !bandGroup?.regions?.length) {
-      continue;
-    }
-
-    const lowerRegions = buildContourBandRegionsFromMultiPolygon(lowerArea);
-    const upperRegions = buildContourBandRegionsFromMultiPolygon(upperArea);
-    const lowerSegments = buildLocalBoundarySegmentsFromRegions(lowerRegions);
-    const upperSegments = buildLocalBoundarySegmentsFromRegions(upperRegions);
-
-    if (!lowerSegments.length || !upperSegments.length) {
-      continue;
-    }
-
-    records.push({
-      bottomElevation,
-      topElevation,
-      regions: bandGroup.regions,
-      bounds: bandGroup.bounds || computeRegionBounds(bandGroup.regions),
-      lowerSegments,
-      upperSegments,
+    segments.push({
+      startPoint,
+      endPoint,
+      startDistance: totalLength,
+      endDistance: totalLength + length,
+      length,
     });
+    totalLength += length;
   }
 
-  return records;
-}
-
-function resolveGeneratedContourBandRecordForPoint(point, bandRecords) {
-  if (!Array.isArray(point) || point.length < 2 || !bandRecords?.length) {
+  if (!(totalLength > 1e-6) || !segments.length) {
     return null;
   }
-
-  const [xMeters, yMeters] = point;
-
-  if (!Number.isFinite(xMeters) || !Number.isFinite(yMeters)) {
-    return null;
-  }
-
-  for (const record of bandRecords) {
-    const bounds = record?.bounds;
-
-    if (
-      bounds &&
-      (xMeters < bounds.minX - 0.001 ||
-        xMeters > bounds.maxX + 0.001 ||
-        yMeters < bounds.minY - 0.001 ||
-        yMeters > bounds.maxY + 0.001)
-    ) {
-      continue;
-    }
-
-    if (isPointInsideOrOnAnyLocalRegion(point, record?.regions || [])) {
-      return record;
-    }
-  }
-
-  return null;
-}
-
-function buildTerrainGridFromNativeContourBands(
-  siteContext,
-  contourInterval,
-  sourceContourInterval
-) {
-  if (
-    !siteContext?.location ||
-    !siteContext?.clipBoundary ||
-    !Number.isFinite(contourInterval) ||
-    contourInterval <= 0 ||
-    !Number.isFinite(sourceContourInterval) ||
-    !(sourceContourInterval > contourInterval + 1e-9)
-  ) {
-    return null;
-  }
-
-  const bandRecords = buildGeneratedContourBandRecordsFromNativeAreas(
-    siteContext,
-    sourceContourInterval
-  );
-
-  if (!bandRecords.length) {
-    return null;
-  }
-
-  const sampleStep = resolveGeneratedContourInterpolationGridStep(
-    siteContext,
-    contourInterval,
-    sourceContourInterval
-  );
-  const sampleGrid = buildTerrainSampleGridWithExplicitStep(
-    siteContext.location,
-    siteContext.clipBoundary,
-    sampleStep
-  );
-  const snapDistance = Math.max(0.03, sampleGrid.step * 0.08);
-  const elevations = [];
-  const numericElevations = [];
-
-  for (const row of sampleGrid.cells) {
-    const elevationRow = [];
-
-    for (const point of row) {
-      if (!point.inside) {
-        elevationRow.push(null);
-        continue;
-      }
-
-      const localPoint = [point.x, point.y];
-      const bandRecord = resolveGeneratedContourBandRecordForPoint(
-        localPoint,
-        bandRecords
-      );
-
-      if (!bandRecord) {
-        elevationRow.push(null);
-        continue;
-      }
-
-      const lowerDistance = distancePointToLocalBoundarySegments(
-        localPoint,
-        bandRecord.lowerSegments
-      );
-      const upperDistance = distancePointToLocalBoundarySegments(
-        localPoint,
-        bandRecord.upperSegments
-      );
-
-      if (!Number.isFinite(lowerDistance) || !Number.isFinite(upperDistance)) {
-        elevationRow.push(null);
-        continue;
-      }
-
-      let elevation = bandRecord.bottomElevation;
-
-      if (upperDistance <= snapDistance) {
-        elevation = bandRecord.topElevation;
-      } else if (lowerDistance > snapDistance) {
-        const totalDistance = lowerDistance + upperDistance;
-
-        if (totalDistance > 1e-9) {
-          const ratio = Math.max(0, Math.min(1, lowerDistance / totalDistance));
-          elevation =
-            bandRecord.bottomElevation +
-            (bandRecord.topElevation - bandRecord.bottomElevation) * ratio;
-        }
-      }
-
-      const normalizedElevation = Number(elevation.toFixed(3));
-      elevationRow.push(normalizedElevation);
-      numericElevations.push(normalizedElevation);
-    }
-
-    elevations.push(elevationRow);
-  }
-
-  if (!numericElevations.length) {
-    return null;
-  }
-
-  const bandBottomElevations = bandRecords
-    .map((record) => Number(record?.bottomElevation))
-    .filter(Number.isFinite);
-  const bandTopElevations = bandRecords
-    .map((record) => Number(record?.topElevation))
-    .filter(Number.isFinite);
 
   return {
-    step: sampleGrid.step,
-    xValues: sampleGrid.xValues,
-    yValues: sampleGrid.yValues,
-    elevations,
-    minElevation: Number(
-      Math.min(...(bandBottomElevations.length ? bandBottomElevations : numericElevations)).toFixed(
-        2
-      )
-    ),
-    maxElevation: Number(
-      Math.max(...(bandTopElevations.length ? bandTopElevations : numericElevations)).toFixed(2)
-    ),
+    points: normalizedPoints,
+    segments,
+    totalLength: Number(totalLength.toFixed(6)),
+    closed,
   };
+}
+
+function sampleLocalPolylineMetricPoint(metric, normalizedT) {
+  if (!metric?.segments?.length || !(metric.totalLength > 0)) {
+    return null;
+  }
+
+  const clampedT = metric.closed
+    ? ((Number(normalizedT) % 1) + 1) % 1
+    : Math.max(0, Math.min(1, Number(normalizedT) || 0));
+  const targetDistance = clampedT * metric.totalLength;
+
+  for (const segment of metric.segments) {
+    if (targetDistance <= segment.endDistance + 1e-9) {
+      const localDistance = Math.max(
+        0,
+        Math.min(segment.length, targetDistance - segment.startDistance)
+      );
+      const ratio = segment.length > 1e-9 ? localDistance / segment.length : 0;
+      return interpolateLocalSegmentPoint(
+        segment.startPoint,
+        segment.endPoint,
+        ratio
+      );
+    }
+  }
+
+  const lastSegment = metric.segments[metric.segments.length - 1];
+  return [...(lastSegment?.endPoint || lastSegment?.startPoint || metric.points[metric.points.length - 1])];
+}
+
+function resampleLocalPolylineMetric(metric, sampleCount) {
+  if (!metric || !Number.isInteger(sampleCount) || sampleCount < 2) {
+    return [];
+  }
+
+  const points = [];
+
+  if (metric.closed) {
+    for (let index = 0; index < sampleCount; index += 1) {
+      points.push(
+        sampleLocalPolylineMetricPoint(metric, index / sampleCount)
+      );
+    }
+    return points.filter(Boolean);
+  }
+
+  for (let index = 0; index < sampleCount; index += 1) {
+    const divisor = Math.max(1, sampleCount - 1);
+    points.push(
+      sampleLocalPolylineMetricPoint(metric, index / divisor)
+    );
+  }
+
+  return points.filter(Boolean);
+}
+
+function computeAverageLocalPointDistance(leftPoints, rightPoints) {
+  if (
+    !Array.isArray(leftPoints) ||
+    !Array.isArray(rightPoints) ||
+    leftPoints.length !== rightPoints.length ||
+    !leftPoints.length
+  ) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  let totalDistance = 0;
+
+  for (let index = 0; index < leftPoints.length; index += 1) {
+    totalDistance += Math.hypot(
+      Number(rightPoints[index]?.[0] || 0) - Number(leftPoints[index]?.[0] || 0),
+      Number(rightPoints[index]?.[1] || 0) - Number(leftPoints[index]?.[1] || 0)
+    );
+  }
+
+  return Number((totalDistance / leftPoints.length).toFixed(6));
+}
+
+function rotateLocalPoints(points, offset) {
+  if (!Array.isArray(points) || !points.length) {
+    return [];
+  }
+
+  const safeOffset = ((Number(offset) % points.length) + points.length) % points.length;
+  return [...points.slice(safeOffset), ...points.slice(0, safeOffset)];
+}
+
+function reverseLocalPolylinePoints(points, closed = false) {
+  const reversed = [...(points || [])].reverse();
+  return closed ? reversed : reversed;
+}
+
+function resolveGeneratedContourPairSampleCount(lowerMetric, upperMetric) {
+  const pairLength = Math.max(
+    Number(lowerMetric?.totalLength || 0),
+    Number(upperMetric?.totalLength || 0),
+    1
+  );
+
+  return Math.max(24, Math.min(160, Math.round(pairLength / 2.5)));
+}
+
+function averageLocalPointSet(points) {
+  if (!Array.isArray(points) || !points.length) {
+    return [0, 0];
+  }
+
+  const total = points.reduce(
+    (result, point) => [
+      result[0] + Number(point?.[0] || 0),
+      result[1] + Number(point?.[1] || 0),
+    ],
+    [0, 0]
+  );
+
+  return [
+    Number((total[0] / points.length).toFixed(6)),
+    Number((total[1] / points.length).toFixed(6)),
+  ];
+}
+
+function alignOpenContourPairSamples(lowerMetric, upperMetric, sampleCount) {
+  const lowerSamples = resampleLocalPolylineMetric(lowerMetric, sampleCount);
+  const upperForwardSamples = resampleLocalPolylineMetric(upperMetric, sampleCount);
+  const reversedUpperMetric = buildLocalPolylineMetric(
+    reverseLocalPolylinePoints(upperMetric?.points || []),
+    false
+  );
+  const upperReverseSamples = resampleLocalPolylineMetric(
+    reversedUpperMetric,
+    sampleCount
+  );
+  const forwardScore =
+    computeAverageLocalPointDistance(lowerSamples, upperForwardSamples) +
+    Math.hypot(
+      Number(upperForwardSamples[0]?.[0] || 0) - Number(lowerSamples[0]?.[0] || 0),
+      Number(upperForwardSamples[0]?.[1] || 0) - Number(lowerSamples[0]?.[1] || 0)
+    ) * 0.2 +
+    Math.hypot(
+      Number(upperForwardSamples[upperForwardSamples.length - 1]?.[0] || 0) -
+        Number(lowerSamples[lowerSamples.length - 1]?.[0] || 0),
+      Number(upperForwardSamples[upperForwardSamples.length - 1]?.[1] || 0) -
+        Number(lowerSamples[lowerSamples.length - 1]?.[1] || 0)
+    ) * 0.2;
+  const reverseScore =
+    computeAverageLocalPointDistance(lowerSamples, upperReverseSamples) +
+    Math.hypot(
+      Number(upperReverseSamples[0]?.[0] || 0) - Number(lowerSamples[0]?.[0] || 0),
+      Number(upperReverseSamples[0]?.[1] || 0) - Number(lowerSamples[0]?.[1] || 0)
+    ) * 0.2 +
+    Math.hypot(
+      Number(upperReverseSamples[upperReverseSamples.length - 1]?.[0] || 0) -
+        Number(lowerSamples[lowerSamples.length - 1]?.[0] || 0),
+      Number(upperReverseSamples[upperReverseSamples.length - 1]?.[1] || 0) -
+        Number(lowerSamples[lowerSamples.length - 1]?.[1] || 0)
+    ) * 0.2;
+
+  if (forwardScore <= reverseScore) {
+    return {
+      lowerSamples,
+      upperSamples: upperForwardSamples,
+      score: Number(forwardScore.toFixed(6)),
+    };
+  }
+
+  return {
+    lowerSamples,
+    upperSamples: upperReverseSamples,
+    score: Number(reverseScore.toFixed(6)),
+  };
+}
+
+function alignClosedContourPairSamples(lowerMetric, upperMetric, sampleCount) {
+  const lowerSamples = resampleLocalPolylineMetric(lowerMetric, sampleCount);
+  const orientationSamples = [
+    resampleLocalPolylineMetric(upperMetric, sampleCount),
+    resampleLocalPolylineMetric(
+      buildLocalPolylineMetric(
+        reverseLocalPolylinePoints(upperMetric?.points || [], true),
+        true
+      ),
+      sampleCount
+    ),
+  ].filter((samples) => samples.length === lowerSamples.length);
+  let bestUpperSamples = [];
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (const upperSamples of orientationSamples) {
+    for (let offset = 0; offset < upperSamples.length; offset += 1) {
+      const rotatedUpperSamples = rotateLocalPoints(upperSamples, offset);
+      const score = computeAverageLocalPointDistance(
+        lowerSamples,
+        rotatedUpperSamples
+      );
+
+      if (score < bestScore) {
+        bestScore = score;
+        bestUpperSamples = rotatedUpperSamples;
+      }
+    }
+  }
+
+  return {
+    lowerSamples,
+    upperSamples: bestUpperSamples,
+    score: Number(bestScore.toFixed(6)),
+  };
+}
+
+function buildGeneratedContourInterpolationSourceEntries(siteContext) {
+  const nativeContourCollection = featureCollection(
+    (siteContext?.contourLines?.features || []).filter(
+      (feature) => feature?.properties?.generated !== true
+    )
+  );
+  const normalizedNativeContours = normalizeContourFeatureCollection(
+    siteContext,
+    nativeContourCollection
+  );
+
+  return buildCanonicalContourInputEntries(
+    siteContext,
+    normalizedNativeContours,
+    { includeLocalPoints: true }
+  )
+    .filter((entry) => entry.source === "native")
+    .map((entry) => ({
+      ...entry,
+      bounds: computeLocalBoundsFromPoints(entry.localPoints || []),
+    }));
+}
+
+function buildGeneratedContourPairCandidates(lowerEntries, upperEntries) {
+  const candidates = [];
+
+  for (let lowerIndex = 0; lowerIndex < lowerEntries.length; lowerIndex += 1) {
+    const lowerEntry = lowerEntries[lowerIndex];
+
+    for (let upperIndex = 0; upperIndex < upperEntries.length; upperIndex += 1) {
+      const upperEntry = upperEntries[upperIndex];
+
+      if (Boolean(lowerEntry?.closedInput) !== Boolean(upperEntry?.closedInput)) {
+        continue;
+      }
+
+      const lowerMetric = buildLocalPolylineMetric(
+        lowerEntry?.localPoints || [],
+        lowerEntry?.closedInput === true
+      );
+      const upperMetric = buildLocalPolylineMetric(
+        upperEntry?.localPoints || [],
+        upperEntry?.closedInput === true
+      );
+
+      if (!lowerMetric || !upperMetric) {
+        continue;
+      }
+
+      const sampleCount = resolveGeneratedContourPairSampleCount(
+        lowerMetric,
+        upperMetric
+      );
+      const alignment =
+        lowerEntry?.closedInput === true
+          ? alignClosedContourPairSamples(lowerMetric, upperMetric, sampleCount)
+          : alignOpenContourPairSamples(lowerMetric, upperMetric, sampleCount);
+
+      if (
+        alignment.lowerSamples.length !== sampleCount ||
+        alignment.upperSamples.length !== sampleCount ||
+        !Number.isFinite(alignment.score)
+      ) {
+        continue;
+      }
+
+      const lowerCenter = averageLocalPointSet(alignment.lowerSamples);
+      const upperCenter = averageLocalPointSet(alignment.upperSamples);
+      const centerDistance = Math.hypot(
+        upperCenter[0] - lowerCenter[0],
+        upperCenter[1] - lowerCenter[1]
+      );
+      const overlapPenalty = boundsOverlap(lowerEntry?.bounds, upperEntry?.bounds, 0)
+        ? 0
+        : 20;
+
+      candidates.push({
+        lowerIndex,
+        upperIndex,
+        lowerEntry,
+        upperEntry,
+        lowerSamples: alignment.lowerSamples,
+        upperSamples: alignment.upperSamples,
+        score: Number((alignment.score + centerDistance * 0.08 + overlapPenalty).toFixed(6)),
+      });
+    }
+  }
+
+  return candidates.sort((left, right) => left.score - right.score);
 }
 
 function buildGeneratedContourLinesFromNativeAnchorBands(siteContext, contourInterval) {
@@ -10426,118 +10530,125 @@ function buildGeneratedContourLinesFromNativeAnchorBands(siteContext, contourInt
     return featureCollection([]);
   }
 
-  const nativeContourLines = featureCollection(
-    (siteContext?.contourLines?.features || []).filter(
-      (feature) => feature?.properties?.generated !== true
-    )
-  );
+  const nativeEntries = buildGeneratedContourInterpolationSourceEntries(siteContext);
 
-  if (!(nativeContourLines?.features?.length > 0)) {
+  if (!nativeEntries.length) {
     return featureCollection([]);
   }
 
-  const nativeElevationKeys = buildContourElevationKeySet(nativeContourLines);
-  let generatedTerrainGrid = null;
-
-  try {
-    generatedTerrainGrid = buildTerrainGridFromNativeContourBands(
-      siteContext,
-      contourInterval,
-      sourceContourInterval
-    );
-  } catch (error) {
-    console.warn(
-      `[contour-display] native contour band interpolation failed source=${sourceContourInterval} target=${contourInterval} error=${formatErrorForLog(
-        error
-      )}`
-    );
-    return featureCollection([]);
-  }
-
-  if (!generatedTerrainGrid?.elevations?.length) {
-    return featureCollection([]);
-  }
-
-  const generatedContourCollection = createContourLinesFromTerrainGrid(
-    siteContext.location,
-    generatedTerrainGrid,
-    {
-      ...(siteContext?.options || {}),
-      contourInterval,
-    }
+  const nativeElevationKeys = new Set(
+    nativeEntries.map((entry) => buildContourLevelKey(entry?.elevation))
   );
   const features = [];
   const featureKeys = new Set();
+  const elevations = [
+    ...new Set(
+      nativeEntries
+        .map((entry) => Number(entry?.elevation))
+        .filter(Number.isFinite)
+        .sort((left, right) => left - right)
+    ),
+  ];
 
-  for (const feature of generatedContourCollection?.features || []) {
-    const elevation = Number(feature?.properties?.elevation);
+  for (let levelIndex = 0; levelIndex < elevations.length - 1; levelIndex += 1) {
+    const lowerElevation = Number(elevations[levelIndex].toFixed(3));
+    const upperElevation = Number(elevations[levelIndex + 1].toFixed(3));
+    const bandDelta = Number((upperElevation - lowerElevation).toFixed(3));
 
-    if (!Number.isFinite(elevation)) {
+    if (!(bandDelta > contourInterval + 1e-9)) {
       continue;
     }
 
-    const levelKey = buildContourLevelKey(elevation);
+    const stepCount = Math.round(bandDelta / contourInterval);
 
-    if (nativeElevationKeys.has(levelKey)) {
+    if (
+      !(stepCount >= 2) ||
+      Math.abs(stepCount * contourInterval - bandDelta) > 0.01
+    ) {
       continue;
     }
 
-    for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
-      const localPoints = mergeContourPolylinePoints(
-        lineString
-          .map((point) => localMetersFromLngLat(point, siteContext.location))
-          .filter(
-            (point) =>
-              Array.isArray(point) &&
-              Number.isFinite(point[0]) &&
-              Number.isFinite(point[1])
-          ),
-        0.001
-      );
+    const lowerEntries = nativeEntries.filter(
+      (entry) => Math.abs(Number(entry?.elevation || 0) - lowerElevation) <= 0.001
+    );
+    const upperEntries = nativeEntries.filter(
+      (entry) => Math.abs(Number(entry?.elevation || 0) - upperElevation) <= 0.001
+    );
+    const candidates = buildGeneratedContourPairCandidates(
+      lowerEntries,
+      upperEntries
+    );
+    const usedLowerIndices = new Set();
+    const usedUpperIndices = new Set();
 
-      if (localPoints.length < 2) {
+    for (const candidate of candidates) {
+      if (
+        usedLowerIndices.has(candidate.lowerIndex) ||
+        usedUpperIndices.has(candidate.upperIndex)
+      ) {
         continue;
       }
 
-      const closedLoop =
-        localPoints.length >= 3 &&
-        pointsMatchInMeters(localPoints[0], localPoints[localPoints.length - 1], 0.001);
-      const normalizedPoints =
-        closedLoop === true
-          ? closeRing(dedupeLocalPolygonPoints(localPoints, 0.001))
-          : localPoints;
-      const featureKey = [
-        levelKey,
-        normalizedPoints.map((point) => buildLocalPointKey(point, 3)).join(";"),
-      ].join("|");
+      usedLowerIndices.add(candidate.lowerIndex);
+      usedUpperIndices.add(candidate.upperIndex);
 
-      if (featureKeys.has(featureKey)) {
-        continue;
-      }
+      for (let stepIndex = 1; stepIndex < stepCount; stepIndex += 1) {
+        const interpolationRatio = stepIndex / stepCount;
+        const elevation = Number(
+          (lowerElevation + contourInterval * stepIndex).toFixed(3)
+        );
 
-      featureKeys.add(featureKey);
-      features.push(
-        lineFeature(
-          normalizedPoints.map(([xMeters, yMeters]) =>
-            lngLatFromMeters(siteContext.location, xMeters, yMeters)
-          ),
-          {
-            elevation: Number(elevation.toFixed(3)),
-            provider: "derived-contours-native-band",
-            generated: true,
-            closedLoop,
-            exportDerived: "native-band-interpolation",
-            sourceContourIntervalMeters: Number(sourceContourInterval.toFixed(3)),
-            interpolationTerrainGridStep: Number(
-              Number(generatedTerrainGrid.step || 0).toFixed(3)
+        if (nativeElevationKeys.has(buildContourLevelKey(elevation))) {
+          continue;
+        }
+
+        const interpolatedPoints = candidate.lowerSamples.map((startPoint, pointIndex) =>
+          interpolateLocalSegmentPoint(
+            startPoint,
+            candidate.upperSamples[pointIndex],
+            interpolationRatio
+          )
+        );
+        const closedLoop = candidate.lowerEntry?.closedInput === true;
+        const normalizedPoints = closedLoop
+          ? closeRing(dedupeLocalPolygonPoints(interpolatedPoints, 0.001))
+          : mergeContourPolylinePoints(interpolatedPoints, 0.001);
+
+        if (normalizedPoints.length < (closedLoop ? 4 : 2)) {
+          continue;
+        }
+
+        const featureKey = [
+          buildContourLevelKey(elevation),
+          normalizedPoints.map((point) => buildLocalPointKey(point, 3)).join(";"),
+        ].join("|");
+
+        if (featureKeys.has(featureKey)) {
+          continue;
+        }
+
+        featureKeys.add(featureKey);
+        features.push(
+          lineFeature(
+            normalizedPoints.map(([xMeters, yMeters]) =>
+              lngLatFromMeters(siteContext.location, xMeters, yMeters)
             ),
-            ...buildContourExportMetadata(siteContext, {
+            {
+              elevation,
+              provider: "derived-contours-native-band",
               generated: true,
-              contourInterval,
-            }),
-          }
-        )
-      );
+              closedLoop,
+              exportDerived: "native-band-interpolation",
+              sourceContourIntervalMeters: Number(sourceContourInterval.toFixed(3)),
+              interpolationTerrainGridStep: null,
+              ...buildContourExportMetadata(siteContext, {
+                generated: true,
+                contourInterval,
+              }),
+            }
+          )
+        );
+      }
     }
   }
 
