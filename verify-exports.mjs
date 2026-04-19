@@ -2502,6 +2502,7 @@ async function runBaselineVerification() {
         (feature) =>
           [
             "native-band-interpolation",
+            "resolved-area-above-contour",
             "generated-terrain-grid-fallback",
             "top-surface-cap-contour",
           ].includes(String(feature?.properties?.exportDerived || "").trim()) &&
@@ -2509,7 +2510,7 @@ async function runBaselineVerification() {
             .trim()
             .startsWith("contours-generated-")
       ),
-      "Generated intermediate contours should stay on a dedicated generated-contour layer and use the simple native-band interpolation path whenever that path is available."
+      "Generated intermediate contours should stay on a dedicated generated-contour layer and use either the native-band interpolation path or the closed resolved-area export path."
     );
     const refined3dmTerrainPlan = resolveContourTerrainRenderPlan(refined3dmSiteContext);
     assert.equal(
