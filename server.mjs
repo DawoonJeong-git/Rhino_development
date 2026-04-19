@@ -10462,7 +10462,11 @@ function normalizeContourFeatureCollection(siteContext, contourCollection = null
   );
 }
 
-function buildNativeContourLoopEntries(siteContext, contourCollection = null) {
+function buildNativeContourLoopEntries(
+  siteContext,
+  contourCollection = null,
+  { allowAmbiguousFallback = false } = {}
+) {
   if (!siteContext?.location) {
     return [];
   }
@@ -10487,9 +10491,12 @@ function buildNativeContourLoopEntries(siteContext, contourCollection = null) {
 
   for (const entry of canonicalNativeEntries) {
     let closedLoopPoints = [];
+    let closureFallbackUsed = false;
+    let closureSelectionReason = null;
 
     if (entry.closedInput === true) {
       closedLoopPoints = closeRing(dedupeLocalPolygonPoints(entry.localPoints || [], 0.001));
+      closureSelectionReason = "already_closed";
     } else {
       const closure = resolveOpenContourBoundaryCandidates(entry.localPoints || [], clipRect);
       const selection = resolveHigherContourSideCandidate(
@@ -10498,14 +10505,33 @@ function buildNativeContourLoopEntries(siteContext, contourCollection = null) {
         closure.candidateMultiPolygons,
         seed
       );
+      let selectedIndex = Number.isInteger(selection.selectedIndex)
+        ? selection.selectedIndex
+        : null;
 
-      if (Number.isInteger(selection.selectedIndex)) {
+      if (
+        !Number.isInteger(selectedIndex) &&
+        allowAmbiguousFallback &&
+        Array.isArray(closure.candidatePolygons) &&
+        closure.candidatePolygons.length
+      ) {
+        const scoredFallbackIndex = Number.isInteger(selection?.scoredCandidates?.[0]?.index)
+          ? selection.scoredCandidates[0].index
+          : null;
+        selectedIndex = Number.isInteger(scoredFallbackIndex) ? scoredFallbackIndex : 0;
+        closureFallbackUsed = true;
+      }
+
+      if (Number.isInteger(selectedIndex)) {
         closedLoopPoints = closeRing(
           dedupeLocalPolygonPoints(
-            closure.candidatePolygons?.[selection.selectedIndex] || [],
+            closure.candidatePolygons?.[selectedIndex] || [],
             0.001
           )
         );
+        closureSelectionReason = closureFallbackUsed
+          ? `display_fallback:${selection.reason || "candidate_0"}`
+          : selection.reason || "selected";
       }
     }
 
@@ -10532,6 +10558,8 @@ function buildNativeContourLoopEntries(siteContext, contourCollection = null) {
       sourceLinePoints: entry.localPoints || [],
       loopPoints,
       closedLoopPoints: closeRing(loopPoints),
+      closureFallbackUsed,
+      closureSelectionReason,
     });
   }
 
@@ -10553,6 +10581,14 @@ function buildClosedContourExportCollection(siteContext) {
   const features = [];
   const featureKeys = new Set();
   const appendedFeatureCountsByLevel = new Map();
+  const nativeLoopEntries = buildNativeContourLoopEntries(
+    siteContext,
+    siteContext?.contourLines,
+    { allowAmbiguousFallback: true }
+  );
+  const nativeLoopLevels = new Set(
+    nativeLoopEntries.map((entry) => buildContourLevelKey(entry.elevation))
+  );
 
   const registerLevelFeatureAppend = (levelKey) => {
     appendedFeatureCountsByLevel.set(
@@ -10584,7 +10620,11 @@ function buildClosedContourExportCollection(siteContext) {
           provider: "official-contours-closed",
           generated: false,
           closedLoop: true,
-          exportDerived: "native-source-closed",
+          exportDerived: entry.closureFallbackUsed
+            ? "native-source-closed-display-fallback"
+            : "native-source-closed",
+          closureSelectionReason: entry.closureSelectionReason || null,
+          closureFallbackUsed: entry.closureFallbackUsed === true,
         }
       )
     );
@@ -10645,6 +10685,10 @@ function buildClosedContourExportCollection(siteContext) {
       }
     }
   };
+  for (const entry of nativeLoopEntries) {
+    appendNativeEntryFeature(entry);
+  }
+
   const rawAnchorAssembly = buildRawAnchoredContourBandAssembly(siteContext);
 
   if (rawAnchorAssembly?.resolvedAreaAboveByLevel instanceof Map) {
@@ -10654,8 +10698,14 @@ function buildClosedContourExportCollection(siteContext) {
       .sort((left, right) => left - right);
 
     for (const level of resolvedLevels) {
+      const levelKey = buildContourLevelKey(level);
+
+      if (nativeLoopLevels.has(levelKey)) {
+        continue;
+      }
+
       appendFeaturesFromMultiPolygon(
-        rawAnchorAssembly.resolvedAreaAboveByLevel.get(buildContourLevelKey(level)) || [],
+        rawAnchorAssembly.resolvedAreaAboveByLevel.get(levelKey) || [],
         level,
         "resolved-area-above-contour"
       );
@@ -10680,16 +10730,6 @@ function buildClosedContourExportCollection(siteContext) {
         );
       }
     }
-  }
-
-  for (const entry of buildNativeContourLoopEntries(siteContext, siteContext?.contourLines)) {
-    const levelKey = buildContourLevelKey(entry.elevation);
-
-    if (Number(appendedFeatureCountsByLevel.get(levelKey) || 0) > 0) {
-      continue;
-    }
-
-    appendNativeEntryFeature(entry);
   }
 
   if (features.length) {
@@ -10796,7 +10836,9 @@ function summarizeContourFeatureCollectionLevels(siteContext, contourCollection)
         featureCount: 0,
         closedFeatureCount: 0,
         generatedFeatureCount: 0,
+        nativeSourceClosedCount: 0,
         exportDerivedKinds: new Set(),
+        exportDerivedCounts: new Map(),
         providers: new Set(),
       });
     }
@@ -10812,6 +10854,16 @@ function summarizeContourFeatureCollectionLevels(siteContext, contourCollection)
     summary.generatedFeatureCount += generated ? 1 : 0;
     if (exportDerived) {
       summary.exportDerivedKinds.add(exportDerived);
+      summary.exportDerivedCounts.set(
+        exportDerived,
+        Number(summary.exportDerivedCounts.get(exportDerived) || 0) + 1
+      );
+      if (
+        exportDerived === "native-source-closed" ||
+        exportDerived === "native-source-closed-display-fallback"
+      ) {
+        summary.nativeSourceClosedCount += 1;
+      }
     }
     if (provider) {
       summary.providers.add(provider);
@@ -10841,7 +10893,13 @@ function summarizeContourFeatureCollectionLevels(siteContext, contourCollection)
         featureCount: Number(summary.featureCount || 0),
         closedFeatureCount: Number(summary.closedFeatureCount || 0),
         generatedFeatureCount: Number(summary.generatedFeatureCount || 0),
+        nativeSourceClosedCount: Number(summary.nativeSourceClosedCount || 0),
         exportDerivedKinds: [...summary.exportDerivedKinds].sort(),
+        exportDerivedCounts: Object.fromEntries(
+          [...summary.exportDerivedCounts.entries()].sort((left, right) =>
+            String(left[0]).localeCompare(String(right[0]))
+          )
+        ),
         providers: [...summary.providers].sort(),
       }))
       .sort((left, right) => left.elevation - right.elevation),
@@ -10946,6 +11004,11 @@ function buildTerrainPipelineDiagnostics(siteContext) {
     siteContext,
     siteContext?.contourLines
   );
+  const nativeDisplayClosedLoops = buildNativeContourLoopEntries(
+    siteContext,
+    siteContext?.contourLines,
+    { allowAmbiguousFallback: true }
+  );
   const exportContourSummary = summarizeContourFeatureCollectionLevels(
     siteContext,
     getExportContourFeatureCollection(siteContext)
@@ -11008,6 +11071,11 @@ function buildTerrainPipelineDiagnostics(siteContext) {
         : maxDelta,
     0
   );
+  const nativeElevationKeys = new Set(
+    [...(canonicalContourInput?.nativeLevels || [])].map((elevation) =>
+      buildContourLevelKey(elevation)
+    )
+  );
   const alignmentLevels = new Set([
     ...exportContourSummary.levels.map((summary) => buildContourLevelKey(summary.elevation)),
     ...terrainBasisContourSummary.levels.map((summary) =>
@@ -11032,6 +11100,38 @@ function buildTerrainPipelineDiagnostics(siteContext) {
       summary,
     ])
   );
+  const nativeDisplayLoopCountsByLevel = nativeDisplayClosedLoops.reduce((result, entry) => {
+    const levelKey = buildContourLevelKey(entry?.elevation);
+    result.set(levelKey, Number(result.get(levelKey) || 0) + 1);
+    return result;
+  }, new Map());
+  const nativeExportAlignmentLevels = new Set([
+    ...nativeDisplayLoopCountsByLevel.keys(),
+    ...exportContourSummary.levels
+      .filter((summary) => nativeElevationKeys.has(buildContourLevelKey(summary.elevation)))
+      .map((summary) => buildContourLevelKey(summary.elevation)),
+  ]);
+  const nativeExportMismatchLevels = [...nativeExportAlignmentLevels]
+    .map((levelKey) => {
+      const exportSummary = exportByLevel.get(levelKey) || null;
+      const expectedNativeLoopCount = Number(nativeDisplayLoopCountsByLevel.get(levelKey) || 0);
+      const exportNativeSourceClosedCount = Number(
+        exportSummary?.nativeSourceClosedCount || 0
+      );
+
+      if (expectedNativeLoopCount === exportNativeSourceClosedCount) {
+        return null;
+      }
+
+      return {
+        elevation: Number(levelKey),
+        expectedNativeLoopCount,
+        exportNativeSourceClosedCount,
+        exportDerivedKinds: exportSummary?.exportDerivedKinds || [],
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.elevation - right.elevation);
   const mismatchLevels = [...alignmentLevels]
     .map((levelKey) => {
       const exportSummary = exportByLevel.get(levelKey) || null;
@@ -11114,6 +11214,10 @@ function buildTerrainPipelineDiagnostics(siteContext) {
     },
     nativeClosedLoops: {
       count: nativeClosedLoops.length,
+      displayCount: nativeDisplayClosedLoops.length,
+      displayFallbackCount: nativeDisplayClosedLoops.filter(
+        (entry) => entry?.closureFallbackUsed === true
+      ).length,
       levels: [
         ...new Set(
           nativeClosedLoops
@@ -11124,6 +11228,10 @@ function buildTerrainPipelineDiagnostics(siteContext) {
       ],
     },
     exportContours: exportContourSummary,
+    nativeExportAlignment: {
+      mismatchLevelCount: nativeExportMismatchLevels.length,
+      mismatchLevels: nativeExportMismatchLevels,
+    },
     terrainBasisContours: terrainBasisContourSummary,
     sourceBandGroups: summarizeContourBandLevels(sourceBandGroups),
     cumulativeBandGroups: summarizeContourBandLevels(cumulativeBandGroups),

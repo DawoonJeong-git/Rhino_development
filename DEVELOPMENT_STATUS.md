@@ -36,6 +36,9 @@ Last updated: 2026-04-19
   - Fixed flat-fallback building placement so sampled buildings resolve against the same flat terrain cap basis
   - Replaced cumulative contour-band union's array-concatenation fallback with the normalized local-union helper so boolean failures do not inflate into whole-site slab bands
   - Added a cached `muak-live-cache` terrain export regression case so the known Muak hillside failure mode is checked every export verification run
+  - Switched native export curves to prefer closed raw contour loops instead of terrain-basis area boundaries
+  - Added display-only closure fallback for ambiguous native open contours so export curves no longer disappear at native source levels
+  - Added native contour export alignment diagnostics and made them the export verification gate instead of forcing native levels to mirror terrain-basis loop counts
 - `In Progress`
   - Reconnecting building/road Z placement to the same terrain basis
   - Turning live-case placement diagnostics into stricter export-side failures where upstream data is actually available
@@ -160,6 +163,12 @@ For requested `1m` contour models from `5m` source:
 13. Added a cached Muak regression case:
    - `verify:exports` and `report-terrain-progress` now include `muak-live-cache`
    - this uses `tmp_muak_live_site_context.json` so the known hillside geometry can be checked without depending on a fresh upstream geocode/provider lookup
+14. Re-centered export contour curves on native contour closure:
+   - native source elevations now export from `buildNativeContourLoopEntries(..., { allowAmbiguousFallback: true })` before any terrain-basis-derived loops are considered
+   - terrain-basis-derived contour loops are now reserved for non-native generated levels only
+15. Added native contour export alignment telemetry:
+   - diagnostics now report whether native source elevations exported the expected count of `native-source-closed` loops
+   - `verify:exports` now fails on native contour export alignment mismatches rather than treating export-vs-terrain-basis count differences as the primary correctness gate
 
 ## Latest Snapshot
 
@@ -195,9 +204,11 @@ Summary:
   - native open contours: `16`
   - accepted closures: `12`
   - rejected closures: `4`
+  - native closed loops: `strict 12 / display 16 / fallback 4`
   - terrain-basis contours: `85 features / 56 levels`
   - source/cumulative/renderable/top-surface bands: `55 / 55 / 55 / 55`
-  - export-vs-terrain-basis mismatch level count: `0`
+  - native export alignment mismatch level count: `0`
+  - export-vs-terrain-basis mismatch level count: `7`
   - export-vs-band-boundary mismatch level count: `6`
 
 Placement notes:
@@ -215,6 +226,7 @@ Interpretation:
 - After promoting placement gates, `seoul-center` exposed a real flat-fallback road bug (`roadCoverage=0` with `roadFeatureCount=3`), and that fallback is now fixed so current `verify:exports` is green again.
 - `seoul-center` also exposed that flat-fallback buildings were still using sampled Z without a terrain-basis reference (`terrainBasisAvailableCount=0`), and that is now fixed so current `verify:exports` reports `terrainBasisAvailableCount=3`.
 - `muak-live-cache` is now part of the default export regression set, and current verification shows `3dm terrainBands.trailingFullFootprintBandCount = 0` there after the cumulative-union fix.
+- `muak-live-cache` now also shows `nativeExportAlignment.mismatchLevelCount = 0`, while `curveTerrainAlignment` is intentionally non-zero because native source curves are no longer forced to imitate terrain-basis loop counts at native elevations.
 
 ## What This Turn Still Does Not Claim
 

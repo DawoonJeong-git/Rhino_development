@@ -716,10 +716,10 @@ function collectFormatFailures(testCase, result) {
     );
   }
 
-  if (result.formats["3dm"].terrainBasisMismatchLevels > 0) {
+  if (result.formats["3dm"].nativeSourceAlignmentMismatchLevels > 0) {
     failures.push(
-      `${testCase.name}/3dm: export-vs-terrain-basis mismatch levels ` +
-        `${result.formats["3dm"].terrainBasisMismatchLevels} should be 0`
+      `${testCase.name}/3dm: native contour export alignment mismatch levels ` +
+        `${result.formats["3dm"].nativeSourceAlignmentMismatchLevels} should be 0`
     );
   }
 
@@ -901,6 +901,9 @@ async function verifyCase(testCase) {
         bytes: threeDmBytes.length,
         curveCount: threeDmCurveSummary.curveCount,
         curveMaxAbsZ: threeDmCurveSummary.maxAbsZ,
+        nativeSourceAlignmentMismatchLevels: Number(
+          threeDmTerrainDiagnostics?.nativeExportAlignment?.mismatchLevelCount || 0
+        ),
         terrainBasisMismatchLevels: Number(
           threeDmTerrainDiagnostics?.curveTerrainAlignment?.mismatchLevelCount || 0
         ),

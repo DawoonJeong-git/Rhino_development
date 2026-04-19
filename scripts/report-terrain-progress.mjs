@@ -147,6 +147,18 @@ function summarizeDiagnostics(siteContext, exportSiteContext, include3dmBytes = 
           mismatchExampleLevels: mismatchLevels.slice(0, 12),
         }
       : null,
+    nativeExportAlignment: diagnostics
+      ? {
+          mismatchLevelCount: Number(
+            diagnostics?.nativeExportAlignment?.mismatchLevelCount || 0
+          ),
+          mismatchExampleLevels: Array.isArray(
+            diagnostics?.nativeExportAlignment?.mismatchLevels
+          )
+            ? diagnostics.nativeExportAlignment.mismatchLevels.slice(0, 12)
+            : [],
+        }
+      : null,
     bandBoundaryAlignment: diagnostics
       ? {
           mismatchLevelCount: Number(
