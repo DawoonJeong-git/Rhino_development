@@ -379,6 +379,22 @@ async function summarize3dmCurveHeights(threeDmBytes) {
   const objects = doc.objects();
   let curveCount = 0;
   let maxAbsZ = 0;
+  const readBBoxAxis = (point, axisIndex, axisName) => {
+    const arrayValue = Number(point?.[axisIndex]);
+
+    if (Number.isFinite(arrayValue)) {
+      return arrayValue;
+    }
+
+    const upperValue = Number(point?.[axisName]);
+
+    if (Number.isFinite(upperValue)) {
+      return upperValue;
+    }
+
+    const lowerValue = Number(point?.[String(axisName || "").toLowerCase()]);
+    return Number.isFinite(lowerValue) ? lowerValue : null;
+  };
 
   for (let index = 0; index < objects.count; index += 1) {
     const geometry = objects.get(index)?.geometry?.();
@@ -395,6 +411,22 @@ async function summarize3dmCurveHeights(threeDmBytes) {
 
       if (Array.isArray(point) && Number.isFinite(point[2])) {
         maxAbsZ = Math.max(maxAbsZ, Math.abs(Number(point[2] || 0)));
+      }
+    }
+
+    if (maxAbsZ <= 1e-9) {
+      const bbox = geometry?.getBoundingBox?.();
+      const minPoint = bbox?.min || bbox?.Min || null;
+      const maxPoint = bbox?.max || bbox?.Max || null;
+      const minZ = readBBoxAxis(minPoint, 2, "Z");
+      const maxZ = readBBoxAxis(maxPoint, 2, "Z");
+
+      if (Number.isFinite(minZ)) {
+        maxAbsZ = Math.max(maxAbsZ, Math.abs(minZ));
+      }
+
+      if (Number.isFinite(maxZ)) {
+        maxAbsZ = Math.max(maxAbsZ, Math.abs(maxZ));
       }
     }
   }
@@ -710,9 +742,9 @@ function collectFormatFailures(testCase, result) {
     failures.push(`${testCase.name}/3dm: no curve objects were found in the exported file`);
   }
 
-  if (result.formats["3dm"].curveMaxAbsZ > 0.001) {
+  if (result.formats["3dm"].curveMaxAbsZ <= 0.001) {
     failures.push(
-      `${testCase.name}/3dm: curve max |z| ${result.formats["3dm"].curveMaxAbsZ} should stay at 0`
+      `${testCase.name}/3dm: curve max |z| ${result.formats["3dm"].curveMaxAbsZ} should preserve exported contour elevations`
     );
   }
 

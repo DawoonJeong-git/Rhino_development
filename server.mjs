@@ -24539,6 +24539,7 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
       const objectGroupName =
         feature?.properties?.contourObjectGroup ||
         resolveContourFeatureExportLayer(siteContext, feature, "object");
+      const contourElevation = Number(feature?.properties?.elevation || 0);
 
       for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
         lines.push(`o ${objectGroupName}_${contourCounter}`);
@@ -24546,7 +24547,9 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
 
         for (const point of lineString) {
           const [xMeters, yMeters] = localMetersFromLngLat(point, center);
-          const elevation = FLAT_EXPORT_CURVE_ELEVATION;
+          const elevation = Number.isFinite(contourElevation)
+            ? contourElevation
+            : FLAT_EXPORT_CURVE_ELEVATION;
           appendObjVertex(lines, xMeters, yMeters, elevation);
           contourIndices.push(vertexIndex);
           vertexIndex += 1;
@@ -27675,6 +27678,7 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
     const contourCollection = getExportContourFeatureCollection(siteContext);
 
     for (const feature of contourCollection?.features || []) {
+      const contourElevation = Number(feature?.properties?.elevation || 0);
       const contourLayerName = resolveContourFeatureExportLayer(
         siteContext,
         feature,
@@ -27689,7 +27693,9 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
           lineString.map((point) => localMetersFromLngLat(point, center)),
           {
             closed: feature?.properties?.closedLoop === true,
-            elevation: FLAT_EXPORT_CURVE_ELEVATION,
+            elevation: Number.isFinite(contourElevation)
+              ? contourElevation
+              : FLAT_EXPORT_CURVE_ELEVATION,
           }
         );
       }
@@ -27872,7 +27878,13 @@ function createRhinoContourDisplayCurve(rhino, points) {
   const normalizedPoints = dedupePolylinePoints(
     points.map((point) =>
       Array.isArray(point) && point.length >= 2
-        ? [Number(point[0]), Number(point[1]), FLAT_EXPORT_CURVE_ELEVATION]
+        ? [
+            Number(point[0]),
+            Number(point[1]),
+            Number.isFinite(Number(point[2]))
+              ? Number(point[2])
+              : FLAT_EXPORT_CURVE_ELEVATION,
+          ]
         : point
     )
   ).filter(
@@ -29218,11 +29230,18 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
     ) {
       const feature = contourCollection.features[index];
       const lineStrings = getLineStringsFromGeometry(feature.geometry);
+      const contourElevation = Number(feature?.properties?.elevation || 0);
 
       for (let lineIndex = 0; lineIndex < lineStrings.length; lineIndex += 1) {
         const points = lineStrings[lineIndex].map((point) => {
           const [xMeters, yMeters] = localMetersFromLngLat(point, center);
-          return [xMeters, yMeters, FLAT_EXPORT_CURVE_ELEVATION];
+          return [
+            xMeters,
+            yMeters,
+            Number.isFinite(contourElevation)
+              ? contourElevation
+              : FLAT_EXPORT_CURVE_ELEVATION,
+          ];
         });
 
         if (!points.length) {
