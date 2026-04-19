@@ -2484,8 +2484,14 @@ async function runBaselineVerification() {
       "3DM contour export should produce closed export contours when contour terrain bands are available."
     );
     assert.ok(
-      nativeExportContours.every((feature) => feature?.properties?.closedLoop === true),
-      "Native export contours should stay closed so the original contour boundaries remain exact."
+      nativeExportContours.every(
+        (feature) =>
+          feature?.properties?.closedLoop === true &&
+          String(feature?.properties?.contourExportLayer || "")
+            .trim()
+            .startsWith("contours-native-")
+      ),
+      "Native export contours should stay closed and remain on a dedicated native-contour layer so the source 5m rows can be verified directly."
     );
     assert.ok(
       generatedExportContours.length > 0,
@@ -2494,13 +2500,16 @@ async function runBaselineVerification() {
     assert.ok(
       generatedExportContours.every(
         (feature) =>
-          feature?.properties?.closedLoop === true &&
           [
-            "resolved-area-above-contour",
+            "native-band-interpolation",
+            "generated-terrain-grid-fallback",
             "top-surface-cap-contour",
-          ].includes(String(feature?.properties?.exportDerived || "").trim())
+          ].includes(String(feature?.properties?.exportDerived || "").trim()) &&
+          String(feature?.properties?.contourExportLayer || "")
+            .trim()
+            .startsWith("contours-generated-")
       ),
-      "Generated intermediate contours should come directly from the terrain contour basis so the display curves and terrace edges stay in sync."
+      "Generated intermediate contours should stay on a dedicated generated-contour layer and use the simple native-band interpolation path whenever that path is available."
     );
     const refined3dmTerrainPlan = resolveContourTerrainRenderPlan(refined3dmSiteContext);
     assert.equal(
@@ -3066,7 +3075,11 @@ async function runBaselineVerification() {
       refinedSketchUpSiteContext
     );
     const refinedContourCurves = (refinedSketchUpPayload.groups || [])
-      .filter((group) => group?.layer === "contours")
+      .filter((group) =>
+        String(group?.layer || "")
+          .trim()
+          .startsWith("contours")
+      )
       .flatMap((group) => group?.polylines || [])
       .map((polyline) => polyline?.curve === true);
     assert.ok(

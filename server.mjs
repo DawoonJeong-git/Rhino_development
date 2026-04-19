@@ -1510,6 +1510,7 @@ function buildSiteContextCacheKey(location = {}, options = {}, customBounds = nu
     radius: Math.max(30, Number(options.radius) || 120),
     contourInterval: normalizeContourInterval(options.contourInterval),
     terrainMode: options.terrainMode === "flat" ? "flat" : "contour",
+    terrainPipelineMode: normalizeTerrainPipelineMode(options.terrainPipelineMode) || "auto",
     buildingPlacement: normalizeBuildingPlacementMode(options.buildingPlacement),
     exportFormat: normalizeExportFormat(options.exportFormat),
     includeContours: options.includeContours !== false,
@@ -9959,27 +9960,219 @@ function buildContourFeatureCountByElevation(contourCollection) {
   return counts;
 }
 
-function normalizeBuildingPlacementMode(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  return normalized === "remove-overlap" || normalized === "embed-lowest"
-    ? "remove-overlap"
-    : "default";
+function formatContourIntervalLayerToken(interval) {
+  const normalizedInterval = Number(Number(interval || 0).toFixed(3));
+
+  if (!(normalizedInterval > 0)) {
+    return "custom";
+  }
+
+  return `${String(normalizedInterval).replace(/\./g, "p")}m`;
 }
 
-function shouldRemoveTerrainBuildingOverlap(siteContextOrOptions) {
-  const options =
-    siteContextOrOptions?.options && typeof siteContextOrOptions.options === "object"
-      ? siteContextOrOptions.options
-      : siteContextOrOptions;
-  return normalizeBuildingPlacementMode(options?.buildingPlacement) === "remove-overlap";
+function normalizeContourLayerNameForExport(layerName, style = "default") {
+  const normalized = String(layerName || "contours")
+    .trim()
+    .toLowerCase();
+
+  if (style === "dxf" || style === "object") {
+    return normalized.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+  }
+
+  return normalized || "contours";
 }
 
-function buildGeneratedContourLinesFromResolvedAreas(siteContext, contourInterval) {
+function buildContourExportMetadata(
+  siteContext,
+  { generated = false, contourInterval = null } = {}
+) {
+  const resolvedInterval = normalizeContourInterval(
+    generated
+      ? contourInterval ??
+          siteContext?.stats?.effectiveContourDisplayInterval ??
+          siteContext?.options?.contourInterval
+      : resolveSourceContourInterval(siteContext)
+  );
+  const contourKind = generated ? "generated" : "native";
+  const contourExportLayer = `contours-${contourKind}-${formatContourIntervalLayerToken(
+    resolvedInterval
+  )}`;
+
+  return {
+    contourKind,
+    contourIntervalMeters: Number(resolvedInterval.toFixed(3)),
+    contourExportLayer,
+    contourDxfLayer: normalizeContourLayerNameForExport(contourExportLayer, "dxf"),
+    contourObjectGroup: normalizeContourLayerNameForExport(
+      contourExportLayer,
+      "object"
+    ),
+  };
+}
+
+function resolveContourFeatureExportLayer(siteContext, feature, style = "default") {
+  const properties = feature?.properties || {};
+  const metadata = buildContourExportMetadata(siteContext, {
+    generated: properties.generated === true,
+    contourInterval: properties.contourIntervalMeters,
+  });
+
+  return style === "default"
+    ? metadata.contourExportLayer
+    : normalizeContourLayerNameForExport(metadata.contourExportLayer, style);
+}
+
+function resolveGeneratedContourInterpolationGridStep(
+  siteContext,
+  contourInterval,
+  sourceContourInterval = 0
+) {
+  const terrainStep = Number(siteContext?.terrainGrid?.step || 0);
+  const minimumStep = Math.max(0.35, contourInterval * 0.45);
+  const maximumStep = Math.max(
+    minimumStep,
+    Math.min(
+      1.1,
+      sourceContourInterval > 0 ? sourceContourInterval * 0.22 : contourInterval * 1.1
+    )
+  );
+  const preferredStep =
+    terrainStep > 0
+      ? Math.max(terrainStep, contourInterval * 0.6)
+      : contourInterval * 0.65;
+
+  return Number(
+    Math.min(maximumStep, Math.max(minimumStep, preferredStep)).toFixed(3)
+  );
+}
+
+function buildContourInterpolationGridAxisValues(minValue, maxValue, step) {
+  if (
+    !Number.isFinite(minValue) ||
+    !Number.isFinite(maxValue) ||
+    !Number.isFinite(step) ||
+    step <= 0
+  ) {
+    return [];
+  }
+
+  const normalizedStep = Math.max(0.05, Number(step) || 0);
+  let startValue = Number((Math.floor(minValue / normalizedStep) * normalizedStep).toFixed(3));
+  let endValue = Number((Math.ceil(maxValue / normalizedStep) * normalizedStep).toFixed(3));
+
+  if (!(endValue > startValue + 1e-9)) {
+    endValue = Number((startValue + normalizedStep).toFixed(3));
+  }
+
+  const values = [];
+
+  for (
+    let value = startValue;
+    value <= endValue + normalizedStep * 0.25;
+    value = Number((value + normalizedStep).toFixed(6))
+  ) {
+    values.push(Number(value.toFixed(3)));
+  }
+
+  if (values.length < 2) {
+    values.push(Number((values[0] + normalizedStep).toFixed(3)));
+  }
+
+  return values;
+}
+
+function buildLocalBoundarySegmentsFromRegions(regions) {
+  const segments = [];
+
+  for (const region of regions || []) {
+    for (const ring of [region?.outerPoints, ...(region?.holePoints || [])]) {
+      const closedRing = closeRing(dedupeLocalPolygonPoints(ring, 0.001));
+
+      if (closedRing.length < 4) {
+        continue;
+      }
+
+      for (let index = 1; index < closedRing.length; index += 1) {
+        const startPoint = closedRing[index - 1];
+        const endPoint = closedRing[index];
+
+        if (
+          !Array.isArray(startPoint) ||
+          !Array.isArray(endPoint) ||
+          pointsMatchInMeters(startPoint, endPoint, 0.001)
+        ) {
+          continue;
+        }
+
+        segments.push({
+          startPoint,
+          endPoint,
+          minX: Math.min(startPoint[0], endPoint[0]),
+          maxX: Math.max(startPoint[0], endPoint[0]),
+          minY: Math.min(startPoint[1], endPoint[1]),
+          maxY: Math.max(startPoint[1], endPoint[1]),
+        });
+      }
+    }
+  }
+
+  return segments;
+}
+
+function distancePointToLocalBoundarySegments(point, segments) {
+  if (!Array.isArray(point) || !segments?.length) {
+    return 0;
+  }
+
+  const [xMeters, yMeters] = point;
+
+  if (!Number.isFinite(xMeters) || !Number.isFinite(yMeters)) {
+    return 0;
+  }
+
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (const segment of segments) {
+    if (
+      Number.isFinite(bestDistance) &&
+      (xMeters < segment.minX - bestDistance ||
+        xMeters > segment.maxX + bestDistance ||
+        yMeters < segment.minY - bestDistance ||
+        yMeters > segment.maxY + bestDistance)
+    ) {
+      continue;
+    }
+
+    const distance = distancePointToLocalSegment(
+      point,
+      segment.startPoint,
+      segment.endPoint
+    );
+
+    if (distance < bestDistance) {
+      bestDistance = distance;
+
+      if (bestDistance <= 0.001) {
+        return 0;
+      }
+    }
+  }
+
+  return Number.isFinite(bestDistance) ? Number(bestDistance.toFixed(6)) : 0;
+}
+
+function buildGeneratedContourLinesFromNativeAnchorBands(siteContext, contourInterval) {
   if (
     !siteContext?.location ||
     !Number.isFinite(contourInterval) ||
     contourInterval <= 0
   ) {
+    return featureCollection([]);
+  }
+
+  const sourceContourInterval = resolveSourceContourInterval(siteContext);
+
+  if (!(sourceContourInterval > contourInterval + 1e-9)) {
     return featureCollection([]);
   }
 
@@ -9993,75 +10186,186 @@ function buildGeneratedContourLinesFromResolvedAreas(siteContext, contourInterva
     ...siteContext,
     contourLines: nativeContourLines,
   });
+  const areaByLevel =
+    rawAnchorAssembly?.constrainedAnchorAreaByLevel instanceof Map
+      ? rawAnchorAssembly.constrainedAnchorAreaByLevel
+      : rawAnchorAssembly?.resolvedAreaAboveByLevel instanceof Map
+        ? rawAnchorAssembly.resolvedAreaAboveByLevel
+        : null;
+  const anchorLevels = [...(rawAnchorAssembly?.anchorLevels || [])]
+    .map(Number)
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
 
-  if (!(rawAnchorAssembly?.resolvedAreaAboveByLevel instanceof Map)) {
+  if (!areaByLevel || anchorLevels.length < 2) {
     return featureCollection([]);
   }
 
   const features = [];
   const featureKeys = new Set();
-  const levels = [...rawAnchorAssembly.resolvedAreaAboveByLevel.keys()]
-    .map(Number)
-    .filter(Number.isFinite)
-    .sort((left, right) => left - right);
-  const levelRegionEntries = [];
+  const interpolationStep = resolveGeneratedContourInterpolationGridStep(
+    siteContext,
+    contourInterval,
+    sourceContourInterval
+  );
+  const bandAreaThresholdSqm = Math.max(0.04, interpolationStep * interpolationStep * 0.2);
+  const paddingMeters = interpolationStep * 2;
+  const epsilon = Number(
+    Math.max(0.01, Math.min(0.08, contourInterval * 0.05)).toFixed(3)
+  );
 
-  for (const level of levels) {
-    const levelKey = buildContourLevelKey(level);
+  for (let index = 0; index < anchorLevels.length - 1; index += 1) {
+    const lowerElevation = anchorLevels[index];
+    const upperElevation = anchorLevels[index + 1];
 
-    if (nativeElevationKeys.has(levelKey)) {
+    if (!(upperElevation > lowerElevation + contourInterval + 1e-9)) {
       continue;
     }
 
-    const multiPolygon =
-      rawAnchorAssembly.resolvedAreaAboveByLevel.get(levelKey) || [];
-
-    if (!Array.isArray(multiPolygon) || !multiPolygon.length) {
-      continue;
-    }
-
-    const regions = normalizeContourRegionsForLevel(
-      siteContext,
-      buildContourBandRegionsFromMultiPolygon(multiPolygon),
-      level
+    const lowerLevelKey = buildContourLevelKey(lowerElevation);
+    const upperLevelKey = buildContourLevelKey(upperElevation);
+    const lowerArea = areaByLevel.get(lowerLevelKey) || [];
+    const upperArea = constrainUpperContourAreaWithinLower(
+      lowerArea,
+      areaByLevel.get(upperLevelKey) || []
     );
 
-    if (!regions.length) {
+    if (!lowerArea.length || !upperArea.length) {
       continue;
     }
 
-    levelRegionEntries.push({
-      level,
-      regions,
-    });
-  }
+    const bandMultiPolygon = filterTinyLocalMultiPolygonArtifacts(
+      differenceLocalMultiPolygon(lowerArea, upperArea, 0, {
+        kind: "generated-native-band",
+        bottom: Number(lowerElevation.toFixed(3)),
+        top: Number(upperElevation.toFixed(3)),
+      }),
+      bandAreaThresholdSqm
+    );
+    const bandBounds = computeLocalMultiPolygonBounds(bandMultiPolygon);
+    const bandRegions = buildContourBandRegionsFromMultiPolygon(bandMultiPolygon);
 
-  const prunedLevelRegionEntries = levelRegionEntries.map((entry, index, entries) => ({
-    level: entry.level,
-    regions: pruneTransientGeneratedRegions(
-      siteContext,
-      entry.level,
-      entry.regions,
-      entries[index - 1]?.regions || [],
-      entries[index + 1]?.regions || []
-    ),
-  }));
+    if (!bandBounds || !bandRegions.length) {
+      continue;
+    }
 
-  for (const entry of prunedLevelRegionEntries) {
-    const level = Number(entry.level);
-    const levelKey = buildContourLevelKey(level);
+    const lowerRegions = buildContourBandRegionsFromMultiPolygon(lowerArea);
+    const upperRegions = buildContourBandRegionsFromMultiPolygon(upperArea);
+    const lowerBoundarySegments = buildLocalBoundarySegmentsFromRegions(lowerRegions);
+    const upperBoundarySegments = buildLocalBoundarySegmentsFromRegions(upperRegions);
+    const xValues = buildContourInterpolationGridAxisValues(
+      bandBounds.minX - paddingMeters,
+      bandBounds.maxX + paddingMeters,
+      interpolationStep
+    );
+    const yValues = buildContourInterpolationGridAxisValues(
+      bandBounds.minY - paddingMeters,
+      bandBounds.maxY + paddingMeters,
+      interpolationStep
+    );
 
-    for (const region of entry.regions || []) {
-      for (const loop of [region?.outerPoints, ...(region?.holePoints || [])]) {
-        const closedLoop = closeRing(dedupeLocalPolygonPoints(loop, 0.001));
+    if (
+      xValues.length < 2 ||
+      yValues.length < 2 ||
+      !lowerBoundarySegments.length ||
+      !upperBoundarySegments.length
+    ) {
+      continue;
+    }
 
-        if (closedLoop.length < 4) {
+    const elevations = yValues.map((yMeters) =>
+      xValues.map((xMeters) => {
+        const point = [xMeters, yMeters];
+
+        if (isPointInsideOrOnAnyLocalRegion(point, upperRegions)) {
+          return Number((upperElevation + epsilon).toFixed(3));
+        }
+
+        if (isPointInsideOrOnAnyLocalRegion(point, bandRegions)) {
+          const lowerDistance = distancePointToLocalBoundarySegments(
+            point,
+            lowerBoundarySegments
+          );
+          const upperDistance = distancePointToLocalBoundarySegments(
+            point,
+            upperBoundarySegments
+          );
+          const ratio = Math.max(
+            0,
+            Math.min(1, lowerDistance / Math.max(0.001, lowerDistance + upperDistance))
+          );
+
+          return Number(
+            (
+              lowerElevation +
+              (upperElevation - lowerElevation) * ratio
+            ).toFixed(3)
+          );
+        }
+
+        return Number((lowerElevation - epsilon).toFixed(3));
+      })
+    );
+
+    const generatedContourCollection = createContourLinesFromTerrainGrid(
+      siteContext.location,
+      {
+        xValues,
+        yValues,
+        elevations,
+        step: interpolationStep,
+        minElevation: lowerElevation - epsilon,
+        maxElevation: upperElevation + epsilon,
+      },
+      {
+        contourInterval,
+      }
+    );
+
+    for (const feature of generatedContourCollection?.features || []) {
+      const elevation = Number(feature?.properties?.elevation);
+
+      if (
+        !Number.isFinite(elevation) ||
+        elevation <= lowerElevation + 1e-6 ||
+        elevation >= upperElevation - 1e-6
+      ) {
+        continue;
+      }
+
+      const levelKey = buildContourLevelKey(elevation);
+
+      if (nativeElevationKeys.has(levelKey)) {
+        continue;
+      }
+
+      for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
+        const localPoints = mergeContourPolylinePoints(
+          lineString
+            .map((point) => localMetersFromLngLat(point, siteContext.location))
+            .filter(
+              (point) =>
+                Array.isArray(point) &&
+                Number.isFinite(point[0]) &&
+                Number.isFinite(point[1])
+            ),
+          0.001
+        );
+
+        if (localPoints.length < 2) {
           continue;
         }
 
+        const closedLoop =
+          localPoints.length >= 3 &&
+          pointsMatchInMeters(localPoints[0], localPoints[localPoints.length - 1], 0.001);
+        const normalizedPoints =
+          closedLoop === true
+            ? closeRing(dedupeLocalPolygonPoints(localPoints, 0.001))
+            : localPoints;
         const featureKey = [
           levelKey,
-          closedLoop.map((point) => buildLocalPointKey(point, 3)).join(";"),
+          normalizedPoints.map((point) => buildLocalPointKey(point, 3)).join(";"),
         ].join("|");
 
         if (featureKeys.has(featureKey)) {
@@ -10071,15 +10375,22 @@ function buildGeneratedContourLinesFromResolvedAreas(siteContext, contourInterva
         featureKeys.add(featureKey);
         features.push(
           lineFeature(
-            closedLoop.map(([xMeters, yMeters]) =>
+            normalizedPoints.map(([xMeters, yMeters]) =>
               lngLatFromMeters(siteContext.location, xMeters, yMeters)
             ),
             {
-              elevation: Number(level.toFixed(3)),
-              provider: "derived-contours-resolved-area",
+              elevation: Number(elevation.toFixed(3)),
+              provider: "derived-contours-native-band",
               generated: true,
-              closedLoop: true,
-              exportDerived: "generated-terrain-aligned",
+              closedLoop,
+              exportDerived: "native-band-interpolation",
+              lowerAnchorElevation: Number(lowerElevation.toFixed(3)),
+              upperAnchorElevation: Number(upperElevation.toFixed(3)),
+              sourceContourIntervalMeters: Number(sourceContourInterval.toFixed(3)),
+              ...buildContourExportMetadata(siteContext, {
+                generated: true,
+                contourInterval,
+              }),
             }
           )
         );
@@ -10087,7 +10398,71 @@ function buildGeneratedContourLinesFromResolvedAreas(siteContext, contourInterva
     }
   }
 
-  return featureCollection(features);
+  return featureCollection(
+    features.sort(
+      (left, right) =>
+        Number(left?.properties?.elevation || 0) -
+          Number(right?.properties?.elevation || 0) ||
+        Number(Boolean(left?.properties?.generated)) -
+          Number(Boolean(right?.properties?.generated))
+    )
+  );
+}
+
+function normalizeBuildingPlacementMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "remove-overlap" || normalized === "embed-lowest"
+    ? "remove-overlap"
+    : "default";
+}
+
+function normalizeTerrainPipelineMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "legacy" || normalized === "current" ? normalized : "";
+}
+
+function isContourModelExportFormat(format) {
+  const normalized = normalizeExportFormat(format);
+  return (
+    normalized === "obj" ||
+    normalized === "skp" ||
+    normalized === "skp-payload" ||
+    normalized === "3dm" ||
+    normalized === "dxf"
+  );
+}
+
+function resolveTerrainPipelineMode(siteContextOrOptions, format = null) {
+  const options =
+    siteContextOrOptions?.options && typeof siteContextOrOptions.options === "object"
+      ? siteContextOrOptions.options
+      : siteContextOrOptions || {};
+  const requestedMode = normalizeTerrainPipelineMode(options?.terrainPipelineMode);
+
+  if (requestedMode) {
+    return requestedMode;
+  }
+
+  return "current";
+}
+
+function shouldUseLegacyTerrainPipeline(siteContextOrOptions, format = null) {
+  return resolveTerrainPipelineMode(siteContextOrOptions, format) === "legacy";
+}
+
+function shouldRemoveTerrainBuildingOverlap(siteContextOrOptions) {
+  const options =
+    siteContextOrOptions?.options && typeof siteContextOrOptions.options === "object"
+      ? siteContextOrOptions.options
+      : siteContextOrOptions;
+  return normalizeBuildingPlacementMode(options?.buildingPlacement) === "remove-overlap";
+}
+
+function buildGeneratedContourLinesFromResolvedAreas(siteContext, contourInterval) {
+  return buildGeneratedContourLinesFromNativeAnchorBands(
+    siteContext,
+    contourInterval
+  );
 }
 
 function buildAugmentedContourLinesForExport(siteContext, contourInterval) {
@@ -10141,6 +10516,75 @@ function buildAugmentedContourLinesForExport(siteContext, contourInterval) {
         provider:
           String(feature?.properties?.provider || "").trim() || "derived-contours",
         generated: true,
+        exportDerived:
+          String(feature?.properties?.exportDerived || "").trim() ||
+          "generated-terrain-grid-fallback",
+        ...buildContourExportMetadata(siteContext, {
+          generated: true,
+          contourInterval,
+        }),
+      },
+    })),
+  ]);
+}
+
+function buildLegacyAugmentedContourLinesForExport(siteContext, contourInterval) {
+  const nativeContourLines = siteContext?.contourLines || featureCollection([]);
+
+  if (
+    !siteContext?.terrainGrid?.elevations?.length ||
+    !Number.isFinite(contourInterval) ||
+    contourInterval <= 0
+  ) {
+    return nativeContourLines;
+  }
+
+  let generatedContours = buildGeneratedContourLinesFromResolvedAreas(
+    siteContext,
+    contourInterval
+  );
+
+  if (!(generatedContours?.features?.length > 0)) {
+    generatedContours = createContourLinesFromTerrainGrid(
+      siteContext.location,
+      siteContext.terrainGrid,
+      {
+        ...(siteContext?.options || {}),
+        contourInterval,
+      }
+    );
+  }
+  const nativeElevationKeys = buildContourElevationKeySet(nativeContourLines);
+  const generatedFeatures = (generatedContours?.features || []).filter((feature) => {
+    const elevation = Number(feature?.properties?.elevation);
+
+    if (!Number.isFinite(elevation)) {
+      return false;
+    }
+
+    return !nativeElevationKeys.has(buildContourLevelKey(elevation));
+  });
+
+  if (!generatedFeatures.length) {
+    return nativeContourLines;
+  }
+
+  return featureCollection([
+    ...(nativeContourLines?.features || []),
+    ...generatedFeatures.map((feature) => ({
+      ...feature,
+      properties: {
+        ...(feature?.properties || {}),
+        provider:
+          String(feature?.properties?.provider || "").trim() || "derived-contours",
+        generated: true,
+        exportDerived:
+          String(feature?.properties?.exportDerived || "").trim() ||
+          "generated-terrain-grid-fallback",
+        ...buildContourExportMetadata(siteContext, {
+          generated: true,
+          contourInterval,
+        }),
       },
     })),
   ]);
@@ -10566,6 +11010,231 @@ function buildNativeContourLoopEntries(
   return entries;
 }
 
+function appendReusableContourFeatureToExportCollection({
+  siteContext,
+  feature,
+  features,
+  featureKeys,
+  registerLevelFeatureAppend = null,
+  propertyOverrides = null,
+}) {
+  const elevation = Number(feature?.properties?.elevation);
+
+  if (!Number.isFinite(elevation) || !siteContext?.location) {
+    return false;
+  }
+
+  const levelKey = buildContourLevelKey(elevation);
+  let appended = false;
+
+  for (const lineString of getLineStringsFromGeometry(feature?.geometry)) {
+    const localPoints = lineString
+      .map((point) => localMetersFromLngLat(point, siteContext.location))
+      .filter(
+        (point) =>
+          Array.isArray(point) && Number.isFinite(point[0]) && Number.isFinite(point[1])
+      );
+
+    if (localPoints.length < 2) {
+      continue;
+    }
+
+    const closedLoop =
+      feature?.properties?.closedLoop === true ||
+      (localPoints.length >= 3 &&
+        pointsMatchInMeters(localPoints[0], localPoints[localPoints.length - 1], 0.001));
+    const normalizedPoints =
+      closedLoop === true
+        ? closeRing(dedupeLocalPolygonPoints(localPoints, 0.001))
+        : mergeContourPolylinePoints(localPoints, 0.001);
+
+    if ((closedLoop === true && normalizedPoints.length < 4) || normalizedPoints.length < 2) {
+      continue;
+    }
+
+    const featureKey = [
+      levelKey,
+      normalizedPoints.map((point) => buildLocalPointKey(point, 3)).join(";"),
+    ].join("|");
+
+    if (featureKeys.has(featureKey)) {
+      continue;
+    }
+
+    featureKeys.add(featureKey);
+    registerLevelFeatureAppend?.(levelKey);
+    features.push(
+      lineFeature(
+        normalizedPoints.map(([xMeters, yMeters]) =>
+          lngLatFromMeters(siteContext.location, xMeters, yMeters)
+        ),
+        {
+          ...(feature?.properties || {}),
+          elevation: Number(elevation.toFixed(3)),
+          closedLoop,
+          ...buildContourExportMetadata(siteContext, {
+            generated: feature?.properties?.generated === true,
+            contourInterval: feature?.properties?.contourIntervalMeters,
+          }),
+          ...(propertyOverrides || {}),
+        }
+      )
+    );
+    appended = true;
+  }
+
+  return appended;
+}
+
+function buildLegacyClosedContourExportCollection(siteContext) {
+  const cumulativeGroups = getCachedCumulativeContourBandGroups(siteContext);
+
+  if (!cumulativeGroups.length || !siteContext?.location) {
+    return siteContext?.contourLines || featureCollection([]);
+  }
+
+  const nativeElevationKeys = new Set(
+    (siteContext?.contourLines?.features || [])
+      .filter((feature) => feature?.properties?.generated !== true)
+      .map((feature) => Number(feature?.properties?.elevation))
+      .filter((value) => Number.isFinite(value))
+      .map((value) => buildContourLevelKey(value))
+  );
+  const features = [];
+  const featureKeys = new Set();
+  const appendedFeatureCountsByLevel = new Map();
+  const reusableGeneratedFeatures = (siteContext?.contourLines?.features || []).filter(
+    (feature) => shouldReuseGeneratedExportContourFeature(feature)
+  );
+
+  const registerLevelFeatureAppend = (levelKey) => {
+    appendedFeatureCountsByLevel.set(
+      levelKey,
+      Number(appendedFeatureCountsByLevel.get(levelKey) || 0) + 1
+    );
+  };
+
+  const appendClosedLoopFeature = (
+    loop,
+    elevation,
+    generated,
+    exportDerived,
+    provider
+  ) => {
+    const closedLoop = closeRing(dedupeLocalPolygonPoints(loop, 0.001));
+
+    if (closedLoop.length < 4) {
+      return;
+    }
+
+    const levelKey = buildContourLevelKey(elevation);
+    const featureKey = [
+      levelKey,
+      closedLoop.map((point) => buildLocalPointKey(point, 3)).join(";"),
+    ].join("|");
+
+    if (featureKeys.has(featureKey)) {
+      return;
+    }
+
+    featureKeys.add(featureKey);
+    registerLevelFeatureAppend(levelKey);
+    features.push(
+      lineFeature(
+        closedLoop.map(([xMeters, yMeters]) =>
+          lngLatFromMeters(siteContext.location, xMeters, yMeters)
+        ),
+        {
+          elevation: Number(elevation.toFixed(3)),
+          provider,
+          generated,
+          closedLoop: true,
+          exportDerived,
+          ...buildContourExportMetadata(siteContext, {
+            generated,
+            contourInterval: generated
+              ? null
+              : resolveSourceContourInterval(siteContext),
+          }),
+        }
+      )
+    );
+  };
+
+  for (const group of cumulativeGroups) {
+    const elevation = Number(group?.bottomElevation);
+
+    if (!Number.isFinite(elevation)) {
+      continue;
+    }
+
+    const levelKey = buildContourLevelKey(elevation);
+
+    if (!nativeElevationKeys.has(levelKey)) {
+      continue;
+    }
+
+    for (const loop of group?.boundaryLoops || []) {
+      appendClosedLoopFeature(
+        loop,
+        elevation,
+        false,
+        "native-source-closed",
+        "official-contours-closed"
+      );
+    }
+  }
+
+  for (const feature of reusableGeneratedFeatures) {
+    appendReusableContourFeatureToExportCollection({
+      siteContext,
+      feature,
+      features,
+      featureKeys,
+      registerLevelFeatureAppend,
+    });
+  }
+
+  if (!(reusableGeneratedFeatures.length > 0)) {
+    for (const group of cumulativeGroups) {
+      const elevation = Number(group?.bottomElevation);
+
+      if (!Number.isFinite(elevation)) {
+        continue;
+      }
+
+      const levelKey = buildContourLevelKey(elevation);
+
+      if (
+        nativeElevationKeys.has(levelKey) ||
+        Number(appendedFeatureCountsByLevel.get(levelKey) || 0) > 0
+      ) {
+        continue;
+      }
+
+      for (const loop of group?.boundaryLoops || []) {
+        appendClosedLoopFeature(
+          loop,
+          elevation,
+          true,
+          "resolved-area-above-contour",
+          "derived-contours-closed"
+        );
+      }
+    }
+  }
+
+  return featureCollection(
+    features.sort(
+      (left, right) =>
+        Number(left?.properties?.elevation || 0) -
+          Number(right?.properties?.elevation || 0) ||
+        Number(Boolean(left?.properties?.generated)) -
+          Number(Boolean(right?.properties?.generated))
+    )
+  );
+}
+
 function buildClosedContourExportCollection(siteContext) {
   if (!siteContext?.location) {
     return siteContext?.contourLines || featureCollection([]);
@@ -10588,6 +11257,9 @@ function buildClosedContourExportCollection(siteContext) {
   );
   const nativeLoopLevels = new Set(
     nativeLoopEntries.map((entry) => buildContourLevelKey(entry.elevation))
+  );
+  const reusableGeneratedFeatures = (siteContext?.contourLines?.features || []).filter(
+    (feature) => shouldReuseGeneratedExportContourFeature(feature)
   );
 
   const registerLevelFeatureAppend = (levelKey) => {
@@ -10625,6 +11297,10 @@ function buildClosedContourExportCollection(siteContext) {
             : "native-source-closed",
           closureSelectionReason: entry.closureSelectionReason || null,
           closureFallbackUsed: entry.closureFallbackUsed === true,
+          ...buildContourExportMetadata(siteContext, {
+            generated: false,
+            contourInterval: resolveSourceContourInterval(siteContext),
+          }),
         }
       )
     );
@@ -10679,6 +11355,12 @@ function buildClosedContourExportCollection(siteContext) {
               generated,
               closedLoop: true,
               exportDerived,
+              ...buildContourExportMetadata(siteContext, {
+                generated,
+                contourInterval: generated
+                  ? null
+                  : resolveSourceContourInterval(siteContext),
+              }),
             }
           )
         );
@@ -10689,6 +11371,16 @@ function buildClosedContourExportCollection(siteContext) {
     appendNativeEntryFeature(entry);
   }
 
+  for (const feature of reusableGeneratedFeatures) {
+    appendReusableContourFeatureToExportCollection({
+      siteContext,
+      feature,
+      features,
+      featureKeys,
+      registerLevelFeatureAppend,
+    });
+  }
+
   const rawAnchorAssembly = buildRawAnchoredContourBandAssembly(siteContext);
 
   if (rawAnchorAssembly?.resolvedAreaAboveByLevel instanceof Map) {
@@ -10697,18 +11389,23 @@ function buildClosedContourExportCollection(siteContext) {
       .filter(Number.isFinite)
       .sort((left, right) => left - right);
 
-    for (const level of resolvedLevels) {
-      const levelKey = buildContourLevelKey(level);
+    if (!(reusableGeneratedFeatures.length > 0)) {
+      for (const level of resolvedLevels) {
+        const levelKey = buildContourLevelKey(level);
 
-      if (nativeLoopLevels.has(levelKey)) {
-        continue;
+        if (
+          nativeLoopLevels.has(levelKey) ||
+          Number(appendedFeatureCountsByLevel.get(levelKey) || 0) > 0
+        ) {
+          continue;
+        }
+
+        appendFeaturesFromMultiPolygon(
+          rawAnchorAssembly.resolvedAreaAboveByLevel.get(levelKey) || [],
+          level,
+          "resolved-area-above-contour"
+        );
       }
-
-      appendFeaturesFromMultiPolygon(
-        rawAnchorAssembly.resolvedAreaAboveByLevel.get(levelKey) || [],
-        level,
-        "resolved-area-above-contour"
-      );
     }
 
     const highestTopSurfaceGroup = getCachedContourTopSurfaceGroups(siteContext)
@@ -10778,6 +11475,12 @@ function buildClosedContourExportCollection(siteContext) {
             generated,
             closedLoop: true,
             exportDerived: "cumulative-contour-boundary",
+            ...buildContourExportMetadata(siteContext, {
+              generated,
+              contourInterval: generated
+                ? null
+                : resolveSourceContourInterval(siteContext),
+            }),
           }
         )
       );
@@ -10817,9 +11520,12 @@ function shouldReuseGeneratedExportContourFeature(feature) {
 
   return (
     exportDerived === "generated-terrain-aligned" ||
+    exportDerived === "native-band-interpolation" ||
+    exportDerived === "generated-terrain-grid-fallback" ||
     exportDerived === "resolved-area-above-contour" ||
     exportDerived === "top-surface-cap-contour" ||
-    provider === "derived-contours-resolved-area"
+    provider === "derived-contours-resolved-area" ||
+    provider === "derived-contours-native-band"
   );
 }
 
@@ -12529,6 +13235,7 @@ async function buildSiteContext(body, config, reportProgress = null) {
       radius: Math.max(30, Number(options.radius) || 120),
       contourInterval: normalizeContourInterval(options.contourInterval),
       terrainMode: options.terrainMode === "flat" ? "flat" : "contour",
+      terrainPipelineMode: normalizeTerrainPipelineMode(options.terrainPipelineMode) || null,
       previewOnly: isSelectionPreview,
       buildingPlacement: normalizeBuildingPlacementMode(options.buildingPlacement),
       exportFormat: options.exportFormat || "obj",
@@ -18985,6 +19692,15 @@ function buildRawAnchoredContourBandAssembly(
   const anchorLevels = [...entriesByLevel.keys()]
     .map(Number)
     .sort((left, right) => left - right);
+  const nativeAnchorLevels = [
+    ...new Set(
+      (siteContext?.contourLines?.features || [])
+        .filter((feature) => feature?.properties?.generated !== true)
+        .map((feature) => Number(feature?.properties?.elevation))
+        .filter(Number.isFinite)
+        .map((value) => Number(value.toFixed(3)))
+    ),
+  ].sort((left, right) => left - right);
 
   for (const level of [...anchorLevels].sort((left, right) => right - left)) {
     const levelPolygons = entriesByLevel.get(buildContourLevelKey(level)) || [];
@@ -19930,6 +20646,361 @@ function buildGridAreaAboveByLevel(
   return areaResult;
 }
 
+function buildLegacyRawAnchoredContourEntries(
+  siteContext,
+  clipRect,
+  contourCollection = null
+) {
+  const seed = Math.round(
+    Math.abs(Number(siteContext?.location?.lat) * 1000) +
+      Math.abs(Number(siteContext?.location?.lng) * 1000)
+  );
+  const entries = [];
+  const collection = contourCollection || siteContext?.contourLines;
+
+  for (const feature of collection?.features || []) {
+    const elevation = Number(feature?.properties?.elevation);
+
+    if (!Number.isFinite(elevation)) {
+      continue;
+    }
+
+    for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
+      const localPoints = lineString
+        .map((point) => localMetersFromLngLat(point, siteContext.location))
+        .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+
+      if (localPoints.length < 2) {
+        continue;
+      }
+
+      const closedContour =
+        localPoints.length >= 3 &&
+        pointsMatchInMeters(
+          localPoints[0],
+          localPoints[localPoints.length - 1],
+          Math.max(0.02, clipRect.boundarySnapTolerance * 0.08)
+        );
+      const contourPoints = closedContour
+        ? dedupeLocalPolygonPoints(localPoints, 0.001)
+        : mergeContourPolylinePoints(localPoints, 0.001);
+      const candidateMultiPolygons = closedContour
+        ? buildClosedContourSideMultiPolygons(contourPoints, clipRect)
+        : buildOpenContourSideMultiPolygons(contourPoints, clipRect);
+      const higherSideMultiPolygon = selectHigherContourSideMultiPolygon(
+        siteContext,
+        elevation,
+        candidateMultiPolygons,
+        seed
+      );
+
+      if (higherSideMultiPolygon?.length) {
+        entries.push({
+          elevation: Number(elevation.toFixed(3)),
+          properties: {
+            ...(feature?.properties || {}),
+            elevation: Number(elevation.toFixed(3)),
+          },
+          multiPolygon: higherSideMultiPolygon,
+        });
+      }
+    }
+  }
+
+  return entries;
+}
+
+function buildLegacyRawAnchoredContourBandGroups(siteContext) {
+  const terrainGrid = siteContext?.terrainGrid;
+
+  if (
+    !terrainGrid?.elevations?.length ||
+    siteContext?.options?.terrainMode !== "contour" ||
+    !siteContext?.contourLines?.features?.length
+  ) {
+    return [];
+  }
+
+  const clipRect = buildLocalClipRect(siteContext);
+
+  if (!clipRect) {
+    return [];
+  }
+
+  const interval = resolveEffectiveContourBandInterval(siteContext);
+  const sourceContourInterval = resolveSourceContourInterval(siteContext);
+  const minElevation = Number(terrainGrid.minElevation || 0);
+  const maxElevation = Number(terrainGrid.maxElevation || 0);
+  const startLevel = Math.floor(minElevation / interval) * interval;
+  const contourEntries = buildLegacyRawAnchoredContourEntries(siteContext, clipRect);
+
+  if (!contourEntries.length) {
+    return [];
+  }
+
+  const entriesByLevel = new Map();
+
+  for (const entry of contourEntries) {
+    const levelKey = buildContourLevelKey(entry.elevation);
+
+    if (!entriesByLevel.has(levelKey)) {
+      entriesByLevel.set(levelKey, []);
+    }
+
+    entriesByLevel.get(levelKey).push(entry.multiPolygon);
+  }
+
+  for (
+    let level = Number((startLevel + interval).toFixed(3));
+    level < maxElevation - 0.001;
+    level = Number((level + interval).toFixed(3))
+  ) {
+    if (level <= minElevation + 0.001 || level >= maxElevation - 0.001) {
+      continue;
+    }
+
+    if (!entriesByLevel.has(buildContourLevelKey(level))) {
+      return [];
+    }
+  }
+
+  const cumulativeByLevel = new Map();
+  let cumulativeMultiPolygon = [];
+  const anchorLevels = [...entriesByLevel.keys()]
+    .map(Number)
+    .sort((left, right) => left - right);
+  const nativeAnchorLevels = [
+    ...new Set(
+      (siteContext?.contourLines?.features || [])
+        .filter((feature) => feature?.properties?.generated !== true)
+        .map((feature) => Number(feature?.properties?.elevation))
+        .filter(Number.isFinite)
+        .map((value) => Number(value.toFixed(3)))
+    ),
+  ].sort((left, right) => left - right);
+
+  for (const level of [...anchorLevels].sort((left, right) => right - left)) {
+    const levelPolygons = entriesByLevel.get(buildContourLevelKey(level)) || [];
+    cumulativeMultiPolygon = unionLocalMultiPolygons([
+      ...levelPolygons,
+      ...(cumulativeMultiPolygon.length ? [cumulativeMultiPolygon] : []),
+    ]);
+
+    if (cumulativeMultiPolygon.length) {
+      cumulativeByLevel.set(buildContourLevelKey(level), cumulativeMultiPolygon);
+    }
+  }
+
+  const resolveAreaAboveLevel = (level) => {
+    if (level <= minElevation + 0.001) {
+      return clipRect.multiPolygon;
+    }
+
+    if (level >= maxElevation - 0.001) {
+      return [];
+    }
+
+    return cumulativeByLevel.get(buildContourLevelKey(level)) || null;
+  };
+  const bandGroups = [];
+
+  for (
+    let bottomElevation = Number(startLevel.toFixed(3));
+    bottomElevation < maxElevation - 0.001;
+    bottomElevation = Number((bottomElevation + interval).toFixed(3))
+  ) {
+    const topElevation = Number(Math.min(bottomElevation + interval, maxElevation).toFixed(3));
+    const bottomArea = resolveAreaAboveLevel(bottomElevation);
+
+    if (!bottomArea?.length) {
+      continue;
+    }
+
+    const topArea =
+      topElevation >= maxElevation - 0.001 ? [] : resolveAreaAboveLevel(topElevation);
+
+    if (topElevation < maxElevation - 0.001 && topArea === null) {
+      return [];
+    }
+
+    const bandMultiPolygon =
+      topArea?.length
+        ? differenceLocalMultiPolygon(bottomArea, topArea)
+        : bottomArea;
+
+    if (!bandMultiPolygon.length) {
+      continue;
+    }
+
+    const regions = buildContourBandRegionsFromMultiPolygon(bandMultiPolygon);
+
+    if (!regions.length) {
+      continue;
+    }
+
+    bandGroups.push({
+      bottomElevation,
+      topElevation,
+      boundaryLoops: regions.flatMap((region) => [
+        region.outerPoints,
+        ...(region.holePoints || []),
+      ]),
+      regions,
+      multiPolygon: bandMultiPolygon,
+      bounds: computeRegionBounds(regions),
+    });
+  }
+
+  if (bandGroups.length) {
+    Object.assign(bandGroups, {
+      rawAnchoredContourTerrainUsed: true,
+      rawAnchoredContourBandCount: bandGroups.length,
+      rawAnchoredContourEntryCount: contourEntries.length,
+      rawAnchoredNativeContourLevelCount: nativeAnchorLevels.length,
+      rawAnchoredSourceContourInterval: sourceContourInterval,
+      rawAnchoredGridFallbackBandCount: 0,
+    });
+    siteContext.stats = {
+      ...(siteContext?.stats || {}),
+      rawAnchoredContourTerrainUsed: true,
+      rawAnchoredContourBandCount: bandGroups.length,
+      rawAnchoredContourEntryCount: contourEntries.length,
+      rawAnchoredNativeContourLevelCount: nativeAnchorLevels.length,
+      rawAnchoredSourceContourInterval: sourceContourInterval,
+      rawAnchoredGridFallbackBandCount: 0,
+    };
+  }
+
+  return bandGroups;
+}
+
+function buildLegacyContourBandGroups(siteContext) {
+  const rawAnchoredBandGroups = buildLegacyRawAnchoredContourBandGroups(siteContext);
+
+  if (rawAnchoredBandGroups.length) {
+    return rawAnchoredBandGroups;
+  }
+
+  return buildGridContourBandGroups(siteContext);
+}
+
+function buildLegacyCumulativeContourBandGroups(siteContext) {
+  const bandGroups = getCachedContourBandGroups(siteContext);
+
+  if (!bandGroups.length) {
+    return [];
+  }
+
+  const cumulativeDescending = [];
+  let cumulativeMultiPolygon = [];
+
+  for (let index = bandGroups.length - 1; index >= 0; index -= 1) {
+    const group = bandGroups[index];
+    const groupMultiPolygon = buildPolygonClippingMultiPolygonFromRegions(
+      group.regions
+    );
+
+    if (!groupMultiPolygon.length) {
+      continue;
+    }
+
+    let nextMultiPolygon = groupMultiPolygon;
+
+    if (cumulativeMultiPolygon.length) {
+      nextMultiPolygon = unionLocalMultiPolygons([
+        groupMultiPolygon,
+        cumulativeMultiPolygon,
+      ]);
+
+      if (!nextMultiPolygon.length) {
+        nextMultiPolygon = [...groupMultiPolygon, ...cumulativeMultiPolygon];
+      }
+    }
+
+    const regions = stripRegionHoles(
+      buildContourBandRegionsFromMultiPolygon(nextMultiPolygon)
+    );
+
+    if (!regions.length) {
+      cumulativeMultiPolygon = nextMultiPolygon;
+      continue;
+    }
+
+    cumulativeDescending.push({
+      ...group,
+      boundaryLoops: regions.flatMap((region) => [
+        region.outerPoints,
+        ...(region.holePoints || []),
+      ]),
+      regions,
+      multiPolygon: nextMultiPolygon,
+    });
+    cumulativeMultiPolygon = nextMultiPolygon;
+  }
+
+  return cumulativeDescending.reverse();
+}
+
+function buildLegacyRenderableContourBandGroups(siteContext) {
+  const cumulativeGroups = getCachedCumulativeContourBandGroups(siteContext);
+
+  if (!shouldRemoveTerrainBuildingOverlap(siteContext) || !cumulativeGroups.length) {
+    return cumulativeGroups;
+  }
+
+  const buildingCarveProfiles = buildBuildingFootprintCarveProfiles(siteContext);
+
+  if (!buildingCarveProfiles.length) {
+    return cumulativeGroups;
+  }
+
+  const renderableGroups = [];
+
+  for (const group of cumulativeGroups) {
+    const groupMultiPolygon =
+      group.multiPolygon || buildPolygonClippingMultiPolygonFromRegions(group.regions);
+    let carvedMultiPolygon = groupMultiPolygon;
+    const activeBuildingFootprints = buildingCarveProfiles
+      .filter(
+        (profile) =>
+          !Number.isFinite(profile.baseElevation) ||
+          group.topElevation > profile.baseElevation + 1e-9
+      )
+      .map((profile) => profile.polygon);
+
+    if (groupMultiPolygon.length && activeBuildingFootprints.length) {
+      try {
+        carvedMultiPolygon =
+          polygonClipping.difference(groupMultiPolygon, activeBuildingFootprints) || [];
+      } catch (error) {
+        console.warn(
+          `[building-terrain] terrain carve fallback elevation=${group.topElevation} error=${formatErrorForLog(
+            error
+          )}`
+        );
+      }
+    }
+
+    const regions = buildContourBandRegionsFromMultiPolygon(carvedMultiPolygon);
+
+    if (!regions.length) {
+      continue;
+    }
+
+    renderableGroups.push({
+      ...group,
+      boundaryLoops: regions.flatMap((region) => [
+        region.outerPoints,
+        ...(region.holePoints || []),
+      ]),
+      regions,
+      multiPolygon: carvedMultiPolygon,
+    });
+  }
+
+  return renderableGroups;
+}
+
 function buildContourBandGroups(siteContext) {
   // Build cumulative terrain bands from clipped terrain-grid slices so
   // closed contours remain self-contained and only the true clip boundary
@@ -20043,7 +21114,8 @@ function getCachedContourBandGroups(siteContext) {
     return buildContourBandGroups(siteContext);
   }
 
-  const cacheKey = getContourBandCacheKey(siteContext);
+  const terrainPipelineMode = resolveTerrainPipelineMode(siteContext);
+  const cacheKey = `${getContourBandCacheKey(siteContext)}|pipeline:${terrainPipelineMode}`;
   const sharedCachedBandGroups = readSharedDerivedCache(
     sharedContourBandGroupCache,
     cacheKey
@@ -20060,7 +21132,11 @@ function getCachedContourBandGroups(siteContext) {
     return applyContourBandGroupStats(siteContext, entry.get(cacheKey));
   }
 
-  const bandGroups = buildContourBandGroups(siteContext).sort(
+  const bandGroups = (
+    terrainPipelineMode === "legacy"
+      ? buildLegacyContourBandGroups(siteContext)
+      : buildContourBandGroups(siteContext)
+  ).sort(
     (left, right) =>
       left.bottomElevation - right.bottomElevation ||
       left.topElevation - right.topElevation
@@ -20238,7 +21314,8 @@ function getCachedCumulativeContourBandGroups(siteContext) {
     return buildCumulativeContourBandGroups(siteContext);
   }
 
-  const cacheKey = getContourBandCacheKey(siteContext);
+  const terrainPipelineMode = resolveTerrainPipelineMode(siteContext);
+  const cacheKey = `${getContourBandCacheKey(siteContext)}|pipeline:${terrainPipelineMode}`;
   const sharedCachedBandGroups = readSharedDerivedCache(
     sharedContourCumulativeBandGroupCache,
     cacheKey
@@ -20255,7 +21332,11 @@ function getCachedCumulativeContourBandGroups(siteContext) {
     return applyContourBandGroupStats(siteContext, entry.get(cacheKey));
   }
 
-  const bandGroups = buildCumulativeContourBandGroups(siteContext).sort(
+  const bandGroups = (
+    terrainPipelineMode === "legacy"
+      ? buildLegacyCumulativeContourBandGroups(siteContext)
+      : buildCumulativeContourBandGroups(siteContext)
+  ).sort(
     (left, right) =>
       left.bottomElevation - right.bottomElevation ||
       left.topElevation - right.topElevation
@@ -20501,7 +21582,8 @@ function getCachedRenderableContourBandGroups(siteContext) {
     return buildRenderableContourBandGroups(siteContext);
   }
 
-  const cacheKey = `${getContourBandCacheKey(siteContext)}|${
+  const terrainPipelineMode = resolveTerrainPipelineMode(siteContext);
+  const cacheKey = `${getContourBandCacheKey(siteContext)}|pipeline:${terrainPipelineMode}|${
     normalizeBuildingPlacementMode(siteContext?.options?.buildingPlacement)
   }|${siteContext.options?.includeBuildings !== false ? "with-bldg" : "no-bldg"}`;
   const sharedCachedBandGroups = readSharedDerivedCache(
@@ -20520,7 +21602,10 @@ function getCachedRenderableContourBandGroups(siteContext) {
     return applyContourBandGroupStats(siteContext, entry.get(cacheKey));
   }
 
-  const bandGroups = buildRenderableContourBandGroups(siteContext);
+  const bandGroups =
+    terrainPipelineMode === "legacy"
+      ? buildLegacyRenderableContourBandGroups(siteContext)
+      : buildRenderableContourBandGroups(siteContext);
 
   if (entry instanceof Map) {
     entry.set(cacheKey, bandGroups);
@@ -22690,8 +23775,12 @@ function buildObjFromSiteContext(siteContext, reportProgress = null) {
     const contourCollection = getExportContourFeatureCollection(siteContext);
 
     for (const feature of contourCollection.features || []) {
+      const objectGroupName =
+        feature?.properties?.contourObjectGroup ||
+        resolveContourFeatureExportLayer(siteContext, feature, "object");
+
       for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
-        lines.push(`o CONTOUR_${contourCounter}`);
+        lines.push(`o ${objectGroupName}_${contourCounter}`);
         const contourIndices = [];
 
         for (const point of lineString) {
@@ -23365,13 +24454,40 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
   }
 
   if (siteContext.options?.includeContours !== false) {
-    const contourPolylines = [];
-    const parcelContourPolylines = new Map();
+    const contourPolylinesByLayer = new Map();
+    const parcelContourPolylinesByLayer = new Map();
     const contourCollection = getExportContourFeatureCollection(siteContext);
+    const appendContourPolyline = (layerName, targetGroupIndex, polyline) => {
+      if (!polyline) {
+        return;
+      }
+
+      if (Number.isInteger(targetGroupIndex)) {
+        if (!parcelContourPolylinesByLayer.has(layerName)) {
+          parcelContourPolylinesByLayer.set(layerName, new Map());
+        }
+
+        const groupedPolylines = parcelContourPolylinesByLayer.get(layerName);
+
+        if (!groupedPolylines.has(targetGroupIndex)) {
+          groupedPolylines.set(targetGroupIndex, []);
+        }
+
+        groupedPolylines.get(targetGroupIndex).push(polyline);
+        return;
+      }
+
+      if (!contourPolylinesByLayer.has(layerName)) {
+        contourPolylinesByLayer.set(layerName, []);
+      }
+
+      contourPolylinesByLayer.get(layerName).push(polyline);
+    };
 
     for (const feature of contourCollection?.features || []) {
       const elevation = Number(feature?.properties?.elevation || 0);
       const closedLoop = feature?.properties?.closedLoop === true;
+      const layerName = resolveContourFeatureExportLayer(siteContext, feature);
 
       for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
         const localPoints = lineString.map((point) =>
@@ -23391,40 +24507,41 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
           const targetGroupIndex = Number(
             targetParcelFeature?.properties?.groupIndex || Number.NaN
           );
-
-          if (Number.isInteger(targetGroupIndex)) {
-            if (!parcelContourPolylines.has(targetGroupIndex)) {
-              parcelContourPolylines.set(targetGroupIndex, []);
-            }
-            parcelContourPolylines.get(targetGroupIndex).push(polyline);
-          } else {
-            contourPolylines.push(polyline);
-          }
+          appendContourPolyline(layerName, targetGroupIndex, polyline);
         }
       }
     }
 
-    if (contourPolylines.length) {
+    for (const [layerName, contourPolylines] of [...contourPolylinesByLayer.entries()].sort(
+      (left, right) => left[0].localeCompare(right[0])
+    )) {
       pushGroup({
-        layer: "contours",
-        name: "CONTOURS",
+        layer: layerName,
+        name: normalizeContourLayerNameForExport(layerName, "object"),
         faces: [],
         polylines: contourPolylines,
         solids: [],
       });
     }
 
-    for (const [groupIndex, polylines] of [...parcelContourPolylines.entries()].sort(
-      (left, right) => left[0] - right[0]
+    for (const [layerName, groupedPolylines] of [...parcelContourPolylinesByLayer.entries()].sort(
+      (left, right) => left[0].localeCompare(right[0])
     )) {
-      pushGroup({
-        layer: "contours",
-        name: `CONTOURS_PARCEL_${groupIndex}`,
-        container: resolveSketchUpGroupContainer(parcelContainerMap, groupIndex),
-        faces: [],
-        polylines,
-        solids: [],
-      });
+      for (const [groupIndex, polylines] of [...groupedPolylines.entries()].sort(
+        (left, right) => left[0] - right[0]
+      )) {
+        pushGroup({
+          layer: layerName,
+          name: `${normalizeContourLayerNameForExport(
+            layerName,
+            "object"
+          )}_PARCEL_${groupIndex}`,
+          container: resolveSketchUpGroupContainer(parcelContainerMap, groupIndex),
+          faces: [],
+          polylines,
+          solids: [],
+        });
+      }
     }
   }
 
@@ -25797,11 +26914,17 @@ function buildDxfFromSiteContext(siteContext, reportProgress = null) {
     const contourCollection = getExportContourFeatureCollection(siteContext);
 
     for (const feature of contourCollection?.features || []) {
+      const contourLayerName = resolveContourFeatureExportLayer(
+        siteContext,
+        feature,
+        "dxf"
+      );
+
       for (const lineString of getLineStringsFromGeometry(feature.geometry)) {
         appendDxfPathAsLineEntities(
           state,
           entityLines,
-          "CONTOURS",
+          contourLayerName,
           lineString.map((point) => localMetersFromLngLat(point, center)),
           {
             closed: feature?.properties?.closedLoop === true,
@@ -26984,6 +28107,8 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
     ...(requestedOptions || {}),
     exportFormat: format,
   };
+  exportSiteContext.options.terrainPipelineMode =
+    normalizeTerrainPipelineMode(exportSiteContext.options?.terrainPipelineMode) || null;
   exportSiteContext.stats = {
     ...(exportSiteContext?.stats || {}),
   };
@@ -27026,13 +28151,14 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
   const currentDisplayInterval = inferSourceContourIntervalFromContourLines(
     exportSiteContext.contourLines
   );
-  const normalizedExportFormat = String(format || "").trim().toLowerCase();
-  const isContourModelExport =
-    normalizedExportFormat === "obj" ||
-    normalizedExportFormat === "skp" ||
-    normalizedExportFormat === "skp-payload" ||
-    normalizedExportFormat === "3dm" ||
-    normalizedExportFormat === "dxf";
+  const normalizedExportFormat = normalizeExportFormat(format);
+  const isContourModelExport = isContourModelExportFormat(normalizedExportFormat);
+  const terrainPipelineMode = resolveTerrainPipelineMode(
+    exportSiteContext,
+    normalizedExportFormat
+  );
+  const useLegacyTerrainPipeline = terrainPipelineMode === "legacy";
+  exportSiteContext.stats.terrainPipelineMode = terrainPipelineMode;
   const preserveNativeContourDisplayLines =
     shouldPreserveNativeContourDisplayLines(format) &&
     Boolean(exportSiteContext.contourLines?.features?.length);
@@ -27050,7 +28176,9 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
     exportSiteContext.options?.includeContours !== false &&
     exportSiteContext.terrainGrid?.elevations?.length
   ) {
-    const targetContourDisplayInterval = effectiveContourBandInterval;
+    const targetContourDisplayInterval = useLegacyTerrainPipeline
+      ? displayContourInterval
+      : effectiveContourBandInterval;
     const shouldAugmentNativeContourDisplayLines =
       preserveNativeContourDisplayLines &&
       Number.isFinite(sourceContourInterval) &&
@@ -27064,10 +28192,15 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
       );
 
     if (shouldAugmentNativeContourDisplayLines) {
-      exportSiteContext.contourLines = buildAugmentedContourLinesForExport(
-        exportSiteContext,
-        targetContourDisplayInterval
-      );
+      exportSiteContext.contourLines = useLegacyTerrainPipeline
+        ? buildLegacyAugmentedContourLinesForExport(
+            exportSiteContext,
+            targetContourDisplayInterval
+          )
+        : buildAugmentedContourLinesForExport(
+            exportSiteContext,
+            targetContourDisplayInterval
+          );
       exportSiteContext.stats.effectiveContourDisplayInterval =
         targetContourDisplayInterval;
     } else if (shouldRegenerateContourDisplayLines) {
@@ -27127,8 +28260,9 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
     exportSiteContext.options?.includeContours !== false &&
     exportSiteContext.contourLines?.features?.length
   ) {
-    exportSiteContext.exportContourLines =
-      buildClosedContourExportCollection(exportSiteContext);
+    exportSiteContext.exportContourLines = useLegacyTerrainPipeline
+      ? buildLegacyClosedContourExportCollection(exportSiteContext)
+      : buildClosedContourExportCollection(exportSiteContext);
     exportSiteContext.stats.exportContourFeatureCount = Number(
       exportSiteContext?.exportContourLines?.features?.length || 0
     );
@@ -27171,7 +28305,7 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
   }
 
   console.log(
-    `[export-terrain] format=${format} requested=${requestedContourInterval} source=${sourceContourInterval} effective=${effectiveContourBandInterval} display=${exportSiteContext.stats.effectiveContourDisplayInterval} preserveNativeContours=${preserveNativeContourDisplayLines} terrainStep=${Number(exportSiteContext?.terrainGrid?.step || 0).toFixed(3)} refined=${exportSiteContext?.stats?.nativeContourTerrainGridRefined === true}`
+    `[export-terrain] format=${format} pipeline=${terrainPipelineMode} requested=${requestedContourInterval} source=${sourceContourInterval} effective=${effectiveContourBandInterval} display=${exportSiteContext.stats.effectiveContourDisplayInterval} preserveNativeContours=${preserveNativeContourDisplayLines} terrainStep=${Number(exportSiteContext?.terrainGrid?.step || 0).toFixed(3)} refined=${exportSiteContext?.stats?.nativeContourTerrainGridRefined === true}`
   );
 
   return exportSiteContext;
@@ -27240,11 +28374,15 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
     g: 122,
     b: 99,
   });
-  const contourLayer = ensureRhinoLayer(doc, layerIndexCache, "contours", {
-    r: 88,
-    g: 128,
-    b: 168,
-  });
+  const ensureContourRhinoLayer = (feature) =>
+    ensureRhinoLayer(
+      doc,
+      layerIndexCache,
+      resolveContourFeatureExportLayer(siteContext, feature),
+      feature?.properties?.generated === true
+        ? { r: 88, g: 128, b: 168 }
+        : { r: 82, g: 116, b: 85 }
+    );
   progress(18, "3DM 지형 레이어를 구성하는 중입니다.");
 
   if (siteContext.options?.terrainMode === "flat") {
@@ -27334,8 +28472,12 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
           createRhinoContourDisplayCurve(rhino, points),
           createRhinoObjectAttributes(
             rhino,
-            contourLayer,
-            `CONTOUR_${index + 1}_${lineIndex + 1}`,
+            ensureContourRhinoLayer(feature),
+            `${
+              feature?.properties?.generated === true
+                ? "CONTOUR_GENERATED"
+                : "CONTOUR_NATIVE"
+            }_${index + 1}_${lineIndex + 1}`,
             null,
             (() => {
               const targetParcelFeature = resolveTargetParcelGroupForLineString(

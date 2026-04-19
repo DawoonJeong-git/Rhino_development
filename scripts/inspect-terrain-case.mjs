@@ -805,8 +805,32 @@ async function loadSiteContext(args) {
 }
 
 function summarizeComparison(sourceContours, threeDm, skpPayloadSummary) {
-  const threeDmContourLayer = threeDm.layers?.contours || null;
-  const skpContourLayer = skpPayloadSummary.layers?.contours || null;
+  const summarizeLayersByPrefix = (layers, prefix) => {
+    const normalizedPrefix = String(prefix || "").trim().toLowerCase();
+    const matchedLayers = Object.entries(layers || {}).filter(([layerName]) =>
+      String(layerName || "")
+        .trim()
+        .toLowerCase()
+        .startsWith(normalizedPrefix)
+    );
+
+    if (!matchedLayers.length) {
+      return null;
+    }
+
+    return matchedLayers.reduce((summary, [, layerMetrics]) => {
+      for (const [metricName, metricValue] of Object.entries(layerMetrics || {})) {
+        if (typeof metricValue === "number") {
+          summary[metricName] = Number(summary[metricName] || 0) + metricValue;
+        }
+      }
+
+      return summary;
+    }, {});
+  };
+  const threeDmContourLayer = summarizeLayersByPrefix(threeDm.layers, "contours") || null;
+  const skpContourLayer =
+    summarizeLayersByPrefix(skpPayloadSummary.layers, "contours") || null;
   const skpTerrainLayer = skpPayloadSummary.layers?.terrain || null;
   const skpRoadLayer = skpPayloadSummary.layers?.roads || null;
 

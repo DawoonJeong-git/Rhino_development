@@ -3574,6 +3574,11 @@ function normalizeExportFormat(value) {
   return "obj";
 }
 
+function normalizeTerrainPipelineMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "legacy" ? "legacy" : "current";
+}
+
 function describeTerrainMode(value) {
   return value === "mesh" ? "완만한 일체형" : "등고층 매스";
 }
@@ -3610,6 +3615,9 @@ function collectModelOptions() {
     radius: Number(formData.get("radius")),
     contourInterval,
     terrainMode: "contour",
+    terrainPipelineMode: normalizeTerrainPipelineMode(
+      formData.get("terrainPipelineMode")
+    ),
     buildingPlacement: normalizeBuildingPlacementSelection(
       formData.get("buildingPlacement")
     ),
@@ -3644,6 +3652,9 @@ function buildModelOptionsSignature(
       )
         ? "remove-overlap"
         : "default";
+    signature.terrainPipelineMode = normalizeTerrainPipelineMode(
+      options.terrainPipelineMode
+    );
     signature.splitParcelBoundary = options.splitParcelBoundary === true;
     signature.exportFormat = normalizeExportFormat(options.exportFormat);
   }
@@ -4956,6 +4967,23 @@ function ensureModelFormOptionLayout() {
     );
   }
 
+  let terrainPipelineLabel = modelForm.querySelector(
+    '[data-model-option="terrainPipelineMode"]'
+  );
+
+  if (!terrainPipelineLabel) {
+    terrainPipelineLabel = createModelOptionLabel(
+      "terrainPipelineMode",
+      "대지모형 엔진",
+      [
+        { value: "current", label: "최신" },
+        { value: "legacy", label: "레거시 비교" },
+      ],
+      "current",
+      "현재 엔진과 예전 3D 생성 로직을 비교할 때만 레거시를 선택합니다."
+    );
+  }
+
   contourLabel?.classList.add("contour-interval-field");
   radiusLabel?.classList.add("range-field");
   previewSiteContextButton?.classList.remove("secondary-button");
@@ -5024,7 +5052,7 @@ function ensureModelFormOptionLayout() {
       outputGrid.append(splitParcelLabel);
     }
 
-    outputGrid.append(buildingPlacementLabel, exportLabel);
+    outputGrid.append(buildingPlacementLabel, terrainPipelineLabel, exportLabel);
   }
 
   let downloadButtonWrap = modelForm.querySelector(".download-button-wrap");
