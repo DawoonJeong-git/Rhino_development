@@ -742,9 +742,9 @@ function collectFormatFailures(testCase, result) {
     failures.push(`${testCase.name}/3dm: no curve objects were found in the exported file`);
   }
 
-  if (result.formats["3dm"].curveMaxAbsZ <= 0.001) {
+  if (result.formats["3dm"].curveMaxAbsZ > 0.001) {
     failures.push(
-      `${testCase.name}/3dm: curve max |z| ${result.formats["3dm"].curveMaxAbsZ} should preserve exported contour elevations`
+      `${testCase.name}/3dm: curve max |z| ${result.formats["3dm"].curveMaxAbsZ} should stay at 0`
     );
   }
 
@@ -2499,10 +2499,16 @@ async function runBaselineVerification() {
       1,
       "Fragmented native contour segments at the same elevation should merge into one export curve."
     );
+    assert.ok(
+      normalized12Contours[0]?.length >= 4,
+      "Merged contour export should now resolve into one closed loop after boundary closure."
+    );
     assert.equal(
-      normalized12Contours[0]?.length,
-      3,
-      "Merged contour export should keep the original shape while removing duplicate breakpoints."
+      fragmented3dmSiteContext?.contourLines?.features?.find(
+        (feature) => Number(feature?.properties?.elevation) === 12
+      )?.properties?.closedLoop,
+      true,
+      "Prepared native contour curves should be closed before the 1m generation stage begins."
     );
     const closedExportContours = refined3dmSiteContext?.exportContourLines?.features || [];
     const nativeExportContours = closedExportContours.filter(
@@ -3361,16 +3367,10 @@ async function runBaselineVerification() {
       "DXF export should keep native contour levels and add interpolated levels between them."
     );
     assert.ok(
-      syntheticContourSiteContext.contourLines.features.every((sourceFeature) =>
-        (refinedDxfSiteContext?.contourLines?.features || []).some(
-          (refinedFeature) =>
-            Number(refinedFeature?.properties?.elevation) ===
-              Number(sourceFeature?.properties?.elevation) &&
-            JSON.stringify(refinedFeature?.geometry || null) ===
-              JSON.stringify(sourceFeature?.geometry || null)
-        )
-      ),
-      "DXF export should preserve the native official contour geometries while adding only the missing intermediate contours."
+      (refinedDxfSiteContext?.contourLines?.features || [])
+        .filter((feature) => feature?.properties?.generated !== true)
+        .every((feature) => feature?.properties?.closedLoop === true),
+      "DXF export should close native contour curves first, then add only the missing intermediate contours."
     );
     const exportMutationSourceSiteContext = cloneJsonValue({
       ...syntheticContourSiteContext,
