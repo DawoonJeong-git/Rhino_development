@@ -10528,6 +10528,7 @@ function buildGeneratedContourBandRecordsFromNativeAreas(
     { allowAmbiguousFallback: true }
   );
   const nativeLoopRegionsByLevel = new Map();
+  const nativeLoopSegmentsByLevel = new Map();
   const nativeContourLevels = [
     ...new Set(
       nativeLoopEntries
@@ -10557,6 +10558,9 @@ function buildGeneratedContourBandRecordsFromNativeAreas(
       holePoints: [],
     });
   }
+  for (const [levelKey, regions] of nativeLoopRegionsByLevel.entries()) {
+    nativeLoopSegmentsByLevel.set(levelKey, buildLocalBoundarySegmentsFromRegions(regions));
+  }
   const nativeAssembly = buildRawAnchoredContourBandAssembly(nativeIntervalSiteContext);
 
   if (
@@ -10584,32 +10588,19 @@ function buildGeneratedContourBandRecordsFromNativeAreas(
 
     const levelKey = buildContourLevelKey(bottomElevation);
     const topLevelKey = buildContourLevelKey(topElevation);
-    const lowerArea = nativeAssembly.resolvedAreaAboveByLevel.get(levelKey) || [];
-    const upperArea =
-      nativeAssembly.resolvedAreaAboveByLevel.get(topLevelKey) || [];
     const bandGroup = bandGroupByBottom.get(levelKey) || null;
-    const exactUpperRegions = nativeLoopRegionsByLevel.get(topLevelKey) || null;
+    const exactLowerRegions = nativeLoopRegionsByLevel.get(levelKey) || [];
+    const exactUpperRegions = nativeLoopRegionsByLevel.get(topLevelKey) || [];
+    const lowerSegments = nativeLoopSegmentsByLevel.get(levelKey) || [];
+    const upperSegments = nativeLoopSegmentsByLevel.get(topLevelKey) || [];
 
     if (
       !bandGroup?.regions?.length ||
-      !lowerArea.length ||
-      !(upperArea.length || exactUpperRegions?.length)
+      !exactLowerRegions.length ||
+      !exactUpperRegions.length ||
+      !lowerSegments.length ||
+      !upperSegments.length
     ) {
-      continue;
-    }
-
-    const lowerRegions = buildContourBandRegionsFromMultiPolygon(lowerArea);
-    const upperRegions = buildContourBandRegionsFromMultiPolygon(upperArea);
-    const lowerSegments = buildLocalBoundarySegmentsFromRegions(lowerRegions);
-    const upperSegments = buildLocalBoundarySegmentsFromRegions(
-      upperRegions.length
-        ? upperRegions
-        : exactUpperRegions?.length
-          ? exactUpperRegions
-          : upperRegions
-    );
-
-    if (!lowerSegments.length || !upperSegments.length) {
       continue;
     }
 
@@ -11321,7 +11312,7 @@ function shouldRemoveTerrainBuildingOverlap(siteContextOrOptions) {
 }
 
 function buildGeneratedContourLinesFromResolvedAreas(siteContext, contourInterval) {
-  return buildGeneratedClosedContourLinesFromNativeBands(
+  return buildGeneratedContourLinesFromNativeAnchorBands(
     siteContext,
     contourInterval
   );
@@ -12471,12 +12462,14 @@ function shouldReuseGeneratedExportContourFeature(feature) {
     .toLowerCase();
 
   return (
+    exportDerived === "native-band-interpolation" ||
     exportDerived === "native-band-area-above-contour" ||
     exportDerived === "generated-terrain-aligned" ||
     exportDerived === "generated-terrain-grid-fallback" ||
     exportDerived === "resolved-area-above-contour" ||
     exportDerived === "top-surface-cap-contour" ||
-    provider === "derived-contours-resolved-area"
+    provider === "derived-contours-resolved-area" ||
+    provider === "derived-contours-native-band"
   );
 }
 
