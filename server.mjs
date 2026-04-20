@@ -19679,6 +19679,52 @@ function selectHigherContourSideMultiPolygon(
   ).selectedMultiPolygon;
 }
 
+function selectLegacyHigherContourSideMultiPolygon(
+  siteContext,
+  elevation,
+  candidateMultiPolygons,
+  seed
+) {
+  const comparisonTolerance = Math.max(
+    0.02,
+    resolveEffectiveContourBandInterval(siteContext) * 0.12
+  );
+  const scoredCandidates = (candidateMultiPolygons || [])
+    .map((multiPolygon) => ({
+      multiPolygon,
+      sampleElevation: sampleLocalMultiPolygonElevation(siteContext, multiPolygon, seed),
+    }))
+    .filter(
+      (candidate) =>
+        candidate.multiPolygon?.length && Number.isFinite(candidate.sampleElevation)
+    )
+    .sort((left, right) => right.sampleElevation - left.sampleElevation);
+
+  if (!scoredCandidates.length) {
+    return null;
+  }
+
+  const definitelyHigher = scoredCandidates.filter(
+    (candidate) => candidate.sampleElevation > elevation + comparisonTolerance
+  );
+
+  if (definitelyHigher.length) {
+    return definitelyHigher[0].multiPolygon;
+  }
+
+  if (
+    scoredCandidates.length > 1 &&
+    Math.abs(
+      Number(scoredCandidates[0].sampleElevation || 0) -
+        Number(scoredCandidates[1].sampleElevation || 0)
+    ) <= comparisonTolerance * 0.5
+  ) {
+    return null;
+  }
+
+  return scoredCandidates[0].multiPolygon;
+}
+
 function resolveHigherContourSideCandidate(
   siteContext,
   elevation,
@@ -21638,7 +21684,7 @@ function buildLegacyRawAnchoredContourEntries(
       const candidateMultiPolygons = closedContour
         ? buildClosedContourSideMultiPolygons(contourPoints, clipRect)
         : buildOpenContourSideMultiPolygons(contourPoints, clipRect);
-      const higherSideMultiPolygon = selectHigherContourSideMultiPolygon(
+      const higherSideMultiPolygon = selectLegacyHigherContourSideMultiPolygon(
         siteContext,
         elevation,
         candidateMultiPolygons,
@@ -29186,10 +29232,12 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
   ) {
     const contourFeatureCountBeforeNormalize =
       Number(exportSiteContext.contourLines.features.length || 0);
-    exportSiteContext.contourLines = normalizeContourFeatureCollection(
-      exportSiteContext,
-      exportSiteContext.contourLines
-    );
+    if (!useLegacyTerrainPipeline) {
+      exportSiteContext.contourLines = normalizeContourFeatureCollection(
+        exportSiteContext,
+        exportSiteContext.contourLines
+      );
+    }
     exportSiteContext.stats.contourFeatureCountBeforeNormalize =
       contourFeatureCountBeforeNormalize;
     exportSiteContext.stats.contourFeatureCountAfterNormalize = Number(
