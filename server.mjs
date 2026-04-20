@@ -1029,6 +1029,8 @@ function maybeRefineNativeContourTerrainGrid(siteContext) {
     return siteContext;
   }
 
+  const useLegacyTerrainPipeline =
+    resolveTerrainPipelineMode(siteContext) === "legacy";
   const currentStep = Number(siteContext?.terrainGrid?.step || 0);
   const targetStep = resolveNativeContourTerrainRefineStep(siteContext);
 
@@ -1046,14 +1048,19 @@ function maybeRefineNativeContourTerrainGrid(siteContext) {
       siteContext.clipBoundary,
       siteContext.contourLines,
       resolveSourceContourInterval(siteContext),
-      {
-        sampleStep: targetStep,
-        referenceTerrainGrid: siteContext.terrainGrid,
-      }
+      useLegacyTerrainPipeline
+        ? {
+            sampleStep: targetStep,
+          }
+        : {
+            sampleStep: targetStep,
+            referenceTerrainGrid: siteContext.terrainGrid,
+          }
     );
 
     if (refinedGrid?.elevations?.length) {
       if (
+        !useLegacyTerrainPipeline &&
         !siteContext?.nativeContourAnchorGrid?.elevations?.length &&
         siteContext?.terrainGrid?.elevations?.length
       ) {
@@ -1061,22 +1068,33 @@ function maybeRefineNativeContourTerrainGrid(siteContext) {
       }
 
       siteContext.terrainGrid = refinedGrid;
-      siteContext.stats = {
-        ...(siteContext?.stats || {}),
-        nativeContourAnchorGridStep:
-          Number(siteContext?.nativeContourAnchorGrid?.step) > 0
-            ? Number(Number(siteContext.nativeContourAnchorGrid.step).toFixed(3))
-            : Number.isFinite(currentStep)
+      siteContext.stats = useLegacyTerrainPipeline
+        ? {
+            ...(siteContext?.stats || {}),
+            nativeContourTerrainGridRefined: true,
+            nativeContourTerrainGridSourceStep: Number.isFinite(currentStep)
               ? Number(currentStep.toFixed(3))
               : null,
-        nativeContourTerrainGridRefined: true,
-        nativeContourTerrainGridSourceStep: Number.isFinite(currentStep)
-          ? Number(currentStep.toFixed(3))
-          : null,
-        nativeContourTerrainGridStep: Number(
-          Number(refinedGrid.step || targetStep).toFixed(3)
-        ),
-      };
+            nativeContourTerrainGridStep: Number(
+              Number(refinedGrid.step || targetStep).toFixed(3)
+            ),
+          }
+        : {
+            ...(siteContext?.stats || {}),
+            nativeContourAnchorGridStep:
+              Number(siteContext?.nativeContourAnchorGrid?.step) > 0
+                ? Number(Number(siteContext.nativeContourAnchorGrid.step).toFixed(3))
+                : Number.isFinite(currentStep)
+                  ? Number(currentStep.toFixed(3))
+                  : null,
+            nativeContourTerrainGridRefined: true,
+            nativeContourTerrainGridSourceStep: Number.isFinite(currentStep)
+              ? Number(currentStep.toFixed(3))
+              : null,
+            nativeContourTerrainGridStep: Number(
+              Number(refinedGrid.step || targetStep).toFixed(3)
+            ),
+          };
 
       if (isSketchUpExportFormat(siteContext)) {
         siteContext.stats.skpTerrainGridRefined = true;
@@ -12427,6 +12445,10 @@ function buildClosedContourExportCollection(siteContext) {
 }
 
 function getExportContourFeatureCollection(siteContext) {
+  if (resolveTerrainPipelineMode(siteContext) === "legacy") {
+    return siteContext?.contourLines || featureCollection([]);
+  }
+
   if (siteContext?.exportContourLines?.features?.length) {
     return siteContext.exportContourLines;
   }
@@ -21804,6 +21826,12 @@ function buildLegacyRawAnchoredContourBandGroups(siteContext) {
 }
 
 function buildLegacyContourBandGroups(siteContext) {
+  const rawAnchoredBandGroups = buildLegacyRawAnchoredContourBandGroups(siteContext);
+
+  if (rawAnchoredBandGroups.length) {
+    return rawAnchoredBandGroups;
+  }
+
   return buildGridContourBandGroups(siteContext);
 }
 
@@ -29188,12 +29216,19 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
     exportSiteContext.options?.includeContours !== false &&
     exportSiteContext.contourLines?.features?.length
   ) {
-    exportSiteContext.exportContourLines = useLegacyTerrainPipeline
-      ? buildLegacyClosedContourExportCollection(exportSiteContext)
-      : buildClosedContourExportCollection(exportSiteContext);
-    exportSiteContext.stats.exportContourFeatureCount = Number(
-      exportSiteContext?.exportContourLines?.features?.length || 0
-    );
+    if (useLegacyTerrainPipeline) {
+      exportSiteContext.exportContourLines = null;
+      exportSiteContext.stats.exportContourFeatureCount = Number(
+        exportSiteContext?.contourLines?.features?.length || 0
+      );
+    } else {
+      exportSiteContext.exportContourLines = buildClosedContourExportCollection(
+        exportSiteContext
+      );
+      exportSiteContext.stats.exportContourFeatureCount = Number(
+        exportSiteContext?.exportContourLines?.features?.length || 0
+      );
+    }
   }
 
   exportSiteContext.stats.buildingPlacementDebug = buildBuildingPlacementDiagnostics(

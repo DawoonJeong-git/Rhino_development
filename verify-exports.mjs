@@ -2517,7 +2517,11 @@ async function runBaselineVerification() {
         "Prepared native contour curves should be closed before the 1m generation stage begins."
       );
     }
-    const closedExportContours = refined3dmSiteContext?.exportContourLines?.features || [];
+    const legacyRefinedPipeline =
+      refined3dmSiteContext?.stats?.terrainPipelineMode === "legacy";
+    const closedExportContours = legacyRefinedPipeline
+      ? refined3dmSiteContext?.contourLines?.features || []
+      : refined3dmSiteContext?.exportContourLines?.features || [];
     const nativeExportContours = closedExportContours.filter(
       (feature) => feature?.properties?.generated !== true
     );
@@ -2526,18 +2530,27 @@ async function runBaselineVerification() {
     );
     assert.ok(
       closedExportContours.length > 0,
-      "3DM contour export should produce closed export contours when contour terrain bands are available."
+      legacyRefinedPipeline
+        ? "Legacy 3DM contour export should keep using the prepared contour collection."
+        : "3DM contour export should produce closed export contours when contour terrain bands are available."
     );
-    assert.ok(
-      nativeExportContours.every(
-        (feature) =>
-          feature?.properties?.closedLoop === true &&
-          String(feature?.properties?.contourExportLayer || "")
-            .trim()
-            .startsWith("contours-native-")
-      ),
-      "Native export contours should stay closed and remain on a dedicated native-contour layer so the source 5m rows can be verified directly."
-    );
+    if (legacyRefinedPipeline) {
+      assert.ok(
+        nativeExportContours.length > 0,
+        "Legacy contour export should still include native source contours."
+      );
+    } else {
+      assert.ok(
+        nativeExportContours.every(
+          (feature) =>
+            feature?.properties?.closedLoop === true &&
+            String(feature?.properties?.contourExportLayer || "")
+              .trim()
+              .startsWith("contours-native-")
+        ),
+        "Native export contours should stay closed and remain on a dedicated native-contour layer so the source 5m rows can be verified directly."
+      );
+    }
     assert.ok(
       generatedExportContours.length > 0,
       "3DM contour export should still include generated intermediate contours for finer requests."
