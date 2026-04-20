@@ -11296,7 +11296,7 @@ function resolveTerrainPipelineMode(siteContextOrOptions, format = null) {
     return requestedMode;
   }
 
-  return "current";
+  return "legacy";
 }
 
 function shouldUseLegacyTerrainPipeline(siteContextOrOptions, format = null) {
@@ -11434,11 +11434,6 @@ function buildAugmentedContourLinesForExport(siteContext, contourInterval) {
 
 function buildLegacyAugmentedContourLinesForExport(siteContext, contourInterval) {
   const nativeContourLines = siteContext?.contourLines || featureCollection([]);
-  const sourceContourInterval = resolveSourceContourInterval(siteContext);
-  const shouldPreferNativeContourInterpolation = Boolean(
-    nativeContourLines?.features?.length &&
-      sourceContourInterval > contourInterval + 1e-9
-  );
 
   if (
     !siteContext?.terrainGrid?.elevations?.length ||
@@ -11448,24 +11443,14 @@ function buildLegacyAugmentedContourLinesForExport(siteContext, contourInterval)
     return nativeContourLines;
   }
 
-  let generatedContours = buildGeneratedContourLinesFromResolvedAreas(
-    siteContext,
-    contourInterval
+  const generatedContours = createContourLinesFromTerrainGrid(
+    siteContext.location,
+    siteContext.terrainGrid,
+    {
+      ...(siteContext?.options || {}),
+      contourInterval,
+    }
   );
-
-  if (
-    !(generatedContours?.features?.length > 0) &&
-    !shouldPreferNativeContourInterpolation
-  ) {
-    generatedContours = createContourLinesFromTerrainGrid(
-      siteContext.location,
-      siteContext.terrainGrid,
-      {
-        ...(siteContext?.options || {}),
-        contourInterval,
-      }
-    );
-  }
   const nativeElevationKeys = buildContourElevationKeySet(nativeContourLines);
   const generatedFeatures = (generatedContours?.features || []).filter((feature) => {
     const elevation = Number(feature?.properties?.elevation);
@@ -21819,12 +21804,6 @@ function buildLegacyRawAnchoredContourBandGroups(siteContext) {
 }
 
 function buildLegacyContourBandGroups(siteContext) {
-  const rawAnchoredBandGroups = buildLegacyRawAnchoredContourBandGroups(siteContext);
-
-  if (rawAnchoredBandGroups.length) {
-    return rawAnchoredBandGroups;
-  }
-
   return buildGridContourBandGroups(siteContext);
 }
 

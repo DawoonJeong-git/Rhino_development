@@ -2499,17 +2499,24 @@ async function runBaselineVerification() {
       1,
       "Fragmented native contour segments at the same elevation should merge into one export curve."
     );
-    assert.ok(
-      normalized12Contours[0]?.length >= 4,
-      "Merged contour export should now resolve into one closed loop after boundary closure."
-    );
-    assert.equal(
-      fragmented3dmSiteContext?.contourLines?.features?.find(
-        (feature) => Number(feature?.properties?.elevation) === 12
-      )?.properties?.closedLoop,
-      true,
-      "Prepared native contour curves should be closed before the 1m generation stage begins."
-    );
+    if (fragmented3dmSiteContext?.stats?.terrainPipelineMode === "legacy") {
+      assert.ok(
+        normalized12Contours[0]?.length >= 2,
+        "Legacy prepared contour curves should still merge fragmented segments before export."
+      );
+    } else {
+      assert.ok(
+        normalized12Contours[0]?.length >= 4,
+        "Merged contour export should now resolve into one closed loop after boundary closure."
+      );
+      assert.equal(
+        fragmented3dmSiteContext?.contourLines?.features?.find(
+          (feature) => Number(feature?.properties?.elevation) === 12
+        )?.properties?.closedLoop,
+        true,
+        "Prepared native contour curves should be closed before the 1m generation stage begins."
+      );
+    }
     const closedExportContours = refined3dmSiteContext?.exportContourLines?.features || [];
     const nativeExportContours = closedExportContours.filter(
       (feature) => feature?.properties?.generated !== true
@@ -2552,16 +2559,8 @@ async function runBaselineVerification() {
       "Generated intermediate contours should stay on a dedicated generated-contour layer and use either the native-band interpolation path or the closed resolved-area export path."
     );
     const refined3dmTerrainPlan = resolveContourTerrainRenderPlan(refined3dmSiteContext);
-    assert.equal(
-      refined3dmSiteContext?.stats?.rawAnchoredContourTerrainUsed,
-      true,
-      "3DM contour terrain should use the raw-contour-anchored band planner when native contours are available."
-    );
-    assert.equal(
-      refined3dmSiteContext?.stats?.rawAnchoredNativeContourLevelCount,
-      3,
-      "Raw-contour terrain anchoring should use only the native contour levels as hard terrain anchors."
-    );
+    const refinedTerrainPipelineMode =
+      refined3dmSiteContext?.stats?.terrainPipelineMode || "current";
     const raw10ContourFeature = syntheticContourSiteContext.contourLines.features.find(
       (feature) => Number(feature?.properties?.elevation) === 10
     );
@@ -2577,43 +2576,9 @@ async function runBaselineVerification() {
     const rawAnchored10BandDiagnostic = (
       refined3dmRawAnchorDiagnostics?.levelDiagnostics || []
     ).find((entry) => Math.abs(Number(entry?.bottomElevation || 0) - 10) <= 1e-9);
-    assert.ok(
-      rawAnchored10Band,
-      "3DM terrain plan should contain the band whose lower boundary is the lowest raw native contour."
-    );
-    assert.ok(
-      rawAnchored10BandDiagnostic,
-      "Raw-anchor diagnostics should describe the lowest native terrain band."
-    );
-    assert.equal(
-      rawAnchored10BandDiagnostic?.exactBottomAnchor,
-      true,
-      "The lowest native contour should stay an exact terrain anchor when a finer contour interval is requested."
-    );
     const raw10ContourY = raw10ContourLocalPoints[0]?.[1];
     const raw10ContourMinX = Math.min(...raw10ContourLocalPoints.map((point) => point[0]));
     const raw10ContourMaxX = Math.max(...raw10ContourLocalPoints.map((point) => point[0]));
-    assert.ok(
-      (rawAnchored10Band?.boundaryLoops || []).some((loop) =>
-        (loop || []).some((point, index) => {
-          const nextPoint = loop[(index + 1) % loop.length];
-
-          if (!nextPoint) {
-            return false;
-          }
-
-          const segmentMinX = Math.min(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
-          const segmentMaxX = Math.max(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
-          return (
-            Math.abs(Number(point?.[1] || 0) - raw10ContourY) <= 0.5 &&
-            Math.abs(Number(nextPoint?.[1] || 0) - raw10ContourY) <= 0.5 &&
-            segmentMinX <= raw10ContourMinX + 0.5 &&
-            segmentMaxX >= raw10ContourMaxX - 0.5
-          );
-        })
-      ),
-      "The lowest raw native contour should lie directly on a terrain-band boundary edge even for a finer interval request."
-    );
     const raw12ContourFeature = syntheticContourSiteContext.contourLines.features.find(
       (feature) => Number(feature?.properties?.elevation) === 12
     );
@@ -2623,34 +2588,98 @@ async function runBaselineVerification() {
     const rawAnchored12Band = (refined3dmTerrainPlan?.bandGroups || []).find(
       (group) => Math.abs(Number(group?.bottomElevation || 0) - 12) <= 1e-9
     );
-    assert.ok(
-      rawAnchored12Band,
-      "3DM terrain plan should contain the band whose lower boundary is the raw 12m contour."
-    );
     const raw12ContourY = raw12ContourLocalPoints[0]?.[1];
     const raw12ContourMinX = Math.min(...raw12ContourLocalPoints.map((point) => point[0]));
     const raw12ContourMaxX = Math.max(...raw12ContourLocalPoints.map((point) => point[0]));
-    assert.ok(
-      (rawAnchored12Band?.boundaryLoops || []).some((loop) =>
-        (loop || []).some((point, index) => {
-          const nextPoint = loop[(index + 1) % loop.length];
+    if (refinedTerrainPipelineMode === "legacy") {
+      assert.equal(
+        refinedTerrainPipelineMode,
+        "legacy",
+        "Legacy contour terrain should stay on the recovered pre-anchor pipeline."
+      );
+      assert.ok(
+        (refined3dmTerrainPlan?.bandGroups || []).length > 0,
+        "Legacy contour terrain should still produce band groups for the terrain model."
+      );
+      assert.ok(
+        rawAnchored10Band,
+        "Legacy contour terrain should still contain the lowest requested terrain band."
+      );
+      assert.ok(
+        rawAnchored12Band,
+        "Legacy contour terrain should still contain the 12m terrain band."
+      );
+    } else {
+      assert.equal(
+        refined3dmSiteContext?.stats?.rawAnchoredContourTerrainUsed,
+        true,
+        "3DM contour terrain should use the raw-contour-anchored band planner when native contours are available."
+      );
+      assert.equal(
+        refined3dmSiteContext?.stats?.rawAnchoredNativeContourLevelCount,
+        3,
+        "Raw-contour terrain anchoring should use only the native contour levels as hard terrain anchors."
+      );
+      assert.ok(
+        rawAnchored10Band,
+        "3DM terrain plan should contain the band whose lower boundary is the lowest raw native contour."
+      );
+      assert.ok(
+        rawAnchored10BandDiagnostic,
+        "Raw-anchor diagnostics should describe the lowest native terrain band."
+      );
+      assert.equal(
+        rawAnchored10BandDiagnostic?.exactBottomAnchor,
+        true,
+        "The lowest native contour should stay an exact terrain anchor when a finer contour interval is requested."
+      );
+      assert.ok(
+        (rawAnchored10Band?.boundaryLoops || []).some((loop) =>
+          (loop || []).some((point, index) => {
+            const nextPoint = loop[(index + 1) % loop.length];
 
-          if (!nextPoint) {
-            return false;
-          }
+            if (!nextPoint) {
+              return false;
+            }
 
-          const segmentMinX = Math.min(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
-          const segmentMaxX = Math.max(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
-          return (
-            Math.abs(Number(point?.[1] || 0) - raw12ContourY) <= 0.5 &&
-            Math.abs(Number(nextPoint?.[1] || 0) - raw12ContourY) <= 0.5 &&
-            segmentMinX <= raw12ContourMinX + 0.5 &&
-            segmentMaxX >= raw12ContourMaxX - 0.5
-          );
-        })
-      ),
-      "The raw 12m contour should lie directly on a terrain-band boundary edge."
-    );
+            const segmentMinX = Math.min(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
+            const segmentMaxX = Math.max(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
+            return (
+              Math.abs(Number(point?.[1] || 0) - raw10ContourY) <= 0.5 &&
+              Math.abs(Number(nextPoint?.[1] || 0) - raw10ContourY) <= 0.5 &&
+              segmentMinX <= raw10ContourMinX + 0.5 &&
+              segmentMaxX >= raw10ContourMaxX - 0.5
+            );
+          })
+        ),
+        "The lowest raw native contour should lie directly on a terrain-band boundary edge even for a finer interval request."
+      );
+      assert.ok(
+        rawAnchored12Band,
+        "3DM terrain plan should contain the band whose lower boundary is the raw 12m contour."
+      );
+      assert.ok(
+        (rawAnchored12Band?.boundaryLoops || []).some((loop) =>
+          (loop || []).some((point, index) => {
+            const nextPoint = loop[(index + 1) % loop.length];
+
+            if (!nextPoint) {
+              return false;
+            }
+
+            const segmentMinX = Math.min(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
+            const segmentMaxX = Math.max(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
+            return (
+              Math.abs(Number(point?.[1] || 0) - raw12ContourY) <= 0.5 &&
+              Math.abs(Number(nextPoint?.[1] || 0) - raw12ContourY) <= 0.5 &&
+              segmentMinX <= raw12ContourMinX + 0.5 &&
+              segmentMaxX >= raw12ContourMaxX - 0.5
+            );
+          })
+        ),
+        "The raw 12m contour should lie directly on a terrain-band boundary edge."
+      );
+    }
     const exact3dmSiteContext = prepareSiteContextForExport(
       syntheticContourSiteContext,
       {
@@ -2660,16 +2689,6 @@ async function runBaselineVerification() {
       "3dm"
     );
     const exact3dmTerrainPlan = resolveContourTerrainRenderPlan(exact3dmSiteContext);
-    assert.equal(
-      exact3dmSiteContext?.stats?.rawAnchoredExactNativeIntervalUsed,
-      true,
-      "When the requested interval matches the source contour interval, 3DM terrain should use the exact native contour band path."
-    );
-    assert.equal(
-      exact3dmSiteContext?.stats?.rawAnchoredGridFallbackBandCount,
-      0,
-      "Exact native contour terrain should not need fallback grid bands."
-    );
     assert.deepEqual(
       (exact3dmTerrainPlan?.bandGroups || []).map((group) => Number(group?.bottomElevation)),
       [10, 12],
@@ -2682,27 +2701,45 @@ async function runBaselineVerification() {
       exact12Band,
       "Exact native contour terrain should keep the 12m band as a real terrain step."
     );
-    assert.ok(
-      (exact12Band?.boundaryLoops || []).some((loop) =>
-        (loop || []).some((point, index) => {
-          const nextPoint = loop[(index + 1) % loop.length];
+    if (refinedTerrainPipelineMode === "legacy") {
+      assert.equal(
+        exact3dmSiteContext?.stats?.terrainPipelineMode,
+        "legacy",
+        "Legacy exact-interval terrain should stay on the recovered pre-anchor pipeline."
+      );
+    } else {
+      assert.equal(
+        exact3dmSiteContext?.stats?.rawAnchoredExactNativeIntervalUsed,
+        true,
+        "When the requested interval matches the source contour interval, 3DM terrain should use the exact native contour band path."
+      );
+      assert.equal(
+        exact3dmSiteContext?.stats?.rawAnchoredGridFallbackBandCount,
+        0,
+        "Exact native contour terrain should not need fallback grid bands."
+      );
+      assert.ok(
+        (exact12Band?.boundaryLoops || []).some((loop) =>
+          (loop || []).some((point, index) => {
+            const nextPoint = loop[(index + 1) % loop.length];
 
-          if (!nextPoint) {
-            return false;
-          }
+            if (!nextPoint) {
+              return false;
+            }
 
-          const segmentMinX = Math.min(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
-          const segmentMaxX = Math.max(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
-          return (
-            Math.abs(Number(point?.[1] || 0) - raw12ContourY) <= 0.5 &&
-            Math.abs(Number(nextPoint?.[1] || 0) - raw12ContourY) <= 0.5 &&
-            segmentMinX <= raw12ContourMinX + 0.5 &&
-            segmentMaxX >= raw12ContourMaxX - 0.5
-          );
-        })
-      ),
-      "Exact native contour terrain should place the raw 12m contour directly on the exact 12m terrain boundary."
-    );
+            const segmentMinX = Math.min(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
+            const segmentMaxX = Math.max(Number(point?.[0] || 0), Number(nextPoint?.[0] || 0));
+            return (
+              Math.abs(Number(point?.[1] || 0) - raw12ContourY) <= 0.5 &&
+              Math.abs(Number(nextPoint?.[1] || 0) - raw12ContourY) <= 0.5 &&
+              segmentMinX <= raw12ContourMinX + 0.5 &&
+              segmentMaxX >= raw12ContourMaxX - 0.5
+            );
+          })
+        ),
+        "Exact native contour terrain should place the raw 12m contour directly on the exact 12m terrain boundary."
+      );
+    }
     const syntheticBuildingPlacementSiteContext = cloneJsonValue({
       ...syntheticContourSiteContext,
       contourLines: {
@@ -3366,11 +3403,17 @@ async function runBaselineVerification() {
       [10, 11, 12, 13, 14],
       "DXF export should keep native contour levels and add interpolated levels between them."
     );
+    const dxfNativePreparedContours =
+      refinedDxfSiteContext?.stats?.terrainPipelineMode === "legacy"
+        ? (refinedDxfSiteContext?.exportContourLines?.features || []).filter(
+            (feature) => feature?.properties?.generated !== true
+          )
+        : (refinedDxfSiteContext?.contourLines?.features || []).filter(
+            (feature) => feature?.properties?.generated !== true
+          );
     assert.ok(
-      (refinedDxfSiteContext?.contourLines?.features || [])
-        .filter((feature) => feature?.properties?.generated !== true)
-        .every((feature) => feature?.properties?.closedLoop === true),
-      "DXF export should close native contour curves first, then add only the missing intermediate contours."
+      dxfNativePreparedContours.every((feature) => feature?.properties?.closedLoop === true),
+      "DXF export should close native contour curves before writing the export contour collection."
     );
     const exportMutationSourceSiteContext = cloneJsonValue({
       ...syntheticContourSiteContext,

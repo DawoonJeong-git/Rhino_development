@@ -3576,7 +3576,7 @@ function normalizeExportFormat(value) {
 
 function normalizeTerrainPipelineMode(value) {
   const normalized = String(value || "").trim().toLowerCase();
-  return normalized === "legacy" ? "legacy" : "current";
+  return normalized === "current" ? "current" : "legacy";
 }
 
 function describeTerrainMode(value) {
@@ -4976,11 +4976,11 @@ function ensureModelFormOptionLayout() {
       "terrainPipelineMode",
       "대지모형 엔진",
       [
-        { value: "current", label: "최신" },
-        { value: "legacy", label: "레거시 비교" },
+        { value: "legacy", label: "레거시" },
+        { value: "current", label: "최신 비교" },
       ],
-      "current",
-      "현재 엔진과 예전 3D 생성 로직을 비교할 때만 레거시를 선택합니다."
+      "legacy",
+      "기본은 지난달 기준의 안정적인 엔진입니다. 최신 엔진은 비교가 필요할 때만 선택합니다."
     );
   }
 
