@@ -9,6 +9,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Assert-LastExitCode {
+  param(
+    [string]$Step
+  )
+
+  if ($LASTEXITCODE -ne 0) {
+    throw "$Step failed with exit code $LASTEXITCODE"
+  }
+}
+
 function Get-NormalizedHttpsUrl {
   param(
     [string]$Value
@@ -137,26 +147,34 @@ if (-not (Test-Path $gitDir)) {
 Set-Location $ProdRoot
 
 $beforeCommit = (git rev-parse --short HEAD).Trim()
+Assert-LastExitCode -Step "git rev-parse before update"
 Write-Host "Updating production clone in $ProdRoot"
 git fetch origin
+Assert-LastExitCode -Step "git fetch origin"
 git checkout $Branch
+Assert-LastExitCode -Step "git checkout $Branch"
 git pull --ff-only origin $Branch
+Assert-LastExitCode -Step "git pull --ff-only origin $Branch"
 $afterCommit = (git rev-parse --short HEAD).Trim()
+Assert-LastExitCode -Step "git rev-parse after update"
 
 $sparseScript = Join-Path $ProdRoot "deploy\configure-runtime-sparse-checkout.ps1"
 if (Test-Path $sparseScript) {
   Write-Host "Reapplying production sparse checkout"
   powershell -ExecutionPolicy Bypass -File $sparseScript -RepoRoot $ProdRoot
+  Assert-LastExitCode -Step "reapply production sparse checkout"
 }
 
 Write-Host "Refreshing dependencies"
 npm.cmd install
+Assert-LastExitCode -Step "npm.cmd install"
 
 if (-not $SkipRestart) {
   Write-Host "Restarting managed production server"
   $env:PORT = "3000"
   $env:ROUTE_BASE_PATH = $RouteBasePath
   powershell -ExecutionPolicy Bypass -File (Join-Path $ProdRoot "deploy\start-server.ps1") -Managed
+  Assert-LastExitCode -Step "restart managed production server"
 }
 
 if (-not $SkipSmoke) {
@@ -190,6 +208,7 @@ if (-not $SkipSmoke) {
     }
 
     & node @verifyArgs
+    Assert-LastExitCode -Step "post-deploy verification bundle"
   } else {
     Write-Warning "Smoke check script not found: $verifyScript"
   }
