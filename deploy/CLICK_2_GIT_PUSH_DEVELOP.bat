@@ -17,7 +17,7 @@ echo [2/3] No local changes to commit.
 goto :push
 
 :commit
-for /f "delims=" %%i in ('powershell -NoProfile -Command "Get-Date -Format ''yyyy-MM-dd HH:mm:ss''"') do set "STAMP=%%i"
+for /f "delims=" %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd_HH-mm-ss"') do set "STAMP=%%i"
 echo [2/3] Creating commit...
 git commit -m "Develop sync %STAMP%"
 if errorlevel 1 goto :error
