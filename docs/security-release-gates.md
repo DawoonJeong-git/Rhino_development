@@ -2,9 +2,9 @@
 
 ## Purpose
 
-This document is the release gate for the current security build.
+This document is the release gate for the current Cloudflare-based sharing flow.
 
-Use it right before sharing the app with acquaintances.
+Use it right before sharing the app with anyone outside the core workflow.
 
 If any hard stop below fails, do not share the URL yet.
 
@@ -13,49 +13,45 @@ If any hard stop below fails, do not share the URL yet.
 This build is acceptable for:
 
 - acquaintance-only sharing
-- controlled access through Cloudflare Tunnel plus Cloudflare Access
-- fallback controlled access through a reverse proxy plus an explicit IP allowlist
+- controlled access through Cloudflare Tunnel
+- Cloudflare Access in front of the hostname when external sharing is needed
 
 This build is not acceptable for:
 
 - open public indexing
-- public-by-default home router exposure
-- anonymous internet traffic without an access layer
+- router-port exposure for this app
+- direct internet traffic to the Node server
 
 ## Gate 1. Access Path
 
-Release only if one of these is true:
+Release only if both of these are true:
 
-- Cloudflare Tunnel is active and Cloudflare Access protects the hostname
-- a reverse proxy is in front of the app and only an explicit IP allowlist can reach it
+- Cloudflare Tunnel is active for the hostname
+- Cloudflare Access protects the hostname when the site is shared externally
 
 For this project stage, the recommended path is:
 
 - Cloudflare Tunnel plus Cloudflare Access
 
-Fallback only when Access is not available:
+## Gate 2. Runtime Shape
 
-- reverse proxy plus strict allowlist
-
-## Gate 2. Exposure Defaults
-
-Release only if the runtime bind shape matches one of these safe patterns.
-
-Docker pattern:
-
-- `HOST_BIND_IP=127.0.0.1`
-- `BIND_HOST=0.0.0.0`
-- external access happens only through Tunnel, Access, or a trusted proxy
+Release only if the runtime bind shape matches this safe pattern.
 
 Direct Node pattern:
 
 - `BIND_HOST=127.0.0.1`
 - or omit `BIND_HOST` and rely on the server default
-- external access happens only through Tunnel, Access, or a trusted proxy
+- external access happens only through Tunnel and Access
+
+Route pattern:
+
+- production uses `/main`
+- test uses `/test`
+- root traffic lands on production and redirects to `/main/`
 
 Network rule:
 
-- if Cloudflare Tunnel is being used, keep router ports closed unless there is a deliberate reason to open them
+- keep router ports closed unless there is a deliberate reason to open them
 
 ## Gate 3. Automated Verification
 
@@ -86,11 +82,6 @@ If the public share origin is live, also run:
 npm run verify:public-origin -- --base-url https://your-domain.example
 ```
 
-The strict runtime mode is intended to catch real-share blockers such as:
-
-- `VWORLD_API_DOMAIN` still pointing at `localhost`
-- missing contour dataset paths in the actual runtime config
-
 `verify:baseline` covers:
 
 - core routes
@@ -102,11 +93,11 @@ The strict runtime mode is intended to catch real-share blockers such as:
 
 `verify:deployment-security` covers:
 
-- safe Compose defaults
-- safe example env/config values
-- allowlist fallback example presence
+- loopback-safe local config defaults
+- Cloudflare path example presence
+- runtime sparse manifest coverage for deploy
 - access-layer documentation presence
-- local `.env.production` and `config.local.json` values when those files exist
+- local `config.local.json` values when those files exist
 
 `verify:public-origin` covers:
 
@@ -140,9 +131,9 @@ Release only if all of these are true:
 Do not share the app if any of these are true:
 
 - router ports are open while relying on Cloudflare Tunnel privacy
-- the site can be reached directly without Cloudflare Access or an allowlist
-- `HOST_BIND_IP` is not loopback in the Docker deployment
+- the site can be reached directly without Cloudflare Tunnel
 - direct Node runtime is bound to `0.0.0.0` or another non-loopback host
+- Cloudflare routing does not separate `/main` and `/test`
 - `npm run verify:baseline` fails
 - `npm run verify:deployment-security` fails
 - there is no rollback target
@@ -151,7 +142,7 @@ Do not share the app if any of these are true:
 
 Even after all gates pass, these risks still remain:
 
-- a misconfigured Cloudflare Access policy or stale allowlist can still expose the app too broadly
+- a misconfigured Cloudflare Access policy can still expose the app too broadly
 - allowed users can still overuse heavy export or context routes even if anonymous access is blocked
 - upstream public APIs can still throttle, timeout, or change behavior
 - provider-specific timeout values may still need tuning after more real parcel runs

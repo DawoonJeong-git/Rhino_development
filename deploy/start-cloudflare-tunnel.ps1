@@ -65,6 +65,20 @@ function Stop-MatchingProcesses {
   }
 }
 
+function Normalize-ProcessEnvironmentPath {
+  $resolvedPath = [string]$env:Path
+
+  if (-not $resolvedPath -and $env:PATH) {
+    $resolvedPath = [string]$env:PATH
+  }
+
+  Remove-Item Env:PATH -ErrorAction SilentlyContinue
+
+  if ($resolvedPath) {
+    $env:Path = $resolvedPath
+  }
+}
+
 if (-not (Test-Path $CloudflaredPath)) {
   throw "cloudflared executable was not found: $CloudflaredPath"
 }
@@ -95,6 +109,7 @@ Stop-MatchingProcesses -ProcessName "cloudflared.exe" -Patterns @("tunnel", "run
 Stop-MatchingProcesses -ProcessName "powershell.exe" -Patterns @($repoRoot, "start-cloudflare-tunnel.ps1", $TunnelName)
 Stop-MatchingProcesses -ProcessName "cmd.exe" -Patterns @("cloudflared.exe", "tunnel", "run", $TunnelName)
 
+Normalize-ProcessEnvironmentPath
 $tunnelProcess = Start-Process `
   -FilePath $CloudflaredPath `
   -ArgumentList @("tunnel", "run", $TunnelName) `

@@ -1,75 +1,164 @@
-# 대지 컨텍스트 생성기
+# SpaceWork Workflow
 
-한국 건축계획용 대지 컨텍스트 도구의 초기 MVP입니다.
+This repository now supports two local roles on the same PC:
 
-현재 구현 범위:
+- `C:\SpaceWork_develop`
+  Full working copy for feature work, Git history, and the public test path.
+- `C:\SpaceWork_deploy`
+  Runtime-focused working copy for the public production path on Cloudflare.
 
-- 지도 기반 프론트
-- 주소 검색 및 부분 검색 추천
-- 지도 클릭 위치 선택
-- 최근 선택 이력 저장
-- 토지정보 / 법규 / 건축물대장용 공식 사이트 액션
-- 대지 경계 + 등고 미리보기
-- 3D 스펙 JSON 다운로드
-- OBJ 프로토타입 다운로드
+## Public Paths
 
-## 로컬 실행
+- Production hub: `https://spaceswork.net/main`
+- Test hub: `https://spaceswork.net/test`
 
-1. `config.local.json.example`를 복사해 `config.local.json`을 만듭니다.
-2. 아직 API 키가 없으면 그대로 둬도 됩니다.
-3. 아래 명령으로 실행합니다.
+The Node app reads the route prefix from `ROUTE_BASE_PATH`.
 
-```bash
-npm run dev
+- Production wrappers set `ROUTE_BASE_PATH=/main`
+- Test wrappers set `ROUTE_BASE_PATH=/test`
+
+## Folder Roles
+
+### `C:\SpaceWork_develop`
+
+Use this folder for:
+
+- feature work
+- Git commits and pushes
+- local verification
+- the Cloudflare test route
+
+User-facing buttons in both `deploy` folders:
+
+- `CLICK_1_START_BOTH_WEB.bat`
+- `CLICK_2_GIT_PUSH_DEVELOP.bat`
+- `CLICK_3_GIT_PULL_DEPLOY.bat`
+
+The same three button files are kept in:
+
+- `C:\SpaceWork_develop\deploy`
+- `C:\SpaceWork_deploy\deploy`
+
+What they do:
+
+- `CLICK_1_START_BOTH_WEB.bat`
+  - starts `https://spaceswork.net/main`
+  - starts `https://spaceswork.net/test`
+- `CLICK_2_GIT_PUSH_DEVELOP.bat`
+  - stages, commits, and pushes from `C:\SpaceWork_develop`
+- `CLICK_3_GIT_PULL_DEPLOY.bat`
+  - pulls into `C:\SpaceWork_deploy`
+  - restarts production
+  - runs verification
+
+### `C:\SpaceWork_deploy`
+
+Use this folder for:
+
+- pulling the selected Git version
+- running the production server
+- running the Cloudflare tunnel
+- production-only verification
+
+Internal runtime scripts still exist under `deploy\`, but they are support files for the three `CLICK_...` buttons.
+
+## Git Flow
+
+Use this simple release flow:
+
+1. Edit and test in `C:\SpaceWork_develop`
+2. Confirm the version at `https://spaceswork.net/test`
+3. Commit and push the selected version to Git
+4. Move to `C:\SpaceWork_deploy`
+5. Run `deploy\CLICK_3_GIT_PULL_DEPLOY.bat`
+6. Confirm the production version at `https://spaceswork.net/main`
+
+## Cloudflare Tunnel
+
+The Cloudflare tunnel configuration is stored outside this repo:
+
+- `C:\Users\wjdek\.cloudflared\config.yml`
+
+Use path-based ingress so one hostname can serve both apps.
+An example file is included at:
+
+- `deploy/cloudflared-config.example.yml`
+
+Key idea:
+
+- `/main` routes to `http://127.0.0.1:3000`
+- `/test` routes to `http://127.0.0.1:3001`
+- `/` routes to production so the app can redirect to `/main/`
+
+Cloudflare documents that ingress rules can match hostname, path, or both:
+<https://developers.cloudflare.com/tunnel/advanced/local-management/configuration-file/>
+
+## Deploy Worktree Cleanup
+
+`C:\SpaceWork_deploy` can stay runtime-only by using sparse checkout.
+This repo now includes:
+
+- `deploy/configure-runtime-sparse-checkout.ps1`
+- `deploy/runtime-sparse-checkout.txt`
+
+Run once in `C:\SpaceWork_deploy` if needed:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\configure-runtime-sparse-checkout.ps1
 ```
 
-브라우저에서 터미널에 출력된 `http://localhost:3000` 또는 다음 포트를 열면 됩니다.
-포트 3000이 이미 사용 중이면 서버가 자동으로 다음 포트로 이동합니다.
+`deploy\setup-home-prod.ps1` and `deploy\update-home-prod.ps1` now reapply the runtime sparse layout automatically when possible.
 
-## 설정 파일
+## Local Config Notes
 
-`config.local.json`
+`config.local.json` is local-only and is not committed.
 
-```json
-{
-  "PORT": 3000,
-  "VWORLD_API_KEY": "",
-  "VWORLD_API_DOMAIN": "http://localhost:3000",
-  "JUSO_CONFIRM_KEY": "",
-  "BUILDING_HUB_SERVICE_KEY": "",
-  "LAW_API_OC": "",
-  "TERRAIN_DEM_PATH": "",
-  "USE_NOMINATIM_FALLBACK": true
-}
+Important values:
+
+- `PORT`
+- `ROUTE_BASE_PATH`
+- `VWORLD_API_DOMAIN`
+- `PUBLIC_BASE_URL`
+- `PUBLIC_ENABLED_FEATURES`
+- `TERRAIN_CONTOUR_PATH`
+
+Recommended values:
+
+- `C:\SpaceWork_deploy\config.local.json`
+  - `PORT`: `3000`
+  - `ROUTE_BASE_PATH`: optional, wrappers already set `/main`
+  - `PUBLIC_BASE_URL`: `https://spaceswork.net/main`
+- `C:\SpaceWork_develop\config.local.json`
+  - `PORT`: `3001`
+  - `ROUTE_BASE_PATH`: optional, wrappers already set `/test`
+  - `PUBLIC_BASE_URL`: `https://spaceswork.net/test`
+
+If `VWORLD_API_DOMAIN` is only used for origin registration, keep it as the HTTPS origin only, not the path:
+
+- `https://spaceswork.net`
+
+## Production Update Command
+
+Use this command in `C:\SpaceWork_deploy` after a selected version is pushed:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\update-home-prod.ps1
 ```
 
-설정 설명:
+This script now does the following:
 
-- `VWORLD_API_KEY`: 브이월드 검색 / 지적도 / 건물 데이터 키
-- `VWORLD_API_DOMAIN`: 브이월드에 등록한 사용 도메인
-- `JUSO_CONFIRM_KEY`: 도로명주소 검색 품질 강화용 승인키
-- `BUILDING_HUB_SERVICE_KEY`: 건축HUB 건축물대장 조회용 서비스키
-- `LAW_API_OC`: 국가법령정보 공동활용용 OC 값
-- `TERRAIN_DEM_PATH`: 추후 DEM 파일 기반 지형 생성용 로컬 파일 경로
-- `USE_NOMINATIM_FALLBACK`: 브이월드 키가 없을 때 임시 검색 fallback 사용 여부
+1. `git fetch`
+2. `git pull --ff-only`
+3. reapply the runtime sparse checkout when configured
+4. `npm.cmd install`
+5. restart the managed production server on `/main`
+6. run verification against `http://127.0.0.1:3000/main`
 
-API별 준비물과 공식 링크는 [docs/api-setup-guide.md](docs/api-setup-guide.md)에 정리되어 있습니다.
+## Notes
 
-참고:
-
-- `TERRAIN_DEM_PATH`는 선택사항입니다.
-- DEM 관련 일부 예전 링크는 폐기되었을 수 있어, 현재는 국토정보플랫폼의 `공개DEM` 또는 `수치지형도 / 연속수치지형도` 다운로드 경로를 사용하는 쪽으로 정리했습니다.
-
-## 현재 동작
-
-- 주소 검색은 브이월드 키가 없으면 임시 fallback 검색으로 동작
-- 대지 경계는 브이월드 키가 없으면 모의 대지 경계로 동작
-- 등고는 아직 synthetic preview
-- OBJ는 실제 설계 파일이 아니라 프로토타입 지형/대지 확인용
-
-## 다음 단계
-
-1. 브이월드 실대지 연결
-2. DEM 기반 실제 지형 연결
-3. 건물 footprint / 높이 연결
-4. 3DM / DXF / OBJ 실제 export 정교화
+- `CLICK_1_START_BOTH_WEB.bat` is the main daily start button.
+- `CLICK_2_GIT_PUSH_DEVELOP.bat` always pushes from `C:\SpaceWork_develop`.
+- `CLICK_3_GIT_PULL_DEPLOY.bat` always pulls into `C:\SpaceWork_deploy`.
+- `deploy\run-home-site.bat`, `deploy\run-test-site.bat`, `deploy\start-server.ps1`, and `deploy\start-cloudflare-tunnel.ps1` are internal support files.
+- Runtime logs and PID files in `logs\` are local artifacts.
+- Large `tmp_*`, `*.obj`, `*.3dm`, and `*.log` files are disposable local outputs.

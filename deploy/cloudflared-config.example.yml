@@ -1,0 +1,14 @@
+tunnel: REPLACE_WITH_TUNNEL_ID
+credentials-file: C:\Users\wjdek\.cloudflared\REPLACE_WITH_TUNNEL_ID.json
+
+ingress:
+  - hostname: spaceswork.net
+    path: ^/main(?:/.*)?$
+    service: http://127.0.0.1:3000
+  - hostname: spaceswork.net
+    path: ^/test(?:/.*)?$
+    service: http://127.0.0.1:3001
+  - hostname: spaceswork.net
+    path: ^/$
+    service: http://127.0.0.1:3000
+  - service: http_status:404

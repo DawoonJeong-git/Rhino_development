@@ -109,6 +109,7 @@ const DEFAULT_AD_PREVIEW_ALLOWED_PATHS = Object.freeze([
   "/heritage-risk",
   "/max-mass",
 ]);
+const DEFAULT_ROUTE_BASE_PATH = "";
 const DEFAULT_INTERNAL_ONLY_STATIC_PATHS = Object.freeze([]);
 const DEFAULT_PUBLIC_ENABLED_FEATURES = Object.freeze(["contour3dmodel"]);
 const DEFAULT_AD_PREVIEW_FRAME_ANCESTORS = Object.freeze([
@@ -465,6 +466,37 @@ function normalizePathPrefix(value) {
   return prefixed.endsWith("/") ? prefixed.slice(0, -1) : prefixed;
 }
 
+function resolveRouteBasePath(requestPath, routeBasePath) {
+  const normalizedRequestPath = normalizePathPrefix(requestPath || "/") || "/";
+  const normalizedRouteBasePath = normalizePathPrefix(routeBasePath);
+
+  if (!normalizedRouteBasePath) {
+    return {
+      matched: true,
+      requestPath: normalizedRequestPath,
+    };
+  }
+
+  if (normalizedRequestPath === normalizedRouteBasePath) {
+    return {
+      matched: true,
+      requestPath: "/",
+    };
+  }
+
+  if (normalizedRequestPath.startsWith(`${normalizedRouteBasePath}/`)) {
+    return {
+      matched: true,
+      requestPath: normalizedRequestPath.slice(normalizedRouteBasePath.length) || "/",
+    };
+  }
+
+  return {
+    matched: false,
+    requestPath: normalizedRequestPath,
+  };
+}
+
 function normalizePathPrefixList(value, fallback = DEFAULT_AD_PREVIEW_ALLOWED_PATHS) {
   const normalizedEntries = normalizeConfigList(value)
     .map((entry) => normalizePathPrefix(entry))
@@ -475,6 +507,38 @@ function normalizePathPrefixList(value, fallback = DEFAULT_AD_PREVIEW_ALLOWED_PA
   }
 
   return [...new Set(normalizedEntries)];
+}
+
+function decorateHtmlDocument(html, config) {
+  const routeBasePath = normalizePathPrefix(config?.routeBasePath || "");
+  const escapedRouteBasePath = escapeHtml(routeBasePath);
+  let output = String(html || "");
+
+  output = output.replace(
+    /<html([^>]*)>/iu,
+    (match, attributes = "") =>
+      /data-route-base-path=/iu.test(attributes)
+        ? match.replace(
+            /data-route-base-path=(["']).*?\1/iu,
+            `data-route-base-path="${escapedRouteBasePath}"`
+          )
+        : `<html${attributes} data-route-base-path="${escapedRouteBasePath}">`
+  );
+
+  if (!routeBasePath) {
+    return output;
+  }
+
+  output = output.replace(
+    /(href|src)=(")\/(?!\/)/giu,
+    `$1=$2${routeBasePath}/`
+  );
+  output = output.replace(
+    /(href|src)=(')\/(?!\/)/giu,
+    `$1=$2${routeBasePath}/`
+  );
+
+  return output;
 }
 
 function normalizeFeatureId(value) {
@@ -1879,6 +1943,12 @@ function buildRuntimeConfig(localConfig) {
 
   return {
     port: Number(process.env.PORT || localConfig.PORT || 3000),
+    routeBasePath:
+      normalizePathPrefix(
+        process.env.ROUTE_BASE_PATH ||
+          localConfig.ROUTE_BASE_PATH ||
+          DEFAULT_ROUTE_BASE_PATH
+      ) || "",
     bindHost:
       normalizeConfigString(
         process.env.BIND_HOST || localConfig.BIND_HOST || DEFAULT_BIND_HOST
@@ -2338,7 +2408,7 @@ async function serveStatic(request, requestPath, response, config) {
     sendHtml(
       response,
       200,
-      renderHubHtml(config),
+      decorateHtmlDocument(renderHubHtml(config), config),
       {},
       {
         frameAncestors: isAdPreviewAllowedPath(requestPath, config)
@@ -2406,8 +2476,14 @@ async function serveStatic(request, requestPath, response, config) {
       return;
     }
 
-    const body = await readFile(resolvedFilePath);
     const ext = path.extname(resolvedFilePath).toLowerCase();
+    const body =
+      ext === ".html"
+        ? Buffer.from(
+            decorateHtmlDocument(await readFile(resolvedFilePath, "utf8"), config),
+            "utf8"
+          )
+        : await readFile(resolvedFilePath);
 
     response.writeHead(
       200,
@@ -30073,14 +30149,37 @@ async function createApp() {
     });
 
     try {
+      if (requestUrl.pathname === "/" && config.routeBasePath) {
+        response.writeHead(
+          302,
+          buildResponseHeaders({
+            Location: `${config.routeBasePath}/`,
+          })
+        );
+        response.end();
+        return;
+      }
+
       if (requestUrl.pathname === "/favicon.ico") {
         response.writeHead(204, buildResponseHeaders());
         response.end();
         return;
       }
 
-      const rateLimitBucket = resolveRateLimitBucket(
+      const routeResolution = resolveRouteBasePath(
         requestUrl.pathname,
+        config.routeBasePath
+      );
+
+      if (config.routeBasePath && !routeResolution.matched) {
+        sendJson(response, 404, { error: "Not found" });
+        return;
+      }
+
+      const requestPath = routeResolution.requestPath;
+
+      const rateLimitBucket = resolveRateLimitBucket(
+        requestPath,
         request.method
       );
 
@@ -30091,8 +30190,11 @@ async function createApp() {
         return;
       }
 
-      if (requestUrl.pathname === "/api/config" && request.method === "GET") {
+      if (requestPath === "/api/config" && request.method === "GET") {
         sendJson(response, 200, {
+          app: {
+            routeBasePath: config.routeBasePath,
+          },
           map: {
             provider: "openstreetmap",
             initialCenter: { lat: 37.5665, lng: 126.978 },
@@ -30116,7 +30218,7 @@ async function createApp() {
         return;
       }
 
-      if (requestUrl.pathname === "/api/health" && request.method === "GET") {
+      if (requestPath === "/api/health" && request.method === "GET") {
         sendJson(response, 200, {
           ok: true,
           uptimeSeconds: Number(process.uptime().toFixed(1)),
@@ -30126,7 +30228,7 @@ async function createApp() {
       }
 
       if (
-        requestUrl.pathname === "/api/runtime-stats" &&
+        requestPath === "/api/runtime-stats" &&
         request.method === "GET"
       ) {
         const clientIp = getClientIp(request);
@@ -30143,7 +30245,7 @@ async function createApp() {
       }
 
       if (
-        requestUrl.pathname === "/api/request-progress" &&
+        requestPath === "/api/request-progress" &&
         request.method === "GET"
       ) {
         pruneRequestProgressStore();
@@ -30184,17 +30286,21 @@ async function createApp() {
         return;
       }
 
-      if (requestUrl.pathname === "/handoff/eum" && request.method === "GET") {
-        sendHtml(response, 200, createEumHandoffHtml(requestUrl));
+      if (requestPath === "/handoff/eum" && request.method === "GET") {
+        sendHtml(response, 200, decorateHtmlDocument(createEumHandoffHtml(requestUrl), config));
         return;
       }
 
-      if (requestUrl.pathname === "/handoff/eum-law" && request.method === "GET") {
-        sendHtml(response, 200, createEumLawHandoffHtml(requestUrl));
+      if (requestPath === "/handoff/eum-law" && request.method === "GET") {
+        sendHtml(
+          response,
+          200,
+          decorateHtmlDocument(createEumLawHandoffHtml(requestUrl), config)
+        );
         return;
       }
 
-      if (requestUrl.pathname === "/api/geocode" && request.method === "GET") {
+      if (requestPath === "/api/geocode" && request.method === "GET") {
         const query = requestUrl.searchParams.get("q")?.trim();
 
         if (!query) {
@@ -30321,7 +30427,7 @@ async function createApp() {
       }
 
       if (
-        requestUrl.pathname === "/api/reverse-geocode" &&
+        requestPath === "/api/reverse-geocode" &&
         request.method === "GET"
       ) {
         const lat = Number(requestUrl.searchParams.get("lat"));
@@ -30356,7 +30462,7 @@ async function createApp() {
       }
 
       if (
-        requestUrl.pathname === "/api/site-context" &&
+        requestPath === "/api/site-context" &&
         request.method === "POST"
       ) {
         const progressToken = readRequestProgressToken(request);
@@ -30391,7 +30497,7 @@ async function createApp() {
       }
 
       if (
-        requestUrl.pathname === "/api/model-spec" &&
+        requestPath === "/api/model-spec" &&
         request.method === "POST"
       ) {
         const body = await readJsonBody(request, {
@@ -30402,7 +30508,7 @@ async function createApp() {
       }
 
       if (
-        requestUrl.pathname === "/api/land-info" &&
+        requestPath === "/api/land-info" &&
         request.method === "POST"
       ) {
         const body = await readJsonBody(request, {
@@ -30428,7 +30534,7 @@ async function createApp() {
       }
 
       if (
-        requestUrl.pathname === "/api/land-info-details" &&
+        requestPath === "/api/land-info-details" &&
         request.method === "POST"
       ) {
         const body = await readJsonBody(request, {
@@ -30454,7 +30560,7 @@ async function createApp() {
       }
 
       if (
-        requestUrl.pathname === "/api/building-register" &&
+        requestPath === "/api/building-register" &&
         request.method === "POST"
       ) {
         if (!config.buildingHubServiceKey) {
@@ -30488,15 +30594,15 @@ async function createApp() {
       }
 
       if (
-        (requestUrl.pathname === "/api/export-model" ||
-          requestUrl.pathname === "/api/export-obj" ||
-          requestUrl.pathname === "/api/export-skp-payload") &&
+        (requestPath === "/api/export-model" ||
+          requestPath === "/api/export-obj" ||
+          requestPath === "/api/export-skp-payload") &&
         request.method === "POST"
       ) {
         const progressToken = readRequestProgressToken(request);
         const clientIp = getClientIp(request);
         const isSkpPayloadRoute =
-          requestUrl.pathname === "/api/export-skp-payload";
+          requestPath === "/api/export-skp-payload";
         beginRequestProgress(
           progressToken,
           isSkpPayloadRoute ? "export-skp-payload" : "export-model",
@@ -30524,7 +30630,7 @@ async function createApp() {
               hasClientSuppliedSiteContext,
             } = extractExportRequestPayload(body);
             const format =
-              requestUrl.pathname === "/api/export-obj"
+              requestPath === "/api/export-obj"
                 ? "obj"
                 : isSkpPayloadRoute
                   ? "skp-payload"
@@ -30842,7 +30948,7 @@ async function createApp() {
         return;
       }
 
-      await serveStatic(request, requestUrl.pathname, response, config);
+      await serveStatic(request, requestPath, response, config);
     } catch (error) {
       const publicError = normalizePublicError(error);
       const statusCode =

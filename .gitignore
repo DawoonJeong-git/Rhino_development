@@ -2,9 +2,12 @@ node_modules/
 config.local.json
 .env.production
 .env.production.local
+.worktrees/
+SpaceWork_develop.zip
 tmp_*
 *.log
-logs/verify-release/
+*.pid
+logs/
 *.obj
 *.3dm
 data/contours/

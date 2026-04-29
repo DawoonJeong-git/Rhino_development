@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 
@@ -41,36 +41,25 @@ function normalizeJsonText(text) {
   return String(text ?? "").replace(/^\uFEFF/, "");
 }
 
-function parseEnv(text) {
-  const values = new Map();
-
-  for (const rawLine of String(text || "").split(/\r?\n/)) {
-    const line = rawLine.trim();
-
-    if (!line || line.startsWith("#")) {
-      continue;
-    }
-
-    const separatorIndex = line.indexOf("=");
-
-    if (separatorIndex <= 0) {
-      continue;
-    }
-
-    const key = line.slice(0, separatorIndex).trim();
-    const value = line.slice(separatorIndex + 1).trim();
-    values.set(key, normalizeScalar(value));
-  }
-
-  return values;
-}
-
 async function readTextIfExists(filePath) {
   try {
     return await readFile(filePath, "utf8");
   } catch (error) {
     if (error?.code === "ENOENT") {
       return null;
+    }
+
+    throw error;
+  }
+}
+
+async function pathExists(filePath, { directoryOnly = false } = {}) {
+  try {
+    const details = await stat(filePath);
+    return directoryOnly ? details.isDirectory() : true;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
     }
 
     throw error;
@@ -85,11 +74,6 @@ function isLoopbackHost(value) {
     normalized === "localhost" ||
     normalized === "::1"
   );
-}
-
-function isContainerWildcardHost(value) {
-  const normalized = normalizeScalar(value).toLowerCase();
-  return normalized === "0.0.0.0" || normalized === "::";
 }
 
 function recordCheck(checks, id, ok, message) {
@@ -118,49 +102,23 @@ async function main() {
   const { root: repoRoot, strictRuntime } = parseArgs(process.argv.slice(2));
   const checks = [];
 
-  const composeText = await readTextIfExists(path.join(repoRoot, "compose.yaml"));
-  const envExampleText = await readTextIfExists(
-    path.join(repoRoot, ".env.production.example")
-  );
   const configExampleText = await readTextIfExists(
     path.join(repoRoot, "config.local.json.example")
   );
-  const caddyAllowlistText = await readTextIfExists(
-    path.join(repoRoot, "deploy", "Caddyfile.home.example")
+  const cloudflareExampleText = await readTextIfExists(
+    path.join(repoRoot, "deploy", "cloudflared-config.example.yml")
   );
+  const sparseManifestText = await readTextIfExists(
+    path.join(repoRoot, "deploy", "runtime-sparse-checkout.txt")
+  );
+  const readmeText = await readTextIfExists(path.join(repoRoot, "README.md"));
   const homeDeploymentDocText = await readTextIfExists(
     path.join(repoRoot, "docs", "home-pc-deployment.md")
   );
   const releaseGateDocText = await readTextIfExists(
     path.join(repoRoot, "docs", "security-release-gates.md")
   );
-
-  recordCheck(
-    checks,
-    "compose-host-loopback-default",
-    String(composeText || "").includes('"${HOST_BIND_IP:-127.0.0.1}:${PORT:-3000}:3000"'),
-    "compose.yaml should keep the host-published app port on 127.0.0.1 by default."
-  );
-  recordCheck(
-    checks,
-    "compose-container-bind-default",
-    String(composeText || "").includes('BIND_HOST: "${BIND_HOST:-0.0.0.0}"'),
-    "compose.yaml should keep the container listener reachable from Docker port publishing."
-  );
-
-  const envExample = parseEnv(envExampleText);
-  recordCheck(
-    checks,
-    "env-example-host-bind",
-    isLoopbackHost(envExample.get("HOST_BIND_IP")),
-    ".env.production.example should keep HOST_BIND_IP on loopback."
-  );
-  recordCheck(
-    checks,
-    "env-example-container-bind",
-    isContainerWildcardHost(envExample.get("BIND_HOST")),
-    ".env.production.example should keep BIND_HOST on 0.0.0.0 inside Docker."
-  );
+  const localConfigText = await readTextIfExists(path.join(repoRoot, "config.local.json"));
 
   let configExample = {};
 
@@ -176,72 +134,117 @@ async function main() {
   }
 
   if (Object.keys(configExample).length > 0) {
+    const bindHost = Object.prototype.hasOwnProperty.call(configExample, "BIND_HOST")
+      ? configExample.BIND_HOST
+      : "";
+
     recordCheck(
       checks,
       "config-example-direct-bind",
-      isLoopbackHost(configExample.BIND_HOST),
+      isLoopbackHost(bindHost),
       "config.local.json.example should keep direct Node binds on loopback."
     );
+    recordCheck(
+      checks,
+      "config-example-route-base-path",
+      Object.prototype.hasOwnProperty.call(configExample, "ROUTE_BASE_PATH"),
+      "config.local.json.example should document ROUTE_BASE_PATH for /main and /test routing."
+    );
   }
 
   recordCheck(
     checks,
-    "caddy-allowlist-fallback",
-    /remote_ip/.test(String(caddyAllowlistText || "")),
-    "deploy/Caddyfile.home.example should keep an explicit IP allowlist fallback example."
+    "cloudflare-example-main-route",
+    /path:\s+\^\/main\(\?:\/\.\*\)\?\$/i.test(String(cloudflareExampleText || "")) &&
+      /service:\s+http:\/\/127\.0\.0\.1:3000/i.test(String(cloudflareExampleText || "")),
+    "deploy/cloudflared-config.example.yml should route /main to 127.0.0.1:3000."
   );
   recordCheck(
     checks,
-    "home-deploy-doc-access-layer",
-    /Cloudflare Tunnel plus Cloudflare Access/i.test(String(homeDeploymentDocText || "")),
-    "home deployment docs should keep the Tunnel plus Access recommendation visible."
+    "cloudflare-example-test-route",
+    /path:\s+\^\/test\(\?:\/\.\*\)\?\$/i.test(String(cloudflareExampleText || "")) &&
+      /service:\s+http:\/\/127\.0\.0\.1:3001/i.test(String(cloudflareExampleText || "")),
+    "deploy/cloudflared-config.example.yml should route /test to 127.0.0.1:3001."
   );
   recordCheck(
     checks,
-    "release-gates-doc",
-    /Hard Stops/i.test(String(releaseGateDocText || "")) &&
-      /Cloudflare Access/i.test(String(releaseGateDocText || "")) &&
-      /allowlist/i.test(String(releaseGateDocText || "")),
-    "security-release-gates.md should define access expectations and hard stops."
+    "cloudflare-example-root-route",
+    /path:\s+\^\/\$/i.test(String(cloudflareExampleText || "")) &&
+      /service:\s+http:\/\/127\.0\.0\.1:3000/i.test(String(cloudflareExampleText || "")),
+    "deploy/cloudflared-config.example.yml should route / to 127.0.0.1:3000."
   );
 
-  const productionEnvText = await readTextIfExists(path.join(repoRoot, ".env.production"));
+  recordCheck(
+    checks,
+    "runtime-sparse-core-files",
+    [
+      "/deploy/run-home-site.bat",
+      "/deploy/start-cloudflare-tunnel.ps1",
+      "/deploy/update-home-prod.ps1",
+    ].every((requiredPath) => String(sparseManifestText || "").includes(requiredPath)),
+    "deploy/runtime-sparse-checkout.txt should keep the core Cloudflare runtime files."
+  );
+  recordCheck(
+    checks,
+    "runtime-sparse-security-script",
+    String(sparseManifestText || "").includes("/scripts/verify-deployment-security.mjs"),
+    "deploy/runtime-sparse-checkout.txt should keep verify-deployment-security available."
+  );
 
-  if (productionEnvText === null) {
+  recordCheck(
+    checks,
+    "readme-main-test-flow",
+    /SpaceWork_develop/i.test(String(readmeText || "")) &&
+      /SpaceWork_deploy/i.test(String(readmeText || "")) &&
+      /https:\/\/spaceswork\.net\/test/i.test(String(readmeText || "")) &&
+      /https:\/\/spaceswork\.net\/main/i.test(String(readmeText || "")),
+    "README.md should describe the develop/test and deploy/main split."
+  );
+
+  if (homeDeploymentDocText === null) {
     recordInfo(
       checks,
-      "local-production-env",
-      ".env.production is not present in this workspace, so only example defaults were checked."
+      "home-deploy-doc",
+      "docs/home-pc-deployment.md is not present in this workspace, so only runtime files were checked."
     );
   } else {
-    const productionEnv = parseEnv(productionEnvText);
     recordCheck(
       checks,
-      "local-production-host-bind",
-      isLoopbackHost(productionEnv.get("HOST_BIND_IP")),
-      "The local .env.production file should keep HOST_BIND_IP on loopback for controlled sharing."
-    );
-    recordCheck(
-      checks,
-      "local-production-domain",
-      /^https:\/\//i.test(normalizeScalar(productionEnv.get("VWORLD_API_DOMAIN"))),
-      "The local .env.production file should use an HTTPS VWORLD_API_DOMAIN."
+      "home-deploy-doc-access-layer",
+      /Cloudflare Tunnel/i.test(String(homeDeploymentDocText || "")) &&
+        /\/main/i.test(String(homeDeploymentDocText || "")) &&
+        /\/test/i.test(String(homeDeploymentDocText || "")),
+      "home deployment docs should keep the Cloudflare tunnel and /main /test routing visible."
     );
   }
 
-  const localConfigText = await readTextIfExists(path.join(repoRoot, "config.local.json"));
+  if (releaseGateDocText === null) {
+    recordInfo(
+      checks,
+      "release-gates-doc",
+      "docs/security-release-gates.md is not present in this workspace, so the release gate text was skipped."
+    );
+  } else {
+    recordCheck(
+      checks,
+      "release-gates-doc",
+      /Hard Stops/i.test(String(releaseGateDocText || "")) &&
+        /Cloudflare/i.test(String(releaseGateDocText || "")) &&
+        /\/main/i.test(String(releaseGateDocText || "")) &&
+        /\/test/i.test(String(releaseGateDocText || "")),
+      "security-release-gates.md should define Cloudflare routing expectations and hard stops."
+    );
+  }
 
   if (localConfigText === null) {
     recordInfo(
       checks,
       "local-direct-config",
-      "config.local.json is not present, so direct-node bind checks were skipped."
+      "config.local.json is not present, so local runtime checks were skipped."
     );
   } else {
-    let localConfig = {};
-
     try {
-      localConfig = JSON.parse(normalizeJsonText(localConfigText));
+      const localConfig = JSON.parse(normalizeJsonText(localConfigText));
       const bindHost = Object.prototype.hasOwnProperty.call(localConfig, "BIND_HOST")
         ? localConfig.BIND_HOST
         : "";
@@ -257,20 +260,11 @@ async function main() {
 
       if (strictRuntime) {
         const localConfigDomain = normalizeScalar(localConfig.VWORLD_API_DOMAIN);
+        const publicBaseUrl = normalizeScalar(localConfig.PUBLIC_BASE_URL);
+        const routeBasePath = normalizeScalar(localConfig.ROUTE_BASE_PATH);
         const localContourPath = normalizeScalar(localConfig.TERRAIN_CONTOUR_PATH);
         const localContourExists =
-          localContourPath !== "" &&
-          (await readTextIfExists(localContourPath).catch((error) => {
-            if (error?.code === "EISDIR") {
-              return "__DIRECTORY_EXISTS__";
-            }
-
-            if (error?.code === "ENOENT") {
-              return null;
-            }
-
-            throw error;
-          })) !== null;
+          localContourPath !== "" && (await pathExists(localContourPath, { directoryOnly: true }));
 
         recordCheck(
           checks,
@@ -278,6 +272,19 @@ async function main() {
           /^https:\/\//i.test(localConfigDomain) &&
             !/localhost|127\.0\.0\.1|::1/i.test(localConfigDomain),
           "In strict runtime mode, config.local.json should point VWORLD_API_DOMAIN at the real HTTPS share origin."
+        );
+        recordCheck(
+          checks,
+          "strict-runtime-public-base-url",
+          /^https:\/\//i.test(publicBaseUrl) &&
+            /\/(main|test)\/?$/i.test(publicBaseUrl),
+          "In strict runtime mode, config.local.json should publish an HTTPS PUBLIC_BASE_URL ending in /main or /test."
+        );
+        recordCheck(
+          checks,
+          "strict-runtime-route-base-path",
+          routeBasePath === "" || routeBasePath === "/main" || routeBasePath === "/test",
+          "In strict runtime mode, ROUTE_BASE_PATH should be blank, /main, or /test."
         );
         recordCheck(
           checks,
@@ -320,6 +327,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error("[FAIL] verify-deployment-security:", error);
+  console.error(error);
   process.exitCode = 1;
 });

@@ -28,6 +28,12 @@ if (Test-Path $ProdRoot) {
 Write-Host "Creating production clone at $ProdRoot"
 git clone --branch $Branch $RepoUrl $ProdRoot
 
+$sparseScript = Join-Path $ProdRoot "deploy\configure-runtime-sparse-checkout.ps1"
+if (Test-Path $sparseScript) {
+  Write-Host "Configuring production sparse checkout"
+  powershell -ExecutionPolicy Bypass -File $sparseScript -RepoRoot $ProdRoot
+}
+
 $configExample = Join-Path $ProdRoot "config.local.json.example"
 $configTarget = Join-Path $ProdRoot "config.local.json"
 
@@ -44,5 +50,5 @@ Write-Host "Next steps:"
 Write-Host "1. Edit $configTarget"
 Write-Host "2. Run: cd $ProdRoot"
 Write-Host "3. Run: npm.cmd install"
-Write-Host "4. Run: deploy\\run-home-prod-server.bat"
-Write-Host "   Or run: deploy\\run-home-site.bat <tunnel-name>"
+Write-Host "4. Run: deploy\\run-home-site.bat <tunnel-name>"
+Write-Host "   Or run: deploy\\run-home-prod-server.bat"

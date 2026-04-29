@@ -1,197 +1,101 @@
 # Deployment Runbook
 
-## Quick Order
+## Final Shape
 
-Use this exact sequence right before release:
+This project now uses one home PC and one Cloudflare hostname with two paths.
 
-1. Copy `.env.production.example` to `.env.production` and fill in real keys.
-2. Keep `HOST_BIND_IP=127.0.0.1` unless you intentionally expose the app behind a trusted reverse proxy or access layer.
-3. Confirm `VWORLD_API_DOMAIN` is valid for the registered VWorld origin, set `PUBLIC_BASE_URL` when the real public HTTPS origin is different, keep `PUBLIC_ENABLED_FEATURES` limited to released pages, and keep `ADS_TXT_LINES` ready before AdSense site submission.
-4. Copy the contour dataset to the server and set `TERRAIN_CONTOUR_HOST_PATH`, `TERRAIN_CONTOUR_PATH`, and `TERRAIN_CONTOUR_CRS`.
-5. If you need server-side `.skp`, provide a real standalone exporter binary and set `SKP_EXPORTER_CLI`. Otherwise leave it blank and use OBJ/3DM or `skp-payload`.
-6. Run `npm run verify:deployment-security`.
-7. Build and start the container with `docker compose --env-file .env.production up -d --build`.
-8. Verify `GET /api/health` and `GET /api/config`.
-9. Run `npm run verify:release -- --base-url http://127.0.0.1:3000`.
-   If you also want the real share origin checked, add `--public-base-url https://your-domain.example`.
-   The bundle writes a timestamped JSON report plus `latest.json` into `logs/verify-release`.
-   With `--public-base-url`, the bundle now also verifies that the public origin keeps `/api/health` reachable while `/api/runtime-stats` stays blocked with `403`.
-10. Keep the previous image tag and one known-good parcel for rollback.
+- test: `https://spaceswork.net/test`
+- production: `https://spaceswork.net/main`
 
-## Recommended Shape
+Folder split:
 
-This app should run as a long-lived Node server, not as a static-only host and not as a serverless function.
+- `C:\SpaceWork_develop`
+  Full working copy for feature work, Git commits, and the test route.
+- `C:\SpaceWork_deploy`
+  Runtime-focused working copy for the production route.
 
-Recommended target:
+## Release Order
 
-- Linux VM or VPS
-- Docker-capable host
-- Cloudflare Tunnel plus Cloudflare Access as the default controlled access path
-- Reverse proxy with HTTPS
-- Mounted contour dataset directory
+Use this exact sequence for each release:
 
-## Why
+1. Edit and test in `C:\SpaceWork_develop`
+2. Run `deploy\run-test-site.bat`
+3. Confirm the selected version at `http://127.0.0.1:3001/test`
+4. If Cloudflare test routing is active, confirm the same build at `https://spaceswork.net/test`
+5. Commit and push the selected version from `C:\SpaceWork_develop`
+6. Move to `C:\SpaceWork_deploy`
+7. Run `powershell -ExecutionPolicy Bypass -File deploy\update-home-prod.ps1`
+8. Confirm the production build at `http://127.0.0.1:3000/main`
+9. Confirm the public production build at `https://spaceswork.net/main`
 
-The app depends on:
+## Required Local Inputs
 
-- long-running Node HTTP requests for `/api/site-context` and `/api/export-model`
-- local contour dataset access through `TERRAIN_CONTOUR_PATH`
-- binary downloads for OBJ and 3DM exports
-- external API keys that should stay server-side
+Keep these ready before release:
 
-## Step 1. Prepare Production Inputs
+- `config.local.json` in both folders
+- the contour dataset directory referenced by `TERRAIN_CONTOUR_PATH`
+- `C:\Users\wjdek\.cloudflared\config.yml`
+- `deploy/cloudflared-config.example.yml` as the routing reference
 
-You need:
+Recommended local settings:
 
-- production domain
-- server or VPS with Docker
-- contour dataset directory copied to the server
-- production environment variables
+- `C:\SpaceWork_develop\config.local.json`
+  - `PORT`: `3001`
+  - `PUBLIC_BASE_URL`: `https://spaceswork.net/test`
+- `C:\SpaceWork_deploy\config.local.json`
+  - `PORT`: `3000`
+  - `PUBLIC_BASE_URL`: `https://spaceswork.net/main`
 
-Required environment variables:
+`ROUTE_BASE_PATH` can stay out of `config.local.json` because the wrapper scripts already set it:
 
-- `PORT`
-- `HOST_BIND_IP` for Docker host port publishing, default `127.0.0.1`
-- `BIND_HOST` for the Node listener inside the container, default `0.0.0.0`
-- `VWORLD_API_KEY`
-- `VWORLD_API_DOMAIN`
-- `JUSO_CONFIRM_KEY`
-- `BUILDING_HUB_SERVICE_KEY`
-- `LAW_API_OC`
-- `TERRAIN_CONTOUR_PATH`
-- `TERRAIN_CONTOUR_CRS`
-- `USE_NOMINATIM_FALLBACK`
+- `deploy\run-test-site.bat` sets `/test`
+- `deploy\run-home-site.bat` and `deploy\run-home-prod-server.bat` set `/main`
 
-Optional, only if you want server-side `.skp` export:
+## Cloudflare Routing
 
-- `SKP_EXPORT_ENGINE`
-- `SKP_EXPORTER_CLI`
+Cloudflare Tunnel should route:
 
-You can start from:
+- `/test` to `http://127.0.0.1:3001`
+- `/main` to `http://127.0.0.1:3000`
+- `/` to `http://127.0.0.1:3000`
 
-- `.env.production.example`
-- `compose.yaml`
-- `deploy/Caddyfile.example`
-- `docs/security-release-gates.md`
+Keep router port forwarding closed unless you intentionally choose a different access model.
 
-Note:
+## Verification
 
-- `HOST_BIND_IP=127.0.0.1` keeps the published container port private to the local machine by default.
-- `BIND_HOST=0.0.0.0` is the safe container default because Docker port publishing will not reach a process bound only to container loopback.
-- `SKP_EXPORTER_CLI` should stay empty unless the deployment image or host actually provides a standalone exporter binary.
-- If `.skp` is not wired yet, keep OBJ/3DM enabled and use `skp-payload` for downstream conversion.
-
-## Step 2. Copy the Contour Dataset
-
-Copy the contour dataset to a stable directory on the server, for example:
-
-```bash
-/opt/space-work/data/contours
-```
-
-Set:
-
-```bash
-TERRAIN_CONTOUR_PATH=/opt/space-work/data/contours
-TERRAIN_CONTOUR_CRS=EPSG:5179
-```
-
-## Step 3. Build the Container
-
-```bash
-docker build -t space-work:latest .
-```
-
-Or with Compose:
-
-```bash
-cp .env.production.example .env.production
-# edit .env.production
-docker compose --env-file .env.production up -d --build
-```
-
-## Step 4. Run the Container
-
-Example:
-
-```bash
-docker run -d \
-  --name space-work \
-  -p 3000:3000 \
-  -e PORT=3000 \
-  -e VWORLD_API_KEY=... \
-  -e VWORLD_API_DOMAIN=https://your-domain.example \
-  -e JUSO_CONFIRM_KEY=... \
-  -e BUILDING_HUB_SERVICE_KEY=... \
-  -e LAW_API_OC=... \
-  -e TERRAIN_CONTOUR_PATH=/app/data/contours \
-  -e TERRAIN_CONTOUR_CRS=EPSG:5179 \
-  -e USE_NOMINATIM_FALLBACK=true \
-  -v /opt/space-work/data/contours:/app/data/contours:ro \
-  --restart unless-stopped \
-  space-work:latest
-```
-
-## Step 5. Reverse Proxy
-
-Put Nginx or Caddy in front of the app and proxy to:
-
-```text
-http://127.0.0.1:3000
-```
-
-Important proxy settings:
-
-- allow larger response bodies for OBJ and 3DM downloads
-- increase upstream read timeout for long exports
-- enable HTTPS
-
-If you use Caddy, start from:
-
-```text
-deploy/Caddyfile.example
-```
-
-## Step 6. Verify Health
-
-Check:
-
-- `GET /api/health`
-- `GET /api/config`
-- `POST /api/site-context`
-- `POST /api/export-model` for OBJ
-- `POST /api/export-model` for 3DM
-- `node scripts/verify-live-site-context.mjs --base-url http://127.0.0.1:3000`
-- `npm run verify:deployment-security`
-- `npm run verify:baseline`
-
-If you are validating a separate production clone from the development workspace, you can also run:
+Run these in `C:\SpaceWork_develop` before promoting a build:
 
 ```powershell
-node scripts/verify-deployment-security.mjs --root C:\SpaceWork_deploy
+npm.cmd run verify:baseline
+npm.cmd run verify:deployment-security
 ```
 
-For the actual share target, add strict runtime checks too:
+Run the production update from `C:\SpaceWork_deploy`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\update-home-prod.ps1
+```
+
+That script now:
+
+1. pulls the selected Git branch
+2. reapplies the runtime sparse checkout
+3. refreshes dependencies
+4. restarts the production server on `/main`
+5. runs release verification against `http://127.0.0.1:3000/main`
+
+If you want a stricter runtime-only check on the production clone, run:
 
 ```powershell
 node scripts/verify-deployment-security.mjs --root C:\SpaceWork_deploy --strict-runtime
 ```
 
-## Step 7. Final QA
+## Rollback
 
-Run these before public release:
+If production fails after release:
 
-- one dense terrain site
-- one flat site
-- one site with many buildings
-- one site with no buildings
-- Rhino 6 open test for 3DM
-- browser test for range preview, OBJ, and 3DM download
+1. reset the deploy clone to the previous known-good Git commit
+2. rerun `powershell -ExecutionPolicy Bypass -File deploy\update-home-prod.ps1`
+3. recheck `https://spaceswork.net/main`
 
-## Step 8. Rollback Plan
-
-Keep:
-
-- the previous container image tag
-- the previous contour dataset snapshot
-- one known-good test location and expected outputs
+Keep one known-good parcel test case and its expected results so rollback validation stays fast.

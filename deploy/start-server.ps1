@@ -63,12 +63,32 @@ function Stop-MatchingProcesses {
   }
 }
 
+function Normalize-ProcessEnvironmentPath {
+  $resolvedPath = [string]$env:Path
+
+  if (-not $resolvedPath -and $env:PATH) {
+    $resolvedPath = [string]$env:PATH
+  }
+
+  Remove-Item Env:PATH -ErrorAction SilentlyContinue
+
+  if ($resolvedPath) {
+    $env:Path = $resolvedPath
+  }
+}
+
 function Get-ServerPort {
   param(
     [string]$RepoRoot
   )
 
   $defaultPort = 3000
+  $envPort = [int]0
+
+  if ([int]::TryParse([string]$env:PORT, [ref]$envPort) -and $envPort -gt 0) {
+    return $envPort
+  }
+
   $configPath = Join-Path $RepoRoot "config.local.json"
 
   if (-not (Test-Path $configPath)) {
@@ -165,6 +185,7 @@ Stop-MatchingProcesses -ProcessName "powershell.exe" -Patterns @($repoRoot, "dep
 Stop-MatchingProcesses -ProcessName "cmd.exe" -Patterns @($repoRoot, "deploy\start-server.ps1")
 
 $nodeCommand = Get-Command node -ErrorAction Stop
+Normalize-ProcessEnvironmentPath
 $serverProcess = Start-Process `
   -FilePath $nodeCommand.Source `
   -ArgumentList "server.mjs" `

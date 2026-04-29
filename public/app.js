@@ -1,5 +1,16 @@
 ﻿const HISTORY_STORAGE_KEY = "site-context-history-v1";
 
+const ROUTE_BASE_PATH = (() => {
+  const rawValue = String(document.documentElement?.dataset?.routeBasePath || "").trim();
+
+  if (!rawValue || rawValue === "/") {
+    return "";
+  }
+
+  const normalized = rawValue.startsWith("/") ? rawValue : `/${rawValue}`;
+  return normalized.endsWith("/") ? normalized.slice(0, -1) : normalized;
+})();
+
 const state = {
   activeSelectionKey: "",
   buildingRegister: null,
@@ -181,6 +192,37 @@ const REQUEST_UI_PHASE_MESSAGES = Object.freeze({
       "건축물 정보 응답이 길어지고 있지만 계속 조회하고 있습니다.",
   },
 });
+
+function buildAppUrl(endpoint = "/") {
+  const rawValue = String(endpoint || "").trim();
+
+  if (!rawValue) {
+    return ROUTE_BASE_PATH ? `${ROUTE_BASE_PATH}/` : "/";
+  }
+
+  if (/^[a-z][a-z0-9+.-]*:/iu.test(rawValue) || rawValue.startsWith("//")) {
+    return rawValue;
+  }
+
+  const normalized = rawValue.startsWith("/") ? rawValue : `/${rawValue}`;
+
+  if (!ROUTE_BASE_PATH) {
+    return normalized;
+  }
+
+  if (
+    normalized === ROUTE_BASE_PATH ||
+    normalized.startsWith(`${ROUTE_BASE_PATH}/`)
+  ) {
+    return normalized;
+  }
+
+  return normalized === "/" ? `${ROUTE_BASE_PATH}/` : `${ROUTE_BASE_PATH}${normalized}`;
+}
+
+function fetchApp(endpoint, init) {
+  return fetch(buildAppUrl(endpoint), init);
+}
 
 function updateCardHeading(card, kicker, title) {
   if (!card) {
@@ -859,8 +901,10 @@ function describeRequestFailure(error, endpoint, fallbackMessage) {
 }
 
 async function fetchWithDiagnostics(endpoint, init, fallbackMessage) {
+  const requestUrl = buildAppUrl(endpoint);
+
   try {
-    const response = await fetch(endpoint, init);
+    const response = await fetch(requestUrl, init);
 
     if (!response.ok) {
       throw new Error(
@@ -870,8 +914,8 @@ async function fetchWithDiagnostics(endpoint, init, fallbackMessage) {
 
     return response;
   } catch (error) {
-    console.error(`[request] ${endpoint} failed`, error);
-    throw new Error(describeRequestFailure(error, endpoint, fallbackMessage));
+    console.error(`[request] ${requestUrl} failed`, error);
+    throw new Error(describeRequestFailure(error, requestUrl, fallbackMessage));
   }
 }
 
@@ -905,7 +949,7 @@ async function pollModelProgressOnce(token, rangeStart = 0, rangeEnd = 100) {
   }
 
   try {
-    const response = await fetch(
+    const response = await fetchApp(
       `/api/request-progress?token=${encodeURIComponent(token)}`,
       {
         headers: {
@@ -3342,7 +3386,7 @@ function renderSearchResults(items, providerLabel) {
 }
 
 async function loadRuntimeConfig() {
-  const response = await fetch("/api/config");
+  const response = await fetchApp("/api/config");
   state.runtimeConfig = await response.json();
   setProviderBadge();
 }
@@ -3369,7 +3413,7 @@ function shouldPrefetchSearchQuery(query) {
 }
 
 async function fetchGeocodePayload(query) {
-  const response = await fetch(`/api/geocode?q=${encodeURIComponent(query)}`);
+  const response = await fetchApp(`/api/geocode?q=${encodeURIComponent(query)}`);
   const payload = await response.json();
 
   if (!response.ok) {
@@ -3530,7 +3574,7 @@ function hasActiveMapSelectionState() {
 }
 
 async function reverseGeocode(lat, lng) {
-  const response = await fetch(
+  const response = await fetchApp(
     `/api/reverse-geocode?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}`
   );
   const payload = await response.json();
@@ -4135,7 +4179,7 @@ async function loadBuildingRegisterCore(
   let requestPayload = buildParcelLookupRequestPayload(location);
 
   try {
-    let response = await fetch("/api/building-register", {
+    let response = await fetchApp("/api/building-register", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -4148,7 +4192,7 @@ async function loadBuildingRegisterCore(
       await loadSiteContext(selectionKey);
       requestPayload = buildParcelLookupRequestPayload(state.selectedLocation);
 
-      response = await fetch("/api/building-register", {
+      response = await fetchApp("/api/building-register", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -4287,7 +4331,7 @@ async function loadLandInfo(
 
   try {
     let requestPayload = buildParcelLookupRequestPayload(location);
-    let response = await fetch("/api/land-info", {
+    let response = await fetchApp("/api/land-info", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -4300,7 +4344,7 @@ async function loadLandInfo(
       await loadSiteContext(selectionKey);
       requestPayload = buildParcelLookupRequestPayload(state.selectedLocation);
 
-      response = await fetch("/api/land-info", {
+      response = await fetchApp("/api/land-info", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -4386,7 +4430,7 @@ async function loadLandInfoDetails(
 
   try {
     const requestPayload = buildParcelLookupRequestPayload(location, fallbackPnu);
-    const response = await fetch("/api/land-info-details", {
+    const response = await fetchApp("/api/land-info-details", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -4451,7 +4495,7 @@ function buildLandInfoHandoffUrl(landInfo) {
     p_location: landInfo?.address || "",
   });
 
-  return `/handoff/eum?${params.toString()}`;
+  return buildAppUrl(`/handoff/eum?${params.toString()}`);
 }
 
 function showPopupBlockedMessage() {
@@ -4484,7 +4528,7 @@ function renderStandaloneWindow(targetWindow, title, bodyHtml, options = {}) {
   }
 
   const bodyClass = String(options?.bodyClass || "popup-shell").trim();
-  const stylesheetHref = `/popup.css?v=20260326-security2`;
+  const stylesheetHref = buildAppUrl("/popup.css?v=20260326-security2");
 
   targetWindow.document.write(`
     <!doctype html>
@@ -6013,7 +6057,7 @@ function applyUiVerificationModelOptionOverrides(options = {}) {
 }
 
 async function resolveUiTestSearchLocation(query) {
-  const response = await fetch(
+  const response = await fetchApp(
     `/api/geocode?q=${encodeURIComponent(String(query || "").trim())}`
   );
   const payload = await response.json().catch(() => ({}));
