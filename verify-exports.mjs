@@ -3602,6 +3602,27 @@ async function runBaselineVerification() {
       buildExportArtifactCacheKey(maliciousPayloadSiteContext, "skp-payload"),
       "Export cache keys should change when geometry changes even if request counts stay the same."
     );
+    const ignoredClientContourLines = {
+      type: "FeatureCollection",
+      features: [
+        {
+          type: "Feature",
+          properties: {
+            elevation: 999,
+          },
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [serverOwnedSiteContext.location.lng, serverOwnedSiteContext.location.lat],
+              [
+                Number(serverOwnedSiteContext.location.lng) + 0.00001,
+                Number(serverOwnedSiteContext.location.lat) + 0.00001,
+              ],
+            ],
+          },
+        },
+      ],
+    };
     const legacyOnlyExportResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
       method: "POST",
       headers: {
@@ -3614,7 +3635,7 @@ async function runBaselineVerification() {
             ...serverOwnedSiteContext.options,
             exportFormat: "skp-payload",
           },
-          contourLines: maliciousSiteContext.contourLines,
+          contourLines: ignoredClientContourLines,
         },
       }),
     });
@@ -3651,7 +3672,7 @@ async function runBaselineVerification() {
         ...serverOwnedSiteContext.options,
         exportFormat: "skp-payload",
       },
-      contourLines: maliciousSiteContext.contourLines,
+      contourLines: ignoredClientContourLines,
     };
     const maliciousExportResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
       method: "POST",
