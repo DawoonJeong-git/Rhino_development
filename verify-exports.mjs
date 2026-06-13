@@ -3608,7 +3608,14 @@ async function runBaselineVerification() {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        siteContext: serverOwnedSiteContext,
+        siteContext: {
+          location: serverOwnedSiteContext.location,
+          options: {
+            ...serverOwnedSiteContext.options,
+            exportFormat: "skp-payload",
+          },
+          contourLines: maliciousSiteContext.contourLines,
+        },
       }),
     });
     const legacyOnlyExportPayload = await readJson(legacyOnlyExportResponse);
@@ -3638,6 +3645,14 @@ async function runBaselineVerification() {
         exportFormat: "skp-payload",
       },
     };
+    const clientSuppliedBogusSiteContext = {
+      location: serverOwnedSiteContext.location,
+      options: {
+        ...serverOwnedSiteContext.options,
+        exportFormat: "skp-payload",
+      },
+      contourLines: maliciousSiteContext.contourLines,
+    };
     const maliciousExportResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
       method: "POST",
       headers: {
@@ -3645,7 +3660,7 @@ async function runBaselineVerification() {
       },
       body: JSON.stringify({
         location: serverOwnedSiteContext.location,
-        siteContext: maliciousSiteContext,
+        siteContext: clientSuppliedBogusSiteContext,
         options: {
           ...serverOwnedSiteContext.options,
           exportFormat: "skp-payload",
