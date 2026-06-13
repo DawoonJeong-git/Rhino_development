@@ -101,16 +101,16 @@ Last updated: 2026-06-14
   - Added smooth boundary-contour regression coverage to `verify:contour-defaults`; the Muak-dong 82 native `5m` case now samples boundary-touching contour points and fails if the smooth height model drifts from the raw contour elevation.
   - Final pre-release terrain gate passed on 2026-06-14: `verify:predeploy-terrain` passes for stepped 3DM/SKP and smooth 3DM/SKP, smooth boundary alignment checks `53` samples with `0` mismatches and max delta `0.479m`, and smooth SKP remains a closed terrain mass.
   - Updated the UI smoke verification to match the current supported export formats after DXF/OBJ removal; `/test` UI smoke now downloads a 3DM model successfully from the live form flow.
+  - Promoted the stabilized contour terrain release to production on commit `033c5d1`: `C:\SpaceWork_develop` and `C:\SpaceWork_deploy` both point at the same commit, `https://spaceswork.net/main/contour3dmodel` and `/test/contour3dmodel` return 200, and the production release report passed baseline, live site-context, local UI smoke, public security smoke, and public UI smoke.
+  - Set release verification to use UI smoke by default; the extended multi-parcel/SKP UI suite remains available as an explicit long-running QA check instead of a production deployment blocker.
 - `In Progress`
+  - Post-release QA on representative real parcels and large-range downloads
   - Turning live-case placement diagnostics into stricter export-side failures where upstream data is actually available
-  - Validating native `5m` smooth and stepped 3DM output on real upstream-fed parcels
-  - Validating full large-range SKP binary exports with buildings and roads after the payload route is stable
-  - Moving smooth 3DM volume from mesh side/bottom helper geometry toward Rhino-native Brep/surface adapter output
 - `Next`
+  - Run explicit extended UI QA for the large multi-parcel/SKP scenario when time is available
+  - Resume the `1m` generated contour problem after the native `5m` release has settled
   - Validate buildings and roads against the final terrain basis, not parallel fallback logic
   - Add explicit export-side checks for building/road terrain-base mismatches
-  - Keep reducing band-boundary mismatch noise so the diagnostics point only at real geometry errors
-  - Add full regression coverage for smooth contour terrain exports after the baseline route-prefix conflict is cleaned up
   - Add automated SKP payload/export regression coverage for smooth terrain face smoothing and smooth road/building Z alignment
 
 ## Current Focus

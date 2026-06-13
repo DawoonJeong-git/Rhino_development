@@ -152,7 +152,14 @@ This script now does the following:
 3. reapply the runtime sparse checkout when configured
 4. `npm.cmd install`
 5. restart the managed production server on `/main`
-6. run verification against `http://127.0.0.1:3000/main`
+6. run smoke release verification against `http://127.0.0.1:3000/main`
+
+The heavier extended UI suite is intentionally separate from the production
+release gate:
+
+```powershell
+npm.cmd run verify:ui:extended -- --base-url http://127.0.0.1:3001/test
+```
 
 ## Notes
 

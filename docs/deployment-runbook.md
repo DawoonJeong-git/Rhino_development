@@ -91,6 +91,14 @@ That script now:
 4. restarts the production server on `/main`
 5. runs release verification against `http://127.0.0.1:3000/main`
 
+The default release UI gate is the smoke suite. The extended UI suite includes
+larger multi-parcel/SKP flows and should be run explicitly as a long-running QA
+check when needed:
+
+```powershell
+npm.cmd run verify:ui:extended -- --base-url http://127.0.0.1:3001/test
+```
+
 If you want a stricter runtime-only check on the production clone, run:
 
 ```powershell
