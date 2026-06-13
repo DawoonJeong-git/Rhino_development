@@ -350,6 +350,19 @@ async function readJson(response) {
   return response.json().catch(() => ({}));
 }
 
+async function fetchWithRetry(url, options = {}, retryCount = 0) {
+  try {
+    return await fetch(url, options);
+  } catch (error) {
+    if (retryCount < 2 && isRetriableFetchError(error)) {
+      await delay(500 * (retryCount + 1));
+      return fetchWithRetry(url, options, retryCount + 1);
+    }
+
+    throw error;
+  }
+}
+
 async function fetchJson(pathname, payload = null, retryCount = 0) {
   try {
     const response = await fetch(`${BASE_URL}${pathname}`, {
@@ -3623,7 +3636,7 @@ async function runBaselineVerification() {
         },
       ],
     };
-    const legacyOnlyExportResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
+    const legacyOnlyExportResponse = await fetchWithRetry(`${baseUrl}/api/export-skp-payload`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -3674,7 +3687,7 @@ async function runBaselineVerification() {
       },
       contourLines: ignoredClientContourLines,
     };
-    const maliciousExportResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
+    const maliciousExportResponse = await fetchWithRetry(`${baseUrl}/api/export-skp-payload`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -3694,7 +3707,7 @@ async function runBaselineVerification() {
       200,
       "Export payload request with a fake client siteContext should still respond."
     );
-    const topLevelBoundsResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
+    const topLevelBoundsResponse = await fetchWithRetry(`${baseUrl}/api/export-skp-payload`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -3714,7 +3727,7 @@ async function runBaselineVerification() {
       200,
       "Export payload request should ignore unsupported top-level geometry keys."
     );
-    const exportWithoutSiteContextResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
+    const exportWithoutSiteContextResponse = await fetchWithRetry(`${baseUrl}/api/export-skp-payload`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -3748,7 +3761,7 @@ async function runBaselineVerification() {
       "Export payload generation should ignore unsupported top-level geometry fields and use only location/options."
     );
 
-    const firstExportCacheResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
+    const firstExportCacheResponse = await fetchWithRetry(`${baseUrl}/api/export-skp-payload`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -3770,7 +3783,7 @@ async function runBaselineVerification() {
       "First export payload response should include groups."
     );
 
-    const secondExportCacheResponse = await fetch(`${baseUrl}/api/export-skp-payload`, {
+    const secondExportCacheResponse = await fetchWithRetry(`${baseUrl}/api/export-skp-payload`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
