@@ -1066,8 +1066,10 @@ async function runBaselineVerification() {
   const baseUrl = `http://127.0.0.1:${BASELINE_PORT}`;
   const previousPort = process.env.PORT;
   const previousBindHost = process.env.BIND_HOST;
+  const previousRouteBasePath = process.env.ROUTE_BASE_PATH;
   process.env.PORT = String(BASELINE_PORT);
   process.env.BIND_HOST = "127.0.0.1";
+  process.env.ROUTE_BASE_PATH = " ";
   const app = await createApp();
   const server = app?.server;
   const multiParcelSelection = [
@@ -4048,6 +4050,12 @@ async function runBaselineVerification() {
       process.env.BIND_HOST = previousBindHost;
     } else {
       delete process.env.BIND_HOST;
+    }
+
+    if (typeof previousRouteBasePath === "string") {
+      process.env.ROUTE_BASE_PATH = previousRouteBasePath;
+    } else {
+      delete process.env.ROUTE_BASE_PATH;
     }
 
     if (server?.listening) {
