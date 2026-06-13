@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>대지·건물 3D 검토</title>
     <link rel="stylesheet" href="/vendor/leaflet/leaflet.css?v=20260326-security4" />
-    <link rel="stylesheet" href="/styles.css?v=20260331-rose3" />
+    <link rel="stylesheet" href="/styles.css?v=20260610-model-output-card1" />
   </head>
   <body>
     <div class="app-shell">
@@ -35,7 +35,7 @@
           <article class="topbar-highlight">
             <p class="topbar-highlight-label">출력</p>
             <strong>미리보기와 파일 출력</strong>
-            <p>검토 결과를 확인한 뒤 3DM, OBJ, DXF, SKP로 이어갑니다.</p>
+            <p>검토 결과를 확인한 뒤 3DM 또는 SKP로 이어갑니다.</p>
           </article>
         </div>
       </header>
@@ -187,18 +187,29 @@
                 <p class="card-kicker">토지 · 규제</p>
                 <h2>토지 정보</h2>
               </div>
-              <div class="button-row compact-row">
-                <button class="secondary-button" id="loadLandInfoButton" type="button">
-                  토지 정보
+              <div class="button-row compact-row info-action-row">
+                <button
+                  class="secondary-button info-action-button"
+                  data-action-role="화면 표시"
+                  id="loadLandInfoButton"
+                  type="button"
+                >
+                  요약 조회
                 </button>
                 <button
-                  class="secondary-button"
+                  class="secondary-button info-action-button"
+                  data-action-role="팝업"
                   id="showLandInfoDetailsButton"
                   type="button"
                 >
-                  규제 상세
+                  상세 보기
                 </button>
-                <button class="secondary-button" id="openLandUseDetailButton" type="button">
+                <button
+                  class="secondary-button info-action-button"
+                  data-action-role="외부 연결"
+                  id="openLandUseDetailButton"
+                  type="button"
+                >
                   토지이음
                 </button>
               </div>
@@ -252,23 +263,26 @@
                 <p class="card-kicker">건축물</p>
                 <h2>건축물 정보</h2>
               </div>
-              <div class="button-row compact-row">
+              <div class="button-row compact-row info-action-row">
                 <button
-                  class="secondary-button"
+                  class="secondary-button info-action-button"
+                  data-action-role="화면 표시"
                   id="loadBuildingRegisterButton"
                   type="button"
                 >
-                  건축물 정보
+                  요약 조회
                 </button>
                 <button
-                  class="secondary-button"
+                  class="secondary-button info-action-button"
+                  data-action-role="팝업"
                   id="showBuildingRegisterDetailsButton"
                   type="button"
                 >
-                  대장 상세
+                  상세 보기
                 </button>
                 <button
-                  class="secondary-button"
+                  class="secondary-button info-action-button"
+                  data-action-role="외부 연결"
                   id="openOfficialBuildingRegisterButton"
                   type="button"
                 >
@@ -309,8 +323,8 @@
           <article class="card model-card model-card-featured">
             <div class="card-header">
               <div>
-                <p class="card-kicker">파일 출력</p>
-                <h2>3D / CAD 파일</h2>
+                <p class="card-kicker">대지 모형</p>
+                <h2>모델 / 파일 출력</h2>
               </div>
             </div>
             <form id="modelForm" class="model-form">
@@ -319,13 +333,13 @@
                 <input type="number" name="radius" min="20" step="10" value="100" />
               </label>
 
-              <label>
-                등고 간격 (m)
-                <select name="contourInterval">
-                  <option value="0.1">0.1</option>
-                  <option value="0.5">0.5</option>
-                  <option value="1" selected>1</option>
-                  <option value="5">5</option>
+              <label class="model-select-card" data-model-option="terrainSurfaceMode">
+                <span class="model-option-copy">
+                  <span class="model-option-title">대지 방식</span>
+                </span>
+                <select name="terrainSurfaceMode">
+                  <option value="stepped">계단형</option>
+                  <option value="smooth" selected>연속형</option>
                 </select>
               </label>
 
@@ -336,9 +350,14 @@
                 <label class="checkbox">
                   대지 경계
                 </label>
-                <label class="checkbox" data-model-option="splitParcelBoundary">
-                  <input type="checkbox" name="splitParcelBoundary" />
-                  <span class="checkbox-label">필지 그룹 분리</span>
+                <label class="model-select-card" data-model-option="splitParcelBoundary">
+                  <span class="model-option-copy">
+                    <span class="model-option-title">필지 처리</span>
+                  </span>
+                  <select name="splitParcelBoundary">
+                    <option value="merge" selected>병합</option>
+                    <option value="split">분리</option>
+                  </select>
                 </label>
                 <label class="checkbox">
                   등고선
@@ -353,14 +372,14 @@
                   <div class="model-progress-fill" id="modelProgressFill"></div>
                 </div>
                 <p class="model-progress-label" id="modelProgressLabel">
-                  범위와 포함 항목은 미리보기 후 여기에서 먼저 확인할 수 있습니다.
+                  미리보기 대기
                 </p>
               </div>
 
               <div class="button-row">
                 <button type="button" id="previewSiteContextButton">모델 미리보기</button>
                 <button type="button" class="secondary-button" id="downloadObjButton">
-                  OBJ 파일 다운로드
+                  파일 다운로드
                 </button>
                 <button type="button" class="secondary-button" id="download3dmButton">
                   3DM 파일 다운로드
@@ -385,6 +404,6 @@
     <div id="actionFeedback" class="visually-hidden" aria-hidden="true"></div>
 
     <script src="/vendor/leaflet/leaflet.js?v=20260326-security4"></script>
-    <script type="module" src="/app.js?v=20260331-copyblue2"></script>
+    <script type="module" src="/app.js?v=20260610-export-format-trim1"></script>
   </body>
 </html>

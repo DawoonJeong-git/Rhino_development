@@ -828,7 +828,10 @@ function summarizeComparison(sourceContours, threeDm, skpPayloadSummary) {
       return summary;
     }, {});
   };
-  const threeDmContourLayer = summarizeLayersByPrefix(threeDm.layers, "contours") || null;
+  const threeDmContourLayer =
+    summarizeLayersByPrefix(threeDm.layers, "CURVE_CONTOUR") ||
+    summarizeLayersByPrefix(threeDm.layers, "contours") ||
+    null;
   const skpContourLayer =
     summarizeLayersByPrefix(skpPayloadSummary.layers, "contours") || null;
   const skpTerrainLayer = skpPayloadSummary.layers?.terrain || null;

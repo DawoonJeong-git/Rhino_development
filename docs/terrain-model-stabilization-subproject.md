@@ -84,6 +84,10 @@ This subproject covers four issues:
 2. Any SKP terrain change must prove that it does not change 3DM contour count, curve heights, or terrain band behavior unexpectedly.
 3. Any road change must preserve raw source evidence and derived result evidence side by side.
 4. Preview fixes must be isolated from export-geometry fixes whenever possible.
+5. The shared terrain core may be mesh/heightfield based, but final export geometry must be format-native:
+   - `3dm` should prefer Rhino surfaces, Breps, and closed polysurfaces.
+   - `skp` should use closed softened face/edge meshes.
+   - SKP limitations must not force 3DM to downgrade from Rhino-native geometry.
 
 ## Problem statements and hypotheses
 

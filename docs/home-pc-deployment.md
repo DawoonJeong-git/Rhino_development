@@ -127,7 +127,7 @@ Daily buttons:
 - `CLICK_3_GIT_PULL_DEPLOY.bat`
   - pulls into the deploy folder, restarts production, and verifies it
 
-The managed `run-home-*` helpers replace the previous process and keep logs in `C:\SpaceWork_deploy\logs`.
+The managed PowerShell start helpers keep logs in `C:\SpaceWork_deploy\logs`.
 
 ## Network Rules
 

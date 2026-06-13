@@ -71,7 +71,28 @@ This cannot remain hidden inside export-time heuristics.
 
 They should receive a shared terrain core result and only translate it into their own geometry model.
 
-### 5. Diagnostics are part of the architecture
+### 5. Mesh-based core, native-format outputs
+
+The shared terrain engine should be mesh/heightfield based:
+
+- canonical height sampler
+- sampled terrain grid
+- triangulated or quad terrain support for diagnostics
+- building and road Z lookup
+- SKP/OBJ payload generation
+
+That mesh-like core is the system contract, not necessarily the final geometry type.
+
+Each export adapter then translates the same terrain core into the strongest native geometry for that format:
+
+- `3dm`: Rhino-native surfaces, Breps, and closed polysurfaces whenever the available API can construct them reliably.
+- `skp`: closed softened face/edge mesh, because SketchUp is face/edge based.
+- `obj`: explicit mesh.
+- `dxf`: reference curves and 2D CAD evidence.
+
+Do not lower 3DM output quality to match SKP. Do not force SKP to imitate Rhino Breps. The formats should agree on terrain height and footprint, not on internal object type.
+
+### 6. Diagnostics are part of the architecture
 
 If we cannot answer where a contour level disappears, the architecture is incomplete.
 

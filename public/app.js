@@ -145,6 +145,8 @@ const landInfoCard = landInfoMeta?.closest(".card");
 const buildingRegisterCard = buildingRegisterMeta?.closest(".card");
 const modelCard = modelForm?.closest(".card");
 const MIN_CONTOUR_INTERVAL_METERS = 0.1;
+const DEFAULT_CONTOUR_INTERVAL_METERS = 5;
+const DEFAULT_TERRAIN_SURFACE_MODE = "smooth";
 const DEFAULT_SELECTION_SUMMARY =
   "주소를 검색하거나 지도에서 위치를 선택하세요.";
 const MODEL_PROGRESS_STORAGE_KEY =
@@ -154,6 +156,7 @@ const SELECTION_PREVIEW_CACHE_MAX_ENTRIES = 24;
 const MODEL_PROGRESS_MIN_ESTIMATE_MS = 1500;
 const MODEL_PROGRESS_MAX_ESTIMATE_MS = 90000;
 const MODEL_PROGRESS_POLL_INTERVAL_MS = 400;
+const ASYNC_EXPORT_JOB_POLL_INTERVAL_MS = 1500;
 const REQUEST_UI_DELAY_STEPS_MS = Object.freeze([2500, 8000]);
 const SEARCH_PREFETCH_DEBOUNCE_MS = 450;
 const SEARCH_PREFETCH_MIN_QUERY_LENGTH = 6;
@@ -165,6 +168,10 @@ const MODEL_PROGRESS_DEFAULT_ESTIMATES_MS = Object.freeze({
   "export-3dm-cached": 5200,
   "export-dxf": 4200,
   "export-dxf-cached": 2600,
+  "export-3dm-async": 120000,
+  "export-skp-async": 120000,
+  "export-obj-async": 90000,
+  "export-dxf-async": 90000,
 });
 const REQUEST_UI_PHASE_MESSAGES = Object.freeze({
   siteContext: {
@@ -241,6 +248,33 @@ function updateCardHeading(card, kicker, title) {
   }
 }
 
+function configureInfoActionButton(
+  button,
+  { role, label, busyLabel, ariaLabel, title } = {}
+) {
+  if (!button) {
+    return;
+  }
+
+  button.classList.add("info-action-button");
+  if (role) {
+    button.dataset.actionRole = role;
+  }
+  if (busyLabel) {
+    button.dataset.busyLabel = busyLabel;
+  }
+  if (label) {
+    button.dataset.idleLabel = label;
+    button.textContent = label;
+  }
+  if (ariaLabel) {
+    button.setAttribute("aria-label", ariaLabel);
+  }
+  if (title) {
+    button.title = title;
+  }
+}
+
 function applyStudioChrome() {
   selectionCard?.classList.add("selection-card");
   siteContextCard?.classList.add("context-card");
@@ -306,7 +340,7 @@ function applyStudioChrome() {
     }
     if (description) {
       description.textContent =
-        "검토 결과를 확인한 뒤 3DM, OBJ, DXF, SKP로 이어갑니다.";
+        "검토 결과를 확인한 뒤 3DM 또는 SKP로 이어갑니다.";
     }
   }
 
@@ -344,31 +378,50 @@ function applyStudioChrome() {
     "건축물",
     "건축물 정보"
   );
-  updateCardHeading(modelCard, "파일 출력", "3D / CAD 파일");
+  updateCardHeading(modelCard, "대지 모형", "모델 / 파일 출력");
 
-  if (loadLandInfoButton) {
-    loadLandInfoButton.textContent = "토지 정보";
-  }
-
-  if (showLandInfoDetailsButton) {
-    showLandInfoDetailsButton.textContent = "규제 상세";
-  }
-
-  if (openLandUseDetailButton) {
-    openLandUseDetailButton.textContent = "토지이음";
-  }
-
-  if (loadBuildingRegisterButton) {
-    loadBuildingRegisterButton.textContent = "건축물 정보";
-  }
-
-  if (showBuildingRegisterDetailsButton) {
-    showBuildingRegisterDetailsButton.textContent = "대장 상세";
-  }
-
-  if (openOfficialBuildingRegisterButton) {
-    openOfficialBuildingRegisterButton.textContent = "세움터";
-  }
+  configureInfoActionButton(loadLandInfoButton, {
+    role: "화면 표시",
+    label: "요약 조회",
+    busyLabel: "조회 중...",
+    ariaLabel: "토지 정보 요약을 아래 영역에 표시",
+    title: "토지 정보 요약을 현재 카드 아래에 표시합니다.",
+  });
+  configureInfoActionButton(showLandInfoDetailsButton, {
+    role: "팝업",
+    label: "상세 보기",
+    busyLabel: "준비 중...",
+    ariaLabel: "토지 규제 상세 정보를 팝업으로 보기",
+    title: "토지 규제 상세 정보를 팝업 창으로 엽니다.",
+  });
+  configureInfoActionButton(openLandUseDetailButton, {
+    role: "외부 연결",
+    label: "토지이음",
+    busyLabel: "연결 중...",
+    ariaLabel: "토지이음 외부 사이트 열기",
+    title: "토지이음 외부 사이트를 엽니다.",
+  });
+  configureInfoActionButton(loadBuildingRegisterButton, {
+    role: "화면 표시",
+    label: "요약 조회",
+    busyLabel: "조회 중...",
+    ariaLabel: "건축물 정보 요약을 아래 영역에 표시",
+    title: "건축물 정보 요약을 현재 카드 아래에 표시합니다.",
+  });
+  configureInfoActionButton(showBuildingRegisterDetailsButton, {
+    role: "팝업",
+    label: "상세 보기",
+    busyLabel: "준비 중...",
+    ariaLabel: "건축물대장 상세 정보를 팝업으로 보기",
+    title: "건축물대장 상세 정보를 팝업 창으로 엽니다.",
+  });
+  configureInfoActionButton(openOfficialBuildingRegisterButton, {
+    role: "외부 연결",
+    label: "세움터",
+    busyLabel: "연결 중...",
+    ariaLabel: "세움터 외부 사이트 열기",
+    title: "세움터 외부 사이트를 엽니다.",
+  });
 
   if (siteContextNote) {
     siteContextNote.textContent =
@@ -386,8 +439,7 @@ function applyStudioChrome() {
   }
 
   if (modelProgressLabel) {
-    modelProgressLabel.textContent =
-      "범위와 포함 항목은 미리보기 후 여기에서 먼저 확인할 수 있습니다.";
+    modelProgressLabel.textContent = "미리보기 대기";
   }
 }
 
@@ -867,6 +919,14 @@ async function readErrorMessageFromResponse(response, fallbackMessage) {
     }
 
     const text = String(await response.text()).trim();
+
+    if (contentType.includes("text/html") || /^<!doctype html/i.test(text)) {
+      if (response.status === 524 || text.toLowerCase().includes("error code 524")) {
+        return `${fallbackMessage} 서버 작업이 오래 걸려 Cloudflare 연결 제한에 걸렸습니다. 대형 모델은 백그라운드 작업으로 다시 시도해주세요.`;
+      }
+
+      return `${fallbackMessage} 서버가 HTML 오류 페이지를 반환했습니다. 잠시 후 다시 시도해주세요.`;
+    }
 
     if (text) {
       return text;
@@ -1984,19 +2044,12 @@ function failModelProgress(message) {
   setModelProgress(Math.max(18, state.modelProgressValue), message, "error");
 }
 
-function resetModelProgress(
-  message = "범위와 포함 항목이 여기에 표시됩니다."
-) {
+function resetModelProgress(message = "미리보기 대기") {
   clearModelProgressTimer();
   clearModelProgressPollTimer();
   state.modelProgressSession = null;
   setScopedModelProgress("preview", 0, message, "idle");
-  setScopedModelProgress(
-    "export",
-    0,
-    "출력 형식과 옵션을 고른 뒤 모델 파일 다운로드를 누르면 여기에서 진행 상태가 표시됩니다.",
-    "idle"
-  );
+  setScopedModelProgress("export", 0, "파일 출력 대기", "idle");
 }
 
 function loadHistory() {
@@ -2359,7 +2412,7 @@ function renderSelectionMeta() {
       <div><dt>선택 필지 수</dt><dd>${escapeHtml(String(selectedParcels.length))}개</dd></div>
       <div><dt>중심 좌표</dt><dd>${formatCoord(item.lat)}, ${formatCoord(item.lng)}</dd></div>
       <div><dt>대표 필지</dt><dd>${escapeHtml(parcelLabels || "미확인")}${moreCount > 0 ? ` 외 ${moreCount}개` : ""}</dd></div>
-      <div><dt>그룹 출력</dt><dd>필지 그룹 분리 옵션과 함께 각 필지를 그룹으로 내보낼 수 있습니다.</dd></div>
+      <div><dt>필지 처리</dt><dd>파일 출력에서 병합 또는 분리를 선택할 수 있습니다.</dd></div>
       <div><dt>선택 조작</dt><dd>지도에서 필지를 계속 클릭해 추가하고, 같은 필지를 다시 클릭하면 해제됩니다.</dd></div>
     `;
     return;
@@ -3596,42 +3649,49 @@ async function reverseGeocode(lat, lng) {
 }
 
 function normalizeContourInterval(value) {
-  const numericValue = Number(value);
-
-  if (!Number.isFinite(numericValue)) {
-    return MIN_CONTOUR_INTERVAL_METERS;
-  }
-
-  return Math.max(
-    MIN_CONTOUR_INTERVAL_METERS,
-    Number(numericValue.toFixed(3))
-  );
+  return DEFAULT_CONTOUR_INTERVAL_METERS;
 }
 
 function normalizeExportFormat(value) {
   const normalized = String(value || "").trim().toLowerCase();
 
-  if (normalized === "3dm" || normalized === "dxf" || normalized === "skp") {
+  if (normalized === "3dm" || normalized === "skp") {
     return normalized;
   }
 
-  return "obj";
+  return "3dm";
 }
 
 function normalizeTerrainPipelineMode(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  return normalized === "current" ? "current" : "legacy";
+  return "current";
 }
 
-function describeTerrainMode(value) {
-  return value === "mesh" ? "완만한 일체형" : "등고층 매스";
+function normalizeTerrainSurfaceMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+
+  if (normalized === "stepped") {
+    return "stepped";
+  }
+
+  return DEFAULT_TERRAIN_SURFACE_MODE;
+}
+
+function describeTerrainSurfaceMode(value) {
+  return normalizeTerrainSurfaceMode(value) === "smooth" ? "연속형" : "계단형";
+}
+
+function normalizeSplitParcelBoundary(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["split", "separate", "separated", "true", "on", "1"].includes(
+    normalized
+  );
 }
 
 function syncContourIntervalInput() {
   const contourField = modelForm?.querySelector('[name="contourInterval"]');
 
   if (!contourField) {
-    return MIN_CONTOUR_INTERVAL_METERS;
+    return DEFAULT_CONTOUR_INTERVAL_METERS;
   }
 
   const rawValue = Number(contourField.value);
@@ -3647,30 +3707,25 @@ function syncContourIntervalInput() {
 function collectModelOptions() {
   const formData = new FormData(modelForm);
   const contourInterval = syncContourIntervalInput();
-  const normalizeBuildingPlacementSelection = (value) => {
-    const normalized = String(value || "").toLowerCase();
-    return normalized === "remove-overlap" || normalized === "embed-lowest"
-      ? "remove-overlap"
-      : "default";
-  };
 
   return applyUiVerificationModelOptionOverrides({
     shape: "rectangle",
     radius: Number(formData.get("radius")),
     contourInterval,
     terrainMode: "contour",
-    terrainPipelineMode: normalizeTerrainPipelineMode(
-      formData.get("terrainPipelineMode")
+    terrainSurfaceMode: normalizeTerrainSurfaceMode(
+      formData.get("terrainSurfaceMode")
     ),
-    buildingPlacement: normalizeBuildingPlacementSelection(
-      formData.get("buildingPlacement")
-    ),
+    terrainPipelineMode: "current",
+    buildingPlacement: "default",
     exportFormat: normalizeExportFormat(formData.get("exportFormat")),
     includeContours: true,
     includeBuildings: true,
     includeRoads: true,
     includeParcelBoundary: true,
-    splitParcelBoundary: formData.get("splitParcelBoundary") === "on",
+    splitParcelBoundary: normalizeSplitParcelBoundary(
+      formData.get("splitParcelBoundary")
+    ),
   });
 }
 
@@ -3681,8 +3736,9 @@ function buildModelOptionsSignature(
   const includeExportOnly = signatureOptions.includeExportOnly === true;
   const signature = {
     radius: Number(options.radius) || 0,
-    contourInterval: Number(options.contourInterval) || MIN_CONTOUR_INTERVAL_METERS,
+    contourInterval: DEFAULT_CONTOUR_INTERVAL_METERS,
     terrainMode: "contour",
+    terrainSurfaceMode: normalizeTerrainSurfaceMode(options.terrainSurfaceMode),
     includeContours: options.includeContours !== false,
     includeBuildings: options.includeBuildings !== false,
     includeRoads: options.includeRoads !== false,
@@ -3690,15 +3746,6 @@ function buildModelOptionsSignature(
   };
 
   if (includeExportOnly) {
-    signature.buildingPlacement =
-      ["remove-overlap", "embed-lowest"].includes(
-        String(options.buildingPlacement || "").toLowerCase()
-      )
-        ? "remove-overlap"
-        : "default";
-    signature.terrainPipelineMode = normalizeTerrainPipelineMode(
-      options.terrainPipelineMode
-    );
     signature.splitParcelBoundary = options.splitParcelBoundary === true;
     signature.exportFormat = normalizeExportFormat(options.exportFormat);
   }
@@ -3724,15 +3771,11 @@ function describeExportFormat(value) {
     return "3DM";
   }
 
-  if (normalized === "dxf") {
-    return "DXF";
-  }
-
   if (normalized === "skp") {
     return "SKP";
   }
 
-  return "OBJ";
+  return "3DM";
 }
 
 function describeBuildingPlacement(value) {
@@ -3750,23 +3793,10 @@ function buildAppliedModelSummary(
     return "미리보기 후 현재 반경과 출력 조건을 확인할 수 있습니다.";
   }
 
-  const requestedInterval = normalizeContourInterval(options.contourInterval);
-  const effectiveInterval = Number(
-    siteContext?.stats?.effectiveContourBandInterval ||
-      siteContext?.stats?.requestedContourInterval ||
-      requestedInterval
-  );
-  const intervalLabel = Number.isFinite(effectiveInterval)
-    ? effectiveInterval
-    : requestedInterval;
-  const intervalText =
-    Number.isFinite(effectiveInterval) && Math.abs(effectiveInterval - requestedInterval) > 0.0001
-      ? `${requestedInterval}m (출력 ${effectiveInterval}m)`
-      : `${intervalLabel}m`;
+  const terrainSurfaceMode = normalizeTerrainSurfaceMode(options.terrainSurfaceMode);
   const parts = [
     `범위 ${Number(options.radius) || 0}m`,
-    `등고 간격 ${intervalText}`,
-    `건물-대지 처리 ${describeBuildingPlacement(options.buildingPlacement)}`,
+    `대지 방식 ${describeTerrainSurfaceMode(terrainSurfaceMode)}`,
   ];
   const stats = siteContext?.stats || {};
 
@@ -3833,16 +3863,16 @@ function ensureExportProgressUi(exportSection) {
       <div class="model-progress-track">
         <div class="model-progress-fill" id="exportProgressFill"></div>
       </div>
-      <p class="model-progress-label" id="exportProgressLabel">
-        출력 형식과 옵션을 고른 뒤 모델 파일 다운로드를 누르면 여기에서 진행 상태가 표시됩니다.
-      </p>
+      <p class="model-progress-label" id="exportProgressLabel">파일 출력 대기</p>
     `;
   }
 
   const downloadGrid = exportSection.querySelector(".download-action-grid");
 
-  if (downloadGrid && progress.parentElement !== exportSection) {
-    exportSection.insertBefore(progress, downloadGrid);
+  if (downloadGrid) {
+    exportSection.insertBefore(progress, downloadGrid.nextSibling);
+  } else if (progress.parentElement !== exportSection) {
+    exportSection.append(progress);
   }
 
   exportProgressBar = progress;
@@ -4642,7 +4672,7 @@ function scheduleSearch() {
 
 function updateDownloadButtonLabel() {
   if (downloadObjButton) {
-    downloadObjButton.textContent = "모델 파일 다운로드";
+    downloadObjButton.textContent = "파일 다운로드";
   }
 
   if (download3dmButton) {
@@ -4667,7 +4697,7 @@ function setExportActionBusy(isBusy, format = collectModelOptions().exportFormat
   downloadObjButton.setAttribute("aria-busy", isBusy ? "true" : "false");
   downloadObjButton.textContent = isBusy
     ? `${describeExportFormat(format)} 준비 중...`
-    : "모델 파일 다운로드";
+    : "파일 다운로드";
 }
 
 function ensureStatusChip(id, labelElement) {
@@ -4924,6 +4954,104 @@ function createModelOptionLabel(name, title, options, value, description = "") {
   return label;
 }
 
+function setModelOptionTitle(label, title) {
+  const titleElement = label?.querySelector(".model-option-title");
+  if (titleElement) {
+    titleElement.textContent = title;
+  }
+}
+
+function removeModelOptionDescriptions(label) {
+  label
+    ?.querySelectorAll(".model-option-description, .checkbox-description")
+    .forEach((element) => element.remove());
+}
+
+function ensureSelectOption(select, value, label) {
+  if (!select || select.querySelector(`option[value="${value}"]`)) {
+    return;
+  }
+
+  const option = document.createElement("option");
+  option.value = value;
+  option.textContent = label;
+  select.append(option);
+}
+
+function ensureSplitParcelBoundaryControl(label) {
+  if (!label) {
+    return null;
+  }
+
+  const legacyInput = label.querySelector('input[name="splitParcelBoundary"]');
+  const existingSelect = label.querySelector('select[name="splitParcelBoundary"]');
+  const wasSplit =
+    legacyInput?.checked === true ||
+    normalizeSplitParcelBoundary(existingSelect?.value);
+  legacyInput?.remove();
+
+  label.classList.remove("checkbox", "checkbox-featured");
+  label.classList.add("model-select-card");
+  label.dataset.modelOption = "splitParcelBoundary";
+
+  label
+    .querySelectorAll(".checkbox-copy, .checkbox-label, .checkbox-description")
+    .forEach((element) => element.remove());
+
+  let copy = label.querySelector(".model-option-copy");
+  if (!copy) {
+    copy = document.createElement("span");
+    copy.className = "model-option-copy";
+    label.prepend(copy);
+  }
+
+  let caption = copy.querySelector(".model-option-title");
+  if (!caption) {
+    caption = document.createElement("span");
+    caption.className = "model-option-title";
+    copy.prepend(caption);
+  }
+  caption.textContent = "필지 처리";
+
+  let select = existingSelect;
+  if (!select) {
+    select = document.createElement("select");
+    select.name = "splitParcelBoundary";
+    label.append(select);
+  }
+
+  select.innerHTML = "";
+  ensureSelectOption(select, "merge", "병합");
+  ensureSelectOption(select, "split", "분리");
+  select.value = wasSplit ? "split" : "merge";
+
+  return label;
+}
+
+function removeRetiredModelOptionControls() {
+  if (!modelForm) {
+    return;
+  }
+
+  const retiredSelectors = [
+    '[name="contourInterval"]',
+    '[name="terrainPipelineMode"]',
+    '[data-model-option="terrainPipelineMode"]',
+    '[name="buildingPlacement"]',
+    '[data-model-option="buildingPlacement"]',
+  ];
+
+  for (const selector of retiredSelectors) {
+    modelForm.querySelectorAll(selector).forEach((element) => {
+      const removable =
+        element.closest("[data-model-option]") ||
+        element.closest("label") ||
+        element;
+      removable.remove();
+    });
+  }
+}
+
 function ensureModelFormOptionLayout() {
   if (!modelForm) {
     return;
@@ -4937,10 +5065,13 @@ function ensureModelFormOptionLayout() {
   const splitParcelLabel = modelForm.querySelector(
     '[data-model-option="splitParcelBoundary"]'
   );
-  const splitParcelInput = splitParcelLabel?.querySelector(
-    'input[name="splitParcelBoundary"]'
-  );
   const legacyTerrainLabel = modelForm.querySelector('[data-model-option="terrainMode"]');
+  const buildingPlacementLabel = modelForm.querySelector(
+    '[data-model-option="buildingPlacement"]'
+  );
+  const terrainPipelineLabel = modelForm.querySelector(
+    '[data-model-option="terrainPipelineMode"]'
+  );
   const previewButtonRow = modelForm.querySelector(".button-row");
   const legacyIncludeTitle =
     toggleGrid?.previousElementSibling?.classList?.contains("form-section-title")
@@ -4951,25 +5082,12 @@ function ensureModelFormOptionLayout() {
     legacyTerrainLabel.remove();
   }
 
-  if (splitParcelLabel && splitParcelInput) {
-    splitParcelLabel.classList.add("checkbox-featured");
-    splitParcelLabel
-      .querySelectorAll(".checkbox-copy, .checkbox-label, .checkbox-description")
-      .forEach((element) => element.remove());
+  removeRetiredModelOptionControls();
+  contourLabel?.remove();
+  buildingPlacementLabel?.remove();
+  terrainPipelineLabel?.remove();
 
-    const copy = document.createElement("span");
-    const caption = document.createElement("span");
-    const description = document.createElement("span");
-
-    copy.className = "checkbox-copy";
-    caption.className = "checkbox-label checkbox-title";
-    description.className = "checkbox-description";
-    caption.textContent = "필지 그룹 분리";
-    description.textContent =
-      "대지 경계를 그룹별 오브젝트로 나눠서 3D/CAD로 내보냅니다.";
-    copy.append(caption, description);
-    splitParcelLabel.append(copy);
-  }
+  const parcelOutputLabel = ensureSplitParcelBoundaryControl(splitParcelLabel);
 
   toggleGrid
     ?.querySelectorAll('label.checkbox:not([data-model-option="splitParcelBoundary"])')
@@ -4977,58 +5095,41 @@ function ensureModelFormOptionLayout() {
   legacyIncludeTitle?.remove();
   toggleGrid?.remove();
 
-  let buildingPlacementLabel = modelForm.querySelector(
-    '[data-model-option="buildingPlacement"]'
-  );
-
-  if (!buildingPlacementLabel) {
-    buildingPlacementLabel = createModelOptionLabel(
-      "buildingPlacement",
-      "건물-대지 처리",
-      [
-        { value: "default", label: "기본" },
-        { value: "remove-overlap", label: "중첩 제거" },
-      ],
-      "default",
-      "건물 Z는 원 지형 기준으로 맞추고, 대지모형과 겹친 부분을 제거할지 선택합니다."
-    );
-  }
-
   let exportLabel = modelForm.querySelector('[data-model-option="exportFormat"]');
 
   if (!exportLabel) {
     exportLabel = createModelOptionLabel(
       "exportFormat",
-      "출력 형식",
+      "파일 형식",
       [
         { value: "3dm", label: "3DM" },
-        { value: "obj", label: "OBJ" },
-        { value: "dxf", label: "DXF (2D CAD)" },
         { value: "skp", label: "SKP (SketchUp)" },
       ],
-      "3dm",
-      "작업 환경에 맞는 3D/CAD 포맷을 고릅니다."
+      "3dm"
     );
   }
 
-  let terrainPipelineLabel = modelForm.querySelector(
-    '[data-model-option="terrainPipelineMode"]'
+  let terrainSurfaceLabel = modelForm.querySelector(
+    '[data-model-option="terrainSurfaceMode"]'
   );
 
-  if (!terrainPipelineLabel) {
-    terrainPipelineLabel = createModelOptionLabel(
-      "terrainPipelineMode",
-      "대지모형 엔진",
+  if (!terrainSurfaceLabel) {
+    terrainSurfaceLabel = createModelOptionLabel(
+      "terrainSurfaceMode",
+      "대지 방식",
       [
-        { value: "legacy", label: "레거시" },
-        { value: "current", label: "최신 비교" },
+        { value: "stepped", label: "계단형" },
+        { value: "smooth", label: "연속형" },
       ],
-      "legacy",
-      "기본은 지난달 기준의 안정적인 엔진입니다. 최신 엔진은 비교가 필요할 때만 선택합니다."
+      DEFAULT_TERRAIN_SURFACE_MODE
     );
   }
 
-  contourLabel?.classList.add("contour-interval-field");
+  setModelOptionTitle(exportLabel, "파일 형식");
+  setModelOptionTitle(terrainSurfaceLabel, "대지 방식");
+  removeModelOptionDescriptions(exportLabel);
+  removeModelOptionDescriptions(terrainSurfaceLabel);
+  terrainSurfaceLabel?.classList.add("terrain-surface-field");
   radiusLabel?.classList.add("range-field");
   previewSiteContextButton?.classList.remove("secondary-button");
   downloadObjButton?.classList.remove("secondary-button");
@@ -5041,21 +5142,14 @@ function ensureModelFormOptionLayout() {
     rangeSection = document.createElement("div");
     rangeSection.className = "form-section range-action-section";
     rangeSection.innerHTML = `
-      <p class="form-section-title">모델 범위</p>
+      <p class="form-section-title">모델 출력</p>
       <div class="range-action-grid"></div>
     `;
     modelForm.prepend(rangeSection);
   }
 
+  rangeSection.querySelector(".form-section-title").textContent = "모델 출력";
   const rangeGrid = rangeSection.querySelector(".range-action-grid");
-
-  if (rangeGrid && radiusLabel) {
-    rangeGrid.append(radiusLabel);
-  }
-
-  if (rangeGrid && contourLabel) {
-    rangeGrid.append(contourLabel);
-  }
 
   let previewButtonWrap = modelForm.querySelector(".preview-button-wrap");
 
@@ -5072,6 +5166,14 @@ function ensureModelFormOptionLayout() {
     rangeGrid.append(previewButtonWrap);
   }
 
+  if (rangeGrid && radiusLabel) {
+    rangeGrid.append(radiusLabel);
+  }
+
+  if (rangeGrid && terrainSurfaceLabel) {
+    rangeGrid.append(terrainSurfaceLabel);
+  }
+
   if (modelProgressBar && modelProgressBar.parentElement !== rangeSection) {
     rangeSection.append(modelProgressBar);
   }
@@ -5082,21 +5184,22 @@ function ensureModelFormOptionLayout() {
     exportSection = document.createElement("div");
     exportSection.className = "form-section output-section";
     exportSection.innerHTML = `
-      <p class="form-section-title">모델 출력</p>
+      <p class="form-section-title">파일 출력</p>
       <div class="output-grid"></div>
       <div class="download-action-grid"></div>
     `;
     modelForm.append(exportSection);
   }
 
+  exportSection.querySelector(".form-section-title").textContent = "파일 출력";
   const outputGrid = exportSection.querySelector(".output-grid");
 
   if (outputGrid) {
     if (splitParcelLabel) {
-      outputGrid.append(splitParcelLabel);
+      outputGrid.append(parcelOutputLabel || splitParcelLabel);
     }
 
-    outputGrid.append(buildingPlacementLabel, terrainPipelineLabel, exportLabel);
+    outputGrid.append(exportLabel);
   }
 
   let downloadButtonWrap = modelForm.querySelector(".download-button-wrap");
@@ -5110,16 +5213,26 @@ function ensureModelFormOptionLayout() {
     downloadButtonWrap.append(downloadObjButton);
   }
 
+  const downloadGrid = exportSection.querySelector(".download-action-grid");
+  if (downloadGrid) {
+    downloadGrid.append(downloadButtonWrap);
+    if (outputGrid) {
+      downloadGrid.append(outputGrid);
+    }
+  }
+
   ensureExportProgressUi(exportSection);
-  exportSection.querySelector(".download-action-grid")?.append(downloadButtonWrap);
 
   if (previewButtonRow) {
     previewButtonRow.remove();
   }
+
+  removeRetiredModelOptionControls();
 }
 
 function prepareModelFormUi() {
   ensureModelFormOptionLayout();
+  removeRetiredModelOptionControls();
   syncContourIntervalInput();
   syncSelectionModeFormState();
 
@@ -5170,7 +5283,11 @@ function resolveDownloadFilename(response, fallbackFormat) {
   );
   const radiusPart = `${Math.max(0, Math.round(Number(options.radius) || 0))}m`;
   const intervalPart = `${normalizeContourInterval(options.contourInterval)}m`;
-  const parts = [addressPart, radiusPart, intervalPart];
+  const surfacePart =
+    normalizeTerrainSurfaceMode(options.terrainSurfaceMode) === "smooth"
+      ? "연속형"
+      : "계단형";
+  const parts = [addressPart, radiusPart, intervalPart, surfacePart];
 
   if (options.splitParcelBoundary === true && !isRangeSelection(location)) {
     parts.push("분절");
@@ -5196,12 +5313,34 @@ async function generateModelSpec() {
   });
 
   try {
+    const options = collectModelOptions();
+
+    if (shouldUseAsyncExportJob(options, options.exportFormat)) {
+      const summary = [
+        `범위 ${Number(options.radius) || 0}m`,
+        `대지 방식 ${describeTerrainSurfaceMode(options.terrainSurfaceMode)}`,
+        "대형 작업",
+      ].join(", ");
+      state.latestSpec = {
+        generatedAt: Date.now(),
+        options,
+        summary,
+      };
+      specPreview.textContent =
+        `${summary}. 이 범위는 미리보기 요청을 오래 붙잡지 않고 파일 다운로드에서 백그라운드 작업으로 처리합니다.`;
+      state.siteContextNoteOverride =
+        "대형 범위는 Cloudflare 연결 제한을 피하기 위해 파일 출력 단계에서 백그라운드 작업으로 처리합니다.";
+      renderSiteContextMeta();
+      finishModelProgress("대형 범위는 파일 다운로드에서 백그라운드 작업으로 처리합니다.");
+      rememberModelProgressEstimate(operationKey, performance.now() - startedAt);
+      return null;
+    }
+
     const siteContext = await loadSiteContext(getSelectionRequestKey(), {
       useModelProgress: true,
       rangeStart: 10,
       rangeEnd: 92,
     });
-    const options = collectModelOptions();
     const summary = buildAppliedModelSummary(siteContext, options);
     state.latestSpec = {
       generatedAt: Date.now(),
@@ -5226,6 +5365,119 @@ async function generateModelSpec() {
   }
 }
 
+function shouldUseAsyncExportJob(options, format) {
+  const exportConfig = state.runtimeConfig?.exports || {};
+
+  if (exportConfig.asyncJobsEnabled !== true) {
+    return false;
+  }
+
+  const normalizedFormat = normalizeExportFormat(format || options?.exportFormat);
+
+  if (!["3dm", "skp", "obj", "dxf"].includes(normalizedFormat)) {
+    return false;
+  }
+
+  const radius = Math.max(0, Number(options?.radius) || 0);
+  const threshold = Math.max(
+    30,
+    Number(exportConfig.asyncRadiusThresholdMeters) || 320
+  );
+
+  return radius >= threshold;
+}
+
+function waitForAsyncExportPollDelay() {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ASYNC_EXPORT_JOB_POLL_INTERVAL_MS);
+  });
+}
+
+function applyAsyncExportProgress(job, fallbackMessage) {
+  const percent = Math.max(1, Math.min(98, Number(job?.percent || 0)));
+  advanceModelProgress(percent, job?.message || fallbackMessage);
+}
+
+async function startAsyncExportJob(currentOptions, normalizedFormat) {
+  const response = await fetchWithDiagnostics(
+    "/api/export-jobs",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        location: state.selectedLocation,
+        options: currentOptions,
+      }),
+    },
+    `${describeExportFormat(normalizedFormat)} 백그라운드 작업 접수에 실패했습니다.`
+  );
+  const payload = await response.json();
+  const job = payload?.job;
+
+  if (!job?.id) {
+    throw new Error("모델 파일 작업 번호를 받지 못했습니다.");
+  }
+
+  return job;
+}
+
+async function pollAsyncExportJob(job, normalizedFormat) {
+  let currentJob = job;
+
+  while (currentJob?.status !== "succeeded") {
+    if (currentJob?.status === "failed" || currentJob?.status === "cancelled") {
+      throw new Error(
+        currentJob?.error ||
+          currentJob?.message ||
+          `${describeExportFormat(normalizedFormat)} 백그라운드 작업에 실패했습니다.`
+      );
+    }
+
+    applyAsyncExportProgress(
+      currentJob,
+      `${describeExportFormat(normalizedFormat)} 파일을 백그라운드에서 생성하는 중입니다.`
+    );
+    await waitForAsyncExportPollDelay();
+
+    const response = await fetchWithDiagnostics(
+      `/api/export-jobs/${encodeURIComponent(currentJob.id)}/status`,
+      {
+        headers: {
+          Accept: "application/json",
+        },
+      },
+      `${describeExportFormat(normalizedFormat)} 백그라운드 작업 상태 확인에 실패했습니다.`
+    );
+    const payload = await response.json();
+    currentJob = payload?.job;
+
+    if (!currentJob?.id) {
+      throw new Error("모델 파일 작업 상태를 확인하지 못했습니다.");
+    }
+  }
+
+  advanceModelProgress(98, "모델 파일이 준비되었습니다. 다운로드를 시작합니다.");
+  return currentJob;
+}
+
+async function downloadAsyncExportJobResult(job, normalizedFormat) {
+  const response = await fetchWithDiagnostics(
+    job.downloadUrl || `/api/export-jobs/${encodeURIComponent(job.id)}/download`,
+    {
+      headers: {
+        Accept: "application/octet-stream",
+      },
+    },
+    `${describeExportFormat(normalizedFormat)} 파일 다운로드에 실패했습니다.`
+  );
+  const blob = await response.blob();
+  const filename = resolveDownloadFilename(response, normalizedFormat);
+  downloadBlob(filename, blob);
+  return filename;
+}
+
 async function downloadObj(format = collectModelOptions().exportFormat) {
   if (!state.selectedLocation) {
     throw new Error("먼저 위치를 선택하세요.");
@@ -5241,12 +5493,20 @@ async function downloadObj(format = collectModelOptions().exportFormat) {
     ...collectModelOptions(),
     exportFormat: normalizedFormat,
   };
+  const useAsyncExportJob = shouldUseAsyncExportJob(
+    currentOptions,
+    normalizedFormat
+  );
   const needsRefresh = !hasFreshSiteContextForCurrentOptions();
-  const operationKey = `export-${normalizedFormat}${needsRefresh ? "" : "-cached"}`;
+  const operationKey = useAsyncExportJob
+    ? `export-${normalizedFormat}-async`
+    : `export-${normalizedFormat}${needsRefresh ? "" : "-cached"}`;
   const startedAt = performance.now();
   startModelProgress(
     operationKey,
-    `${describeExportFormat(normalizedFormat)} 파일을 준비하는 중입니다.`,
+    useAsyncExportJob
+      ? `${describeExportFormat(normalizedFormat)} 대형 작업을 백그라운드에 접수하는 중입니다.`
+      : `${describeExportFormat(normalizedFormat)} 파일을 준비하는 중입니다.`,
     {
       startValue: 8,
       maxValue: 96,
@@ -5256,6 +5516,37 @@ async function downloadObj(format = collectModelOptions().exportFormat) {
   setExportActionBusy(true, normalizedFormat);
 
   try {
+    if (useAsyncExportJob) {
+      const queuedJob = await startAsyncExportJob(
+        currentOptions,
+        normalizedFormat
+      );
+      applyAsyncExportProgress(
+        queuedJob,
+        `${describeExportFormat(normalizedFormat)} 파일 작업이 접수되었습니다.`
+      );
+      const completedJob = await pollAsyncExportJob(
+        queuedJob,
+        normalizedFormat
+      );
+      await downloadAsyncExportJobResult(completedJob, normalizedFormat);
+
+      const summary = state.siteContext
+        ? buildAppliedModelSummary(state.siteContext, currentOptions)
+        : `범위 ${Number(currentOptions.radius) || 0}m, 대지 방식 ${describeTerrainSurfaceMode(currentOptions.terrainSurfaceMode)}`;
+      state.latestSpec = {
+        generatedAt: Date.now(),
+        options: currentOptions,
+        summary,
+      };
+      specPreview.textContent = `${summary}, ${describeExportFormat(normalizedFormat)} 다운로드를 시작했습니다.`;
+      finishModelProgress(
+        `${describeExportFormat(normalizedFormat)} 파일 다운로드를 시작했습니다.`
+      );
+      rememberModelProgressEstimate(operationKey, performance.now() - startedAt);
+      return;
+    }
+
     if (needsRefresh) {
       await loadSiteContext(getSelectionRequestKey(), {
         useModelProgress: true,
@@ -5451,7 +5742,7 @@ function attachEvents() {
     try {
       await downloadObj(collectModelOptions().exportFormat);
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : "OBJ 파일 다운로드에 실패했습니다.");
+      window.alert(error instanceof Error ? error.message : "모델 파일 다운로드에 실패했습니다.");
     }
   });
 
@@ -5937,7 +6228,7 @@ function setSelectedLocation(location, moveMap = true) {
   state.latestSpec = null;
 
   specPreview.textContent = "미리보기 후 반경과 포함 항목을 확인할 수 있습니다.";
-  resetModelProgress("범위와 포함 항목이 여기에 표시됩니다.");
+  resetModelProgress("미리보기 대기");
 
   if (state.map) {
     if (rangeMode) {
@@ -6034,6 +6325,12 @@ function normalizeUiVerificationModelOptionOverrides(overrides = null) {
     if (Object.prototype.hasOwnProperty.call(overrides, key)) {
       normalized[key] = overrides[key] !== false;
     }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(overrides, "terrainSurfaceMode")) {
+    normalized.terrainSurfaceMode = normalizeTerrainSurfaceMode(
+      overrides.terrainSurfaceMode
+    );
   }
 
   return Object.keys(normalized).length > 0 ? normalized : null;

@@ -14,8 +14,8 @@ This repository now supports two local roles on the same PC:
 
 The Node app reads the route prefix from `ROUTE_BASE_PATH`.
 
-- Production wrappers set `ROUTE_BASE_PATH=/main`
-- Test wrappers set `ROUTE_BASE_PATH=/test`
+- Production start helpers set `ROUTE_BASE_PATH=/main`
+- Test start helpers set `ROUTE_BASE_PATH=/test`
 
 ## Folder Roles
 
@@ -60,7 +60,7 @@ Use this folder for:
 - running the Cloudflare tunnel
 - production-only verification
 
-Internal runtime scripts still exist under `deploy\`, but they are support files for the three `CLICK_...` buttons.
+Internal PowerShell helpers still exist under `deploy\`, but they are support files for the three `CLICK_...` buttons.
 
 ## Git Flow
 
@@ -159,6 +159,6 @@ This script now does the following:
 - `CLICK_1_START_BOTH_WEB.bat` is the main daily start button.
 - `CLICK_2_GIT_PUSH_DEVELOP.bat` always pushes from `C:\SpaceWork_develop`.
 - `CLICK_3_GIT_PULL_DEPLOY.bat` always pulls into `C:\SpaceWork_deploy`.
-- `deploy\run-home-site.bat`, `deploy\run-test-site.bat`, `deploy\start-server.ps1`, and `deploy\start-cloudflare-tunnel.ps1` are internal support files.
+- `deploy\start-server.ps1`, `deploy\start-cloudflare-tunnel.ps1`, and `deploy\update-home-prod.ps1` are the internal support files behind the three buttons.
 - Runtime logs and PID files in `logs\` are local artifacts.
 - Large `tmp_*`, `*.obj`, `*.3dm`, and `*.log` files are disposable local outputs.

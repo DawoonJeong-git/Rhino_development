@@ -64,8 +64,8 @@ function normalizeScenarioName(value) {
     return "";
   }
 
-  if (/^(smoke|address-dxf-smoke)$/.test(normalized)) {
-    return "address-dxf-smoke";
+  if (/^(smoke|address-smoke|address-3dm-smoke|address-dxf-smoke)$/.test(normalized)) {
+    return "address-3dm-smoke";
   }
 
   if (/^(multi|multi-parcel|multi-parcel-preview)$/.test(normalized)) {
@@ -497,10 +497,10 @@ async function runSmokeScenario(context, baseUrl, searchQuery) {
     const previewResult = await runSiteContextPreview(page, 120000);
     const landInfoResult = await loadLandInfo(page, 60000);
     const buildingResult = await loadBuildingRegister(page, 60000);
-    const downloadResult = await downloadModel(page, "dxf", 120000);
+    const downloadResult = await downloadModel(page, "3dm", 180000);
 
     return {
-      name: "address-dxf-smoke",
+      name: "address-3dm-smoke",
       searchQuery,
       selectionSummary,
       ...previewResult,
@@ -698,7 +698,7 @@ async function main() {
 
   try {
     const scenarios = [];
-    if (!onlyScenario || onlyScenario === "address-dxf-smoke") {
+    if (!onlyScenario || onlyScenario === "address-3dm-smoke") {
       scenarios.push(await runSmokeScenario(context, baseUrl, searchQuery));
     }
 

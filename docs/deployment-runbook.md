@@ -19,7 +19,7 @@ Folder split:
 Use this exact sequence for each release:
 
 1. Edit and test in `C:\SpaceWork_develop`
-2. Run `deploy\run-test-site.bat`
+2. Run `deploy\CLICK_1_START_BOTH_WEB.bat`
 3. Confirm the selected version at `http://127.0.0.1:3001/test`
 4. If Cloudflare test routing is active, confirm the same build at `https://spaceswork.net/test`
 5. Commit and push the selected version from `C:\SpaceWork_develop`
@@ -46,10 +46,10 @@ Recommended local settings:
   - `PORT`: `3000`
   - `PUBLIC_BASE_URL`: `https://spaceswork.net/main`
 
-`ROUTE_BASE_PATH` can stay out of `config.local.json` because the wrapper scripts already set it:
+`ROUTE_BASE_PATH` can stay out of `config.local.json` because the shared start button and PowerShell helpers already set it:
 
-- `deploy\run-test-site.bat` sets `/test`
-- `deploy\run-home-site.bat` and `deploy\run-home-prod-server.bat` set `/main`
+- `deploy\CLICK_1_START_BOTH_WEB.bat` starts `/test` on port `3001`
+- `deploy\CLICK_1_START_BOTH_WEB.bat` starts `/main` on port `3000`
 
 ## Cloudflare Routing
 
@@ -66,9 +66,16 @@ Keep router port forwarding closed unless you intentionally choose a different a
 Run these in `C:\SpaceWork_develop` before promoting a build:
 
 ```powershell
+npm.cmd run verify:predeploy-terrain
 npm.cmd run verify:baseline
-npm.cmd run verify:deployment-security
 ```
+
+`verify:contour-defaults` is the hard regression gate for the native 5m
+contour terrain work. It locks the Muak-dong 82 golden case across stepped and
+smooth terrain, 3DM geometry, SKP payload geometry, flat reference contour
+curves, and closed smooth SKP terrain mass counts. Run it after every terrain,
+export, UI option, or optimization change before checking the public `/test`
+page.
 
 Run the production update from `C:\SpaceWork_deploy`:
 

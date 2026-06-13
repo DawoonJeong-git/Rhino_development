@@ -154,7 +154,10 @@ async function summarize3dmTerrainBands(threeDmBytes, exportSiteContext) {
     const layerName = layerNames.get(attributes.layerIndex);
     const objectName = String(attributes.name || "").trim();
 
-    if (layerName !== "terrain" || !objectName.startsWith("TERRAIN_BAND_")) {
+    if (
+      !["MODEL_TERRAIN", "terrain"].includes(layerName) ||
+      !objectName.startsWith("TERRAIN_BAND_")
+    ) {
       continue;
     }
 

@@ -1110,6 +1110,51 @@ h3 {
   justify-content: center;
 }
 
+.info-action-row {
+  align-items: stretch;
+}
+
+.info-action-button {
+  position: relative;
+  display: grid !important;
+  grid-template-rows: auto auto;
+  align-content: center;
+  justify-items: center;
+  gap: 3px;
+  min-width: 0;
+  min-height: 54px !important;
+  padding: 8px 7px !important;
+  line-height: 1.12;
+  text-align: center;
+  white-space: normal;
+}
+
+.info-action-button::before {
+  content: attr(data-action-role);
+  display: block;
+  max-width: 100%;
+  color: rgba(127, 53, 80, 0.72);
+  font-size: 0.64rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.info-action-button[data-action-role="외부 연결"]::after {
+  content: "";
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 6px;
+  height: 6px;
+  border-top: 2px solid rgba(127, 53, 80, 0.58);
+  border-right: 2px solid rgba(127, 53, 80, 0.58);
+}
+
 .land-info-section {
   margin-top: 12px;
 }
@@ -1268,19 +1313,23 @@ h3 {
 .download-action-grid {
   display: grid;
   gap: 8px;
-  align-items: end;
+  align-items: stretch;
 }
 
 .range-action-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(138px, 0.72fr) repeat(2, minmax(0, 1fr));
 }
 
 .preview-button-wrap {
-  grid-column: 1 / -1;
+  grid-column: auto;
 }
 
 .download-action-grid {
-  grid-template-columns: 1fr;
+  grid-template-columns: minmax(138px, 0.72fr) minmax(0, 2fr);
+}
+
+.download-action-grid .output-grid {
+  min-width: 0;
 }
 
 .form-section-title {
@@ -1294,10 +1343,11 @@ h3 {
 
 .output-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
 
+.range-action-grid > label,
 .output-grid label {
   margin: 0;
   min-height: 100%;
@@ -1574,9 +1624,6 @@ h3 {
     order: 0;
   }
 
-  .range-action-grid,
-  .download-action-grid,
-  .output-grid,
   .card:not(.model-card) .compact-row {
     grid-template-columns: 1fr;
   }
@@ -1602,7 +1649,6 @@ h3 {
   .card-header,
   .search-row,
   .meta-grid,
-  .output-grid,
   .toggle-grid,
   .parcel-group-item-header,
   .building-item-grid,
@@ -1646,5 +1692,13 @@ h3 {
   .parcel-group-actions {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 360px) {
+  .range-action-grid,
+  .download-action-grid,
+  .output-grid {
+    grid-template-columns: 1fr;
   }
 }

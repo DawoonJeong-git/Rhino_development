@@ -178,7 +178,8 @@ async function main() {
     checks,
     "runtime-sparse-core-files",
     [
-      "/deploy/run-home-site.bat",
+      "/deploy/CLICK_1_START_BOTH_WEB.bat",
+      "/deploy/start-server.ps1",
       "/deploy/start-cloudflare-tunnel.ps1",
       "/deploy/update-home-prod.ps1",
     ].every((requiredPath) => String(sparseManifestText || "").includes(requiredPath)),
