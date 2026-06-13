@@ -182,6 +182,7 @@ async function main() {
       "/deploy/start-server.ps1",
       "/deploy/start-cloudflare-tunnel.ps1",
       "/deploy/update-home-prod.ps1",
+      "/src/features/generate-3d/terrain-site-model/contour/",
     ].every((requiredPath) => String(sparseManifestText || "").includes(requiredPath)),
     "deploy/runtime-sparse-checkout.txt should keep the core Cloudflare runtime files."
   );

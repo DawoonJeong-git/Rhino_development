@@ -10,6 +10,7 @@
 /docs/
 /DEVELOPMENT_STATUS.md
 /scripts/export-worker.mjs
+/src/features/generate-3d/terrain-site-model/contour/
 /deploy/CLICK_1_START_BOTH_WEB.bat
 /deploy/CLICK_2_GIT_PUSH_DEVELOP.bat
 /deploy/CLICK_3_GIT_PULL_DEPLOY.bat
