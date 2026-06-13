@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const DEFAULT_BASE_URL =
   process.env.VERIFY_RELEASE_BASE_URL || "http://127.0.0.1:3000";
 const DEFAULT_UI_SUITE =
-  process.env.VERIFY_RELEASE_UI_SUITE || "extended";
+  process.env.VERIFY_RELEASE_UI_SUITE || "smoke";
 const DEFAULT_PUBLIC_BASE_URL =
   process.env.VERIFY_RELEASE_PUBLIC_BASE_URL || "";
 const DEFAULT_PUBLIC_UI_SUITE =

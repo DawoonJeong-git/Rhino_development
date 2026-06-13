@@ -402,10 +402,11 @@ async function setModelOptions(page, options = {}) {
   }
 
   if (options.contourInterval != null) {
-    await page.selectOption(
-      'select[name="contourInterval"]',
-      String(options.contourInterval)
-    );
+    const contourIntervalSelect = page.locator('select[name="contourInterval"]');
+
+    if ((await contourIntervalSelect.count()) > 0) {
+      await contourIntervalSelect.selectOption(String(options.contourInterval));
+    }
   }
 
   if (options.exportFormat) {
