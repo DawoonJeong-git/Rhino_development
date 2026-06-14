@@ -4,121 +4,104 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Spaceswork</title>
-    <link rel="stylesheet" href="/hub.css?v=20260331-rose2" />
+    <link rel="stylesheet" href="/hub.css?v=20260615-hub-dev9" />
   </head>
   <body>
     <main class="hub-shell">
       <section class="hero">
         <div class="hero-copy">
           <p class="eyebrow">Spaceswork</p>
-          <h1>대지·건물 검토 서비스</h1>
-          <p class="hero-lead">
-            주소 검색, 토지·건축물 정보 확인, 3D 파일 출력과 검토 기능을 한 화면에서
-            살펴볼 수 있습니다.
+          <h1>건축 설계 보조 도구 개발</h1>
+          <p class="hero-notice">
+            이 서비스는 개발 중인 페이지이며 운영 비용 문제로 지인들에게만 공유하고
+            있습니다. 제가 모르는 타인에게는 공유하지 말아 주세요.
           </p>
-        </div>
-        <div class="hero-status">
-          <div class="status-chip">
-            <span>현재 제공</span>
-            <strong>주소 검색 · 정보 조회</strong>
-          </div>
-          <div class="status-chip">
-            <span>현재 제공</span>
-            <strong>3D 파일 출력</strong>
-          </div>
-          <div class="status-chip">
-            <span>추가 예정</span>
-            <strong>검토 기능 확장</strong>
+          <div class="creator-info" aria-label="만든 사람 정보">
+            <p>만든 사람</p>
+            <strong>Dawoon Jeong</strong>
+            <a href="mailto:dawnee@kaist.ac.kr">dawnee@kaist.ac.kr</a>
+            <a href="https://sites.google.com/view/dawoon-jeong/about">
+              sites.google.com/view/dawoon-jeong/about
+            </a>
           </div>
         </div>
-      </section>
-
-      <section class="service-note" aria-label="서비스 구성">
-        <div>
-          <p class="card-kicker">구성</p>
-          <h2>현재 제공 범위</h2>
-        </div>
-        <ul class="service-list">
-          <li>주소 검색과 지도 선택</li>
-          <li>토지·건축물 정보 확인</li>
-          <li>3D 파일 출력과 후속 검토</li>
-        </ul>
       </section>
 
       <section class="hub-grid" id="services" aria-label="서비스 목록">
         <article class="feature-card feature-card-live">
           <div class="feature-head">
-            <p class="card-kicker">현재 제공</p>
-            <span class="feature-badge is-live">사용 가능</span>
+            <h2>대지·건물 3D 검토</h2>
+            <a class="feature-link" href="/contour3dmodel">기능 열기</a>
           </div>
-          <h2>대지·건물 3D 검토</h2>
           <p class="card-copy">
-            주소 검색과 지도 선택으로 대상지를 정하고, 토지·건축물 정보와 주변 맥락을
-            확인한 뒤 3D 파일로 이어집니다.
+            주소·지번 검색이나 지도 선택으로 대상지를 지정하고, 실제 필지 경계·공식
+            등고 지형·주변 건물·도로 데이터를 조합해 3D 대지모형을 생성합니다.
+            토지이음·건축물대장 요약을 함께 확인하고 3DM/SKP 파일로 출력할 수 있습니다.
           </p>
           <dl class="feature-meta">
             <div>
-              <dt>주요 기능</dt>
-              <dd>주소 검색 · 정보 조회 · 지형/건물 확인</dd>
+              <dt>입력 방식</dt>
+              <dd>주소 검색 · 지도 클릭 · 다중 필지 선택 · 직접 범위 지정</dd>
+            </div>
+            <div>
+              <dt>생성 내용</dt>
+              <dd>필지 경계 · 5m 등고 기반 지형 · 주변 건물/도로 컨텍스트</dd>
             </div>
             <div>
               <dt>출력 형식</dt>
-              <dd>3DM · OBJ · DXF · SKP</dd>
+              <dd>3DM · SKP</dd>
             </div>
           </dl>
-          <div class="feature-actions">
-            <a class="feature-link" href="/contour3dmodel">기능 열기</a>
-          </div>
         </article>
 
-        <article class="feature-card feature-card-plan">
+        <article class="feature-card feature-card-dev">
           <div class="feature-head">
-            <p class="card-kicker">준비 중</p>
-            <span class="feature-badge">준비 중</span>
+            <h2>법규 기반 최대 매스 검토</h2>
+            <a class="feature-link" href="/max-mass">(개발 중)</a>
           </div>
-          <h2>문화재 발굴 위험도 검토</h2>
           <p class="card-copy">
-            후보지 주변의 조사 이력과 발굴 가능성을 한눈에 검토할 수 있도록 준비 중인
-            기능입니다.
+            대지와 법규 조건을 바탕으로 건축 가능한 최대 외피와 제한 요인을 빠르게
+            확인하는 개발 중인 기능입니다.
           </p>
           <dl class="feature-meta">
             <div>
-              <dt>예정 범위</dt>
-              <dd>문화재 조사 이력과 발굴 가능성 검토</dd>
+              <dt>개발 내용</dt>
+              <dd>건축 가능 영역 · 건폐율/용적률 · 높이 제한 검토</dd>
+            </div>
+            <div>
+              <dt>검토 기준</dt>
+              <dd>대지 조건 · 법규 조건 · 제한 요인</dd>
             </div>
             <div>
               <dt>공개 상태</dt>
-              <dd>순차 제공 예정</dd>
+              <dd>개발 중 미리보기</dd>
             </div>
           </dl>
-          <div class="feature-actions">
-            <span class="feature-link is-secondary is-disabled" aria-disabled="true">준비 중</span>
-          </div>
         </article>
 
         <article class="feature-card feature-card-plan">
           <div class="feature-head">
-            <p class="card-kicker">준비 중</p>
-            <span class="feature-badge">준비 중</span>
+            <h2>문화재 발굴 위험도 검토</h2>
+            <span class="feature-link is-secondary is-disabled" aria-disabled="true">미개발</span>
           </div>
-          <h2>법규 기반 최대 매스 검토</h2>
           <p class="card-copy">
-            대지와 법규 조건을 바탕으로 초기 볼륨과 배치 가능성을 빠르게 검토할 수
+            후보지 주변의 문화재 조사 이력과 발굴 가능성을 지도 중심으로 살펴볼 수
             있도록 준비 중인 기능입니다.
           </p>
           <dl class="feature-meta">
             <div>
-              <dt>예정 범위</dt>
-              <dd>법규 해석과 초기 볼륨 검토</dd>
+              <dt>예정 내용</dt>
+              <dd>문화재 조사 이력과 발굴 가능성 검토</dd>
+            </div>
+            <div>
+              <dt>검토 방식</dt>
+              <dd>후보지 주변 이력과 가능성 지도 검토</dd>
             </div>
             <div>
               <dt>공개 상태</dt>
               <dd>순차 제공 예정</dd>
             </div>
           </dl>
-          <div class="feature-actions">
-            <span class="feature-link is-secondary is-disabled" aria-disabled="true">준비 중</span>
-          </div>
         </article>
       </section>
     </main>

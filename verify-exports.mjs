@@ -1225,6 +1225,10 @@ async function runBaselineVerification() {
       "Contour 3D model should stay publicly enabled by default."
     );
     assert.ok(
+      configPayload?.features?.publicEnabledFeatures?.includes("max-mass"),
+      "Max-mass should be publicly enabled by default as a development preview."
+    );
+    assert.ok(
       !configPayload?.features?.publicEnabledFeatures?.includes("heritage-risk"),
       "Heritage-risk should stay out of the public enabled list by default."
     );
@@ -1407,6 +1411,14 @@ async function runBaselineVerification() {
       true,
       "Unreleased feature routes should stay blocked when they are not included in the public feature list."
     );
+    assert.equal(
+      isInternalOnlyStaticPath("/max-mass", {
+        publicEnabledFeatures: ["contour3dmodel", "max-mass"],
+        internalOnlyStaticPaths: ["/max-mass"],
+      }),
+      false,
+      "Max-mass should stay open when it is included as a public development preview."
+    );
     const responseCacheStore = new Map();
     const responseCacheInFlight = new Map();
     let responseCacheLoaderCalls = 0;
@@ -1588,15 +1600,20 @@ async function runBaselineVerification() {
       /법규 기반 최대 매스 검토/,
       "Main page should still introduce the max-mass feature."
     );
+    assert.match(
+      hubHtml,
+      /\/max-mass/,
+      "Main page should link to the max-mass development preview."
+    );
+    assert.match(
+      hubHtml,
+      /\(개발 중\)/,
+      "Main page should label the max-mass preview action as development."
+    );
     assert.doesNotMatch(
       hubHtml,
       /\/heritage-risk/,
       "Main page should not publicly expose the heritage-risk route before release."
-    );
-    assert.doesNotMatch(
-      hubHtml,
-      /\/max-mass/,
-      "Main page should not publicly expose the max-mass route before release."
     );
     const hubCsp = hubResponse.headers.get("content-security-policy");
     assert.ok(hubCsp, "Hub page should send a CSP header.");

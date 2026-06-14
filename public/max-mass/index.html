@@ -3,88 +3,180 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>법규 기반 최대 매스 생성</title>
-    <link rel="stylesheet" href="/future-pages.css?v=20260326-future1" />
+    <title>법규 기반 최대 매스 검토</title>
+    <link rel="stylesheet" href="/styles.css?v=20260610-model-output-card1" />
+    <link rel="stylesheet" href="/max-mass/max-mass.css?v=20260615-maxmass1" />
   </head>
   <body data-page="max-mass">
-    <main class="future-shell">
-      <section class="future-hero">
-        <nav class="future-nav" aria-label="페이지 이동">
-          <a href="/">허브로</a>
-          <a href="/contour3dmodel">대지·건물 3D 검토</a>
-          <a class="is-primary" href="/max-mass">최대 매스 생성</a>
-        </nav>
-        <p class="eyebrow">Roadmap Stage 8</p>
-        <h1>법규 기반 최대 매스 생성</h1>
-        <p class="hero-copy">
-          대지 조건과 법규 해석을 바탕으로 초기 최대 매스를 검토하는 기능을 위한
-          페이지입니다. 지금은 실제 생성 로직을 넣기 전에, 기능이 들어올 자리와
-          흐름을 먼저 잡아둔 상태입니다.
-        </p>
-        <dl class="hero-meta">
-          <div>
-            <dt>페이지 주소</dt>
-            <dd><code>/max-mass</code></dd>
+    <div class="app-shell max-mass-shell">
+      <header class="topbar">
+        <div class="topbar-copy">
+          <p class="eyebrow">법규 · 외피 · 검토</p>
+          <h1>법규 기반 최대 매스 검토</h1>
+          <p class="topbar-subtitle">대지 조건을 기준으로 건축 가능 외피를 검토합니다.</p>
+        </div>
+        <div class="topbar-actions">
+          <a class="link-button secondary-button" href="/">메인으로</a>
+          <a class="link-button secondary-button" href="/contour3dmodel">대지·건물 3D 검토</a>
+          <div class="status-badge">개발 중</div>
+        </div>
+        <div class="topbar-highlights" aria-label="작업 흐름">
+          <article class="topbar-highlight">
+            <p class="topbar-highlight-label">대상지</p>
+            <strong>필지 경계</strong>
+            <p>검색 또는 지도 선택</p>
+          </article>
+          <article class="topbar-highlight">
+            <p class="topbar-highlight-label">조건</p>
+            <strong>법규 제약</strong>
+            <p>건폐율 · 용적률 · 높이</p>
+          </article>
+          <article class="topbar-highlight">
+            <p class="topbar-highlight-label">결과</p>
+            <strong>최대 외피</strong>
+            <p>평면 영역과 3D 한계</p>
+          </article>
+        </div>
+      </header>
+
+      <section class="toolbar max-mass-toolbar">
+        <form class="search-form" aria-label="대상지 입력">
+          <label class="search-label" for="maxMassSearchInput">주소 · 지번</label>
+          <div class="search-row">
+            <input
+              id="maxMassSearchInput"
+              name="query"
+              type="text"
+              placeholder="대상지를 입력하세요"
+              autocomplete="off"
+            />
+            <button type="button" disabled>대상지 불러오기</button>
           </div>
-          <div>
-            <dt>중심 인터페이스</dt>
-            <dd>규제 요약 + 매스 비교</dd>
+          <p class="helper-text">대지·건물 3D 검토의 선택 흐름과 같은 규칙으로 연결됩니다.</p>
+        </form>
+
+        <div class="selection-summary-stack">
+          <div class="selection-summary">
+            대상지를 선택하면 법규 조건과 최대 외피가 표시됩니다.
           </div>
-          <div>
-            <dt>현재 상태</dt>
-            <dd>준비 중인 확장 페이지</dd>
-          </div>
-        </dl>
+        </div>
       </section>
 
-      <section class="future-grid" aria-label="기능 구상">
-        <article class="future-card">
-          <h2>우선 붙을 흐름</h2>
-          <ul class="future-list">
-            <li>대지와 필지 그룹을 불러옵니다.</li>
-            <li>법규 조건을 요약 카드로 정리합니다.</li>
-            <li>조건에 맞는 초기 최대 매스를 생성합니다.</li>
-            <li>여러 안을 비교하고, 필요 시 대지·건물 3D 검토와 교차 검토합니다.</li>
-          </ul>
-        </article>
+      <main class="workspace max-mass-workspace">
+        <section class="map-panel max-mass-stage-panel">
+          <div class="max-mass-stage" aria-label="최대 매스 미리보기">
+            <div class="site-outline">
+              <span class="setback-line setback-line-north"></span>
+              <span class="setback-line setback-line-east"></span>
+              <span class="setback-line setback-line-south"></span>
+              <span class="setback-line setback-line-west"></span>
+              <div class="envelope-mass">
+                <span class="mass-roof"></span>
+                <span class="mass-face mass-face-front"></span>
+                <span class="mass-face mass-face-side"></span>
+              </div>
+            </div>
+          </div>
+          <div class="map-legend">
+            <span class="legend-item">
+              <span class="legend-swatch legend-swatch-parcel"></span>
+              필지 경계
+            </span>
+            <span class="legend-item">
+              <span class="legend-swatch legend-swatch-clip"></span>
+              건축 가능 영역
+            </span>
+            <span class="legend-item">
+              <span class="legend-swatch legend-swatch-building"></span>
+              최대 외피
+            </span>
+          </div>
+        </section>
 
-        <article class="future-card">
-          <h2>예상 출력 방향</h2>
-          <ul class="future-list">
-            <li>규제 요약 카드</li>
-            <li>최대 매스 미리보기</li>
-            <li>안별 비교 패널</li>
-            <li>그룹별 3D 또는 CAD handoff</li>
-          </ul>
-        </article>
+        <section class="side-panel">
+          <article class="card">
+            <div class="card-header">
+              <div>
+                <p class="card-kicker">대상지</p>
+                <h2>기본 조건</h2>
+              </div>
+            </div>
+            <dl class="meta-grid">
+              <div>
+                <dt>대지 경계</dt>
+                <dd>선택 후 표시</dd>
+              </div>
+              <div>
+                <dt>접도 조건</dt>
+                <dd>선택 후 표시</dd>
+              </div>
+              <div>
+                <dt>대지 면적</dt>
+                <dd>선택 후 표시</dd>
+              </div>
+              <div>
+                <dt>용도지역</dt>
+                <dd>선택 후 표시</dd>
+              </div>
+            </dl>
+          </article>
 
-        <article class="future-card">
-          <h2>디자인 메모</h2>
-          <p>
-            이 페이지는 지도만 보기보다 규제 해석과 안 비교가 중요하므로,
-            오른쪽에 분석 패널을 두고 중앙에는 대지와 매스를 크게 보여주는 방식이
-            잘 맞습니다.
-          </p>
-        </article>
+          <article class="card">
+            <div class="card-header">
+              <div>
+                <p class="card-kicker">법규</p>
+                <h2>제약 조건</h2>
+              </div>
+            </div>
+            <dl class="meta-grid">
+              <div>
+                <dt>건폐율</dt>
+                <dd>계산 대기</dd>
+              </div>
+              <div>
+                <dt>용적률</dt>
+                <dd>계산 대기</dd>
+              </div>
+              <div>
+                <dt>이격/공지</dt>
+                <dd>계산 대기</dd>
+              </div>
+              <div>
+                <dt>높이 제한</dt>
+                <dd>계산 대기</dd>
+              </div>
+            </dl>
+          </article>
 
-        <article class="future-card">
-          <h2>연동 메모</h2>
-          <p>
-            다중 필지 선택, 필지 그룹 분리, 이후의 비교 기능과 잘 연결됩니다.
-            현재의 <code>/contour3dmodel</code>이 입력 페이지라면,
-            <code>/max-mass</code>는 초기 설계 검토 페이지가 됩니다.
-          </p>
-        </article>
-      </section>
-
-      <section class="future-note">
-        <h2>현재는 페이지 뼈대만 열어둔 상태입니다</h2>
-        <p>
-          이번 단계에서는 앞으로 붙을 최대 매스 기능의 전용 주소와 화면 틀을
-          먼저 만들었습니다. 실제 규제 해석과 생성 알고리즘은 다음 구현 단계에서
-          이어서 붙이면 됩니다.
-        </p>
-      </section>
-    </main>
+          <article class="card">
+            <div class="card-header">
+              <div>
+                <p class="card-kicker">결과</p>
+                <h2>최대 외피</h2>
+              </div>
+              <button class="secondary-button" type="button" disabled>검토 실행</button>
+            </div>
+            <dl class="meta-grid">
+              <div>
+                <dt>건축 가능 영역</dt>
+                <dd>대기</dd>
+              </div>
+              <div>
+                <dt>최대 건축면적</dt>
+                <dd>대기</dd>
+              </div>
+              <div>
+                <dt>최대 연면적</dt>
+                <dd>대기</dd>
+              </div>
+              <div>
+                <dt>우선 제한</dt>
+                <dd>대기</dd>
+              </div>
+            </dl>
+          </article>
+        </section>
+      </main>
+    </div>
   </body>
 </html>

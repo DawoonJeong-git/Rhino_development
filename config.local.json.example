@@ -6,7 +6,8 @@
   "VWORLD_API_DOMAIN": "__PUT_VWORLD_API_DOMAIN_HERE__",
   "PUBLIC_BASE_URL": "",
   "PUBLIC_ENABLED_FEATURES": [
-    "contour3dmodel"
+    "contour3dmodel",
+    "max-mass"
   ],
   "AD_PREVIEW_ALLOWED_PATHS": [
     "/",

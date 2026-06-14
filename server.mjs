@@ -171,7 +171,7 @@ const DEFAULT_AD_PREVIEW_ALLOWED_PATHS = Object.freeze([
 ]);
 const DEFAULT_ROUTE_BASE_PATH = "";
 const DEFAULT_INTERNAL_ONLY_STATIC_PATHS = Object.freeze([]);
-const DEFAULT_PUBLIC_ENABLED_FEATURES = Object.freeze(["contour3dmodel"]);
+const DEFAULT_PUBLIC_ENABLED_FEATURES = Object.freeze(["contour3dmodel", "max-mass"]);
 const DEFAULT_AD_PREVIEW_FRAME_ANCESTORS = Object.freeze([
   "'self'",
   "https://ads.google.com",
@@ -187,45 +187,55 @@ const FEATURE_PAGE_DEFINITIONS = Object.freeze([
   {
     id: "contour3dmodel",
     routePath: "/contour3dmodel",
+    status: "live",
     title: "대지·건물 3D 검토",
     summary:
-      "주소 검색과 지도 선택으로 대상지를 정하고, 토지·건축물 정보와 주변 맥락을 확인한 뒤 3D 파일로 이어집니다.",
+      "주소·지번 검색이나 지도 선택으로 대상지를 지정하고, 실제 필지 경계·공식 등고 지형·주변 건물·도로 데이터를 조합해 3D 대지모형을 생성합니다. 토지이음·건축물대장 요약을 함께 확인하고 3DM/SKP 파일로 출력할 수 있습니다.",
     enabledMeta: [
-      { label: "주요 기능", value: "주소 검색 · 정보 조회 · 지형/건물 확인" },
-      { label: "출력 형식", value: "3DM · OBJ · DXF · SKP" },
+      { label: "입력 방식", value: "주소 검색 · 지도 클릭 · 다중 필지 선택 · 직접 범위 지정" },
+      { label: "생성 내용", value: "필지 경계 · 5m 등고 기반 지형 · 주변 건물/도로 컨텍스트" },
+      { label: "출력 형식", value: "3DM · SKP" },
     ],
     disabledMeta: [
       { label: "상태", value: "곧 공개" },
       { label: "주요 내용", value: "대지 맥락 검토 + 3D/CAD 출력" },
+      { label: "출력 형식", value: "3DM · SKP" },
+    ],
+  },
+  {
+    id: "max-mass",
+    routePath: "/max-mass",
+    status: "development",
+    title: "법규 기반 최대 매스 검토",
+    summary:
+      "대지와 법규 조건을 바탕으로 건축 가능한 최대 외피와 제한 요인을 빠르게 확인하는 개발 중인 기능입니다.",
+    actionLabel: "(개발 중)",
+    enabledMeta: [
+      { label: "개발 내용", value: "건축 가능 영역 · 건폐율/용적률 · 높이 제한 검토" },
+      { label: "검토 기준", value: "대지 조건 · 법규 조건 · 제한 요인" },
+      { label: "공개 상태", value: "개발 중 미리보기" },
+    ],
+    disabledMeta: [
+      { label: "예정 내용", value: "법규 조건 기반 최대 건축 외피 검토" },
+      { label: "검토 기준", value: "대지 조건 · 법규 조건 · 제한 요인" },
+      { label: "공개 상태", value: "순차 제공 예정" },
     ],
   },
   {
     id: "heritage-risk",
     routePath: "/heritage-risk",
+    status: "planned",
     title: "문화재 발굴 위험도 검토",
     summary:
       "후보지 주변의 문화재 조사 이력과 발굴 가능성을 지도 중심으로 살펴볼 수 있도록 준비 중인 기능입니다.",
     enabledMeta: [
       { label: "바로가기", value: "/heritage-risk", code: true },
       { label: "주요 내용", value: "문화재 조사 이력과 발굴 가능성 검토" },
+      { label: "검토 방식", value: "후보지 주변 이력과 가능성 지도 검토" },
     ],
     disabledMeta: [
       { label: "예정 내용", value: "문화재 조사 이력과 발굴 가능성 검토" },
-      { label: "공개 상태", value: "순차 제공 예정" },
-    ],
-  },
-  {
-    id: "max-mass",
-    routePath: "/max-mass",
-    title: "법규 기반 최대 매스 검토",
-    summary:
-      "대지와 법규 조건을 바탕으로 초기 볼륨과 배치 가능성을 빠르게 살펴볼 수 있도록 준비 중인 기능입니다.",
-    enabledMeta: [
-      { label: "바로가기", value: "/max-mass", code: true },
-      { label: "주요 내용", value: "법규 해석과 초기 볼륨 검토" },
-    ],
-    disabledMeta: [
-      { label: "예정 내용", value: "법규 해석과 초기 볼륨 검토" },
+      { label: "검토 방식", value: "후보지 주변 이력과 가능성 지도 검토" },
       { label: "공개 상태", value: "순차 제공 예정" },
     ],
   },
@@ -929,28 +939,45 @@ function renderFeatureMetaRow(meta) {
   ].join("");
 }
 
+const FEATURE_STATUS_VIEW = Object.freeze({
+  live: {
+    cardClass: "feature-card-live",
+    actionLabel: "기능 열기",
+  },
+  development: {
+    cardClass: "feature-card-dev",
+    actionLabel: "(개발 중)",
+  },
+  planned: {
+    cardClass: "feature-card-plan",
+    disabledActionLabel: "미개발",
+  },
+});
+
 function renderHubFeatureCard(feature) {
-  const cardKicker = feature.publicEnabled ? "현재 제공" : "준비 중";
-  const badgeText = feature.publicEnabled ? "사용 가능" : "준비 중";
-  const badgeClass = feature.publicEnabled ? "feature-badge is-live" : "feature-badge";
-  const cardClass = feature.publicEnabled ? "feature-card-live" : "feature-card-plan";
+  const statusView =
+    FEATURE_STATUS_VIEW[feature.status] ||
+    (feature.publicEnabled ? FEATURE_STATUS_VIEW.live : FEATURE_STATUS_VIEW.planned);
+  const cardClass = statusView.cardClass;
   const metaRows = (feature.publicEnabled ? feature.enabledMeta : feature.disabledMeta)
     .map((meta) => renderFeatureMetaRow(meta))
     .join("");
   const actionMarkup = feature.publicEnabled
-    ? `<a class="feature-link" href="${escapeHtml(feature.routePath)}">기능 열기</a>`
-    : '<span class="feature-link is-secondary is-disabled" aria-disabled="true">준비 중</span>';
+    ? `<a class="feature-link" href="${escapeHtml(feature.routePath)}">${escapeHtml(
+        feature.actionLabel || statusView.actionLabel || "기능 열기"
+      )}</a>`
+    : `<span class="feature-link is-secondary is-disabled" aria-disabled="true">${escapeHtml(
+        statusView.disabledActionLabel || "준비 중"
+      )}</span>`;
 
   return [
     `<article class="feature-card ${cardClass}">`,
     '  <div class="feature-head">',
-    `    <p class="card-kicker">${cardKicker}</p>`,
-    `    <span class="${badgeClass}">${badgeText}</span>`,
+    `    <h2>${escapeHtml(feature.title)}</h2>`,
+    `    ${actionMarkup}`,
     "  </div>",
-    `  <h2>${escapeHtml(feature.title)}</h2>`,
     `  <p class="card-copy">${escapeHtml(feature.summary)}</p>`,
     `  <dl class="feature-meta">${metaRows}</dl>`,
-    `  <div class="feature-actions">${actionMarkup}</div>`,
     "</article>",
   ].join("\n");
 }
@@ -965,44 +992,24 @@ function renderHubHtml(config) {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Spaceswork</title>
-    <link rel="stylesheet" href="/hub.css?v=20260331-rose2" />
+    <link rel="stylesheet" href="/hub.css?v=20260615-hub-dev9" />
   </head>
   <body>
     <main class="hub-shell">
       <section class="hero">
         <div class="hero-copy">
           <p class="eyebrow">Spaceswork</p>
-          <h1>대지·건물 검토 서비스</h1>
-          <p class="hero-lead">
-            주소 검색, 토지·건축물 정보 확인, 3D 파일 출력과 검토 기능을 한 화면에서 살펴볼 수 있습니다.
+          <h1>건축 설계 보조 도구 개발</h1>
+          <p class="hero-notice">
+            이 서비스는 개발 중인 페이지이며 운영 비용 문제로 지인들에게만 공유하고 있습니다. 제가 모르는 타인에게는 공유하지 말아 주세요.
           </p>
-        </div>
-        <div class="hero-status">
-          <div class="status-chip">
-            <span>현재 제공</span>
-            <strong>주소 검색 · 정보 조회</strong>
-          </div>
-          <div class="status-chip">
-            <span>현재 제공</span>
-            <strong>3D 파일 출력</strong>
-          </div>
-          <div class="status-chip">
-            <span>추가 예정</span>
-            <strong>검토 기능 확장</strong>
+          <div class="creator-info" aria-label="만든 사람 정보">
+            <p>만든 사람</p>
+            <strong>Dawoon Jeong</strong>
+            <a href="mailto:dawnee@kaist.ac.kr">dawnee@kaist.ac.kr</a>
+            <a href="https://sites.google.com/view/dawoon-jeong/about">sites.google.com/view/dawoon-jeong/about</a>
           </div>
         </div>
-      </section>
-
-      <section class="service-note" aria-label="서비스 구성">
-        <div>
-          <p class="card-kicker">구성</p>
-          <h2>현재 제공 범위</h2>
-        </div>
-        <ul class="service-list">
-          <li>주소 검색과 지도 선택</li>
-          <li>토지·건축물 정보 확인</li>
-          <li>3D 파일 출력과 후속 검토</li>
-        </ul>
       </section>
 
       <section class="hub-grid" id="services" aria-label="서비스 목록">
