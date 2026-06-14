@@ -2601,7 +2601,8 @@ function renderLandInfo() {
   `;
   landInfoNote.textContent = getRequestAwareNote(
     "landInfo",
-    `${state.landInfo.address || buildSelectionLabel(state.selectedLocation)} 기준 토지 정보를 정리했습니다.`
+    state.landInfo.note ||
+      `${state.landInfo.address || buildSelectionLabel(state.selectedLocation)} 기준 토지 정보를 정리했습니다.`
   );
   renderInfoItems(
     landInfoList,

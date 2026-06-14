@@ -44,7 +44,7 @@ const SITE_CONTEXT_CACHE_TTL_MS = 1000 * 60 * 10;
 const SITE_CONTEXT_CACHE_MAX_ENTRIES = 12;
 const GEOCODE_CACHE_TTL_MS = 1000 * 60 * 10;
 const GEOCODE_CACHE_MAX_ENTRIES = 256;
-const PROPERTY_DATA_CACHE_TTL_MS = 1000 * 60 * 10;
+const PROPERTY_DATA_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
 const PROPERTY_DATA_CACHE_MAX_ENTRIES = 64;
 const EXPORT_ARTIFACT_CACHE_TTL_MS = 1000 * 60 * 5;
 const EXPORT_ARTIFACT_CACHE_MAX_ENTRIES = 8;
@@ -126,6 +126,8 @@ const DEFAULT_BIND_HOST = "127.0.0.1";
 const DEFAULT_OUTBOUND_FETCH_TIMEOUT_MS = 15_000;
 const LONG_OUTBOUND_FETCH_TIMEOUT_MS = 25_000;
 const OVERPASS_FETCH_TIMEOUT_MS = 35_000;
+const EUM_LAND_INFO_FAST_TIMEOUT_MS = 5_000;
+const EUM_LAND_INFO_BACKGROUND_TIMEOUT_MS = 130_000;
 const DEFAULT_PROVIDER_FETCH_TIMEOUTS_MS = Object.freeze({
   vworld: 20_000,
   juso: 18_000,
@@ -8327,6 +8329,81 @@ function parseAreaText(value) {
   };
 }
 
+function buildEumOfficialLinks(parcelReference, location) {
+  return {
+    detailFormAction: "https://www.eum.go.kr/web/ar/lu/luLandDet.jsp",
+    detailFormFields: {
+      selGbn: "umd",
+      isNoScr: "script",
+      s_type: "1",
+      mode: "search",
+      sggcd: parcelReference.sigunguCd,
+      pnu: parcelReference.pnu,
+      p_location: buildSystemAddress(location),
+    },
+    mapUrl:
+      `https://www.eum.go.kr/web/ar/lu/luLandPop.jsp?pnu=${parcelReference.pnu}` +
+      "&default_scale=1200&scale=1200",
+    issueUrl:
+      "https://www.gov.kr/mw/AA020InfoCappView.do?HighCtgCD=A09005&CappBizCD=15000000013&tp_seq=01",
+  };
+}
+
+function buildEumLandInfoFallback(parcelReference, location, reason = "") {
+  return {
+    address: buildSystemAddress(location),
+    parcelReference,
+    summary: {
+      landCategory: "확인 필요",
+      areaText: "확인 필요",
+      areaSquareMeters: null,
+      announcedPrice: "확인 필요",
+      urbanPlanningCount: 0,
+      otherLawCount: 0,
+    },
+    regulations: {
+      urbanPlanningItems: [],
+      otherLawItems: [],
+    },
+    official: buildEumOfficialLinks(parcelReference, location),
+    sourceStatus: "delayed",
+    note:
+      "토지이음 응답이 지연되어 기본 필지 정보와 공식 링크를 먼저 표시했습니다. 잠시 후 다시 조회하면 서버 캐시가 반영될 수 있습니다.",
+    warning: reason,
+  };
+}
+
+function hasFreshEumLandPageCache(parcelReference) {
+  const cacheKey = buildParcelDataCacheKey(parcelReference, "eum-land-page");
+  return readTimedCachePayload(eumLandPageCache, cacheKey, {
+    ttlMs: PROPERTY_DATA_CACHE_TTL_MS,
+    maxEntries: PROPERTY_DATA_CACHE_MAX_ENTRIES,
+  }).hit;
+}
+
+function warmEumLandPageCache(parcelReference, location, config = null) {
+  const cacheKey = buildParcelDataCacheKey(parcelReference, "eum-land-page");
+
+  if (
+    !cacheKey ||
+    hasFreshEumLandPageCache(parcelReference) ||
+    eumLandPageInFlight.has(cacheKey)
+  ) {
+    return;
+  }
+
+  void fetchEumLandPage(parcelReference, location, config, {
+    attempts: 1,
+    timeoutMs: EUM_LAND_INFO_BACKGROUND_TIMEOUT_MS,
+  }).catch((error) => {
+    console.warn(
+      `[eum-land-info] background warm failed pnu=${parcelReference?.pnu || ""} reason=${
+        error instanceof Error ? error.message : error
+      }`
+    );
+  });
+}
+
 function parseEumLandInfoHtml(html, parcelReference, location) {
   const landCategory =
     cleanHtmlText(
@@ -8362,27 +8439,11 @@ function parseEumLandInfoHtml(html, parcelReference, location) {
       urbanPlanningItems,
       otherLawItems,
     },
-    official: {
-      detailFormAction: "https://www.eum.go.kr/web/ar/lu/luLandDet.jsp",
-      detailFormFields: {
-        selGbn: "umd",
-        isNoScr: "script",
-        s_type: "1",
-        mode: "search",
-        sggcd: parcelReference.sigunguCd,
-        pnu: parcelReference.pnu,
-        p_location: buildSystemAddress(location),
-      },
-      mapUrl:
-        `https://www.eum.go.kr/web/ar/lu/luLandPop.jsp?pnu=${parcelReference.pnu}` +
-        "&default_scale=1200&scale=1200",
-      issueUrl:
-        "https://www.gov.kr/mw/AA020InfoCappView.do?HighCtgCD=A09005&CappBizCD=15000000013&tp_seq=01",
-    },
+    official: buildEumOfficialLinks(parcelReference, location),
   };
 }
 
-async function fetchEumLandPage(parcelReference, location, config = null) {
+async function fetchEumLandPage(parcelReference, location, config = null, options = {}) {
   const cacheKey = buildParcelDataCacheKey(parcelReference, "eum-land-page");
   const cachedPage = await readOrLoadResponseCache(
     eumLandPageCache,
@@ -8411,7 +8472,7 @@ async function fetchEumLandPage(parcelReference, location, config = null) {
             },
             {
               requestLabel: "EUM request",
-              timeoutMs: config?.providerTimeouts?.eum,
+              timeoutMs: options?.timeoutMs || config?.providerTimeouts?.eum,
             }
           );
 
@@ -8422,7 +8483,7 @@ async function fetchEumLandPage(parcelReference, location, config = null) {
           return readEncodedResponseText(response, "euc-kr");
         },
         {
-          attempts: 2,
+          attempts: options?.attempts || 1,
           label: "eum-page",
         }
       );
@@ -8442,8 +8503,28 @@ async function fetchEumLandPage(parcelReference, location, config = null) {
 }
 
 async function fetchEumLandInfo(parcelReference, location, config = null) {
-  const page = await fetchEumLandPage(parcelReference, location, config);
-  return page.landInfo;
+  try {
+    const page = await fetchEumLandPage(parcelReference, location, config, {
+      attempts: 1,
+      timeoutMs: Math.min(
+        Number(config?.providerTimeouts?.eum) || EUM_LAND_INFO_FAST_TIMEOUT_MS,
+        EUM_LAND_INFO_FAST_TIMEOUT_MS
+      ),
+    });
+    return page.landInfo;
+  } catch (error) {
+    warmEumLandPageCache(parcelReference, location, config);
+    console.warn(
+      `[eum-land-info] fast fallback pnu=${parcelReference?.pnu || ""} reason=${
+        error instanceof Error ? error.message : error
+      }`
+    );
+    return buildEumLandInfoFallback(
+      parcelReference,
+      location,
+      error instanceof Error ? error.message : String(error || "")
+    );
+  }
 }
 
 async function fetchEumLandInfoDetails(parcelReference, location, config) {
