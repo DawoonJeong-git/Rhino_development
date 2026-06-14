@@ -2519,7 +2519,7 @@ function renderInfoItems(container, items, emptyMessage) {
         return;
       }
 
-      popup.location.replace(detailUrl);
+      popup.location.replace(buildAppUrl(detailUrl));
     });
   });
 }
@@ -2864,7 +2864,7 @@ function buildLandRegulationCards(items, emptyMessage) {
           <p class="meta">${escapeHtml(item.category || "")}</p>
           ${
             item.detailUrl
-              ? `<p class="notice">상세 링크: ${escapeHtml(item.detailUrl)}</p>`
+              ? `<p class="notice">상세 링크: ${escapeHtml(buildAppUrl(item.detailUrl))}</p>`
               : ""
           }
         </section>
