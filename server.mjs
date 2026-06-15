@@ -992,7 +992,7 @@ function renderHubHtml(config) {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Spaceswork</title>
-    <link rel="stylesheet" href="/hub.css?v=20260615-hub-dev9" />
+    <link rel="stylesheet" href="/hub.css?v=20260615-hub-dev10" />
   </head>
   <body>
     <main class="hub-shell">
@@ -1000,9 +1000,10 @@ function renderHubHtml(config) {
         <div class="hero-copy">
           <p class="eyebrow">Spaceswork</p>
           <h1>건축 설계 보조 도구 개발</h1>
-          <p class="hero-notice">
-            이 서비스는 개발 중인 페이지이며 운영 비용 문제로 지인들에게만 공유하고 있습니다. 제가 모르는 타인에게는 공유하지 말아 주세요.
-          </p>
+          <ul class="hero-notice">
+            <li>이 서비스는 개발 중인 페이지이며 운영 비용 문제로 지인들에게만 공유하고 있습니다. 제가 모르는 타인에게는 공유하지 말아 주세요.</li>
+            <li>사용에 어려움이 있거나 오류를 발견한다면 저에게 연락부탁드립니다.</li>
+          </ul>
           <div class="creator-info" aria-label="만든 사람 정보">
             <p>만든 사람</p>
             <strong>Dawoon Jeong</strong>
