@@ -3321,7 +3321,7 @@ async function runBaselineVerification() {
       .filter((value) => Number.isFinite(value));
     assert.ok(
       Math.min(...refinedContourPolylineElevations) >=
-        Number(refinedSketchUpSiteContext?.terrainGrid?.maxElevation || 0) + 4.999,
+        Number(refinedSketchUpSiteContext?.terrainGrid?.maxElevation || 0) + 99.999,
       "SKP contour curves should float above the exported terrain model."
     );
     assert.ok(
