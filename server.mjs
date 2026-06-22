@@ -68,6 +68,9 @@ const PROJECTED_LAYER_MIN_SAMPLE_STEP_METERS = 0.75;
 const PROJECTED_LAYER_MAX_SAMPLE_STEP_METERS = 6;
 const PROJECTED_LAYER_MAX_GRID_CELLS = 1800;
 const PROJECTED_LAYER_MIN_CELL_AREA_SQM = 0.001;
+const RHINO_ROAD_PROJECTED_LAYER_MIN_SAMPLE_STEP_METERS = 4;
+const RHINO_ROAD_PROJECTED_LAYER_MAX_SAMPLE_STEP_METERS = 12;
+const RHINO_ROAD_PROJECTED_LAYER_MAX_GRID_CELLS = 360;
 const SKETCHUP_PROJECTED_LAYER_MIN_SAMPLE_STEP_METERS = 3.25;
 const SKETCHUP_PROJECTED_LAYER_MAX_SAMPLE_STEP_METERS = 8;
 const SKETCHUP_PROJECTED_LAYER_MAX_GRID_CELLS = 420;
@@ -33606,6 +33609,74 @@ function addRhinoProjectedLayerRegionCaps(
   bottomElevationResolver,
   topElevationResolver
 ) {
+  const simpleOuterPoints = dedupeLocalPolygonPoints(region?.outerPoints || []);
+  const hasHoles = Array.isArray(region?.holePoints) && region.holePoints.length > 0;
+
+  if (!hasHoles && (simpleOuterPoints.length === 3 || simpleOuterPoints.length === 4)) {
+    const bottomIndices = [];
+    const topIndices = [];
+
+    for (const [xMeters, yMeters] of simpleOuterPoints) {
+      const bottomElevation = Number(bottomElevationResolver(xMeters, yMeters));
+      const topElevation = Number(topElevationResolver(xMeters, yMeters));
+
+      if (
+        !Number.isFinite(bottomElevation) ||
+        !Number.isFinite(topElevation) ||
+        topElevation <= bottomElevation
+      ) {
+        return 0;
+      }
+
+      bottomIndices.push(mesh.vertices().add(xMeters, yMeters, bottomElevation));
+      topIndices.push(mesh.vertices().add(xMeters, yMeters, topElevation));
+    }
+
+    const isCounterClockwise = computeLocalPolygonSignedArea(simpleOuterPoints) >= 0;
+
+    if (simpleOuterPoints.length === 3) {
+      if (isCounterClockwise) {
+        mesh.faces().addTriFace(topIndices[0], topIndices[1], topIndices[2]);
+        mesh.faces().addTriFace(bottomIndices[2], bottomIndices[1], bottomIndices[0]);
+      } else {
+        mesh.faces().addTriFace(topIndices[2], topIndices[1], topIndices[0]);
+        mesh.faces().addTriFace(bottomIndices[0], bottomIndices[1], bottomIndices[2]);
+      }
+
+      return 2;
+    }
+
+    if (isCounterClockwise) {
+      mesh.faces().addQuadFace(
+        topIndices[0],
+        topIndices[1],
+        topIndices[2],
+        topIndices[3]
+      );
+      mesh.faces().addQuadFace(
+        bottomIndices[3],
+        bottomIndices[2],
+        bottomIndices[1],
+        bottomIndices[0]
+      );
+    } else {
+      mesh.faces().addQuadFace(
+        topIndices[3],
+        topIndices[2],
+        topIndices[1],
+        topIndices[0]
+      );
+      mesh.faces().addQuadFace(
+        bottomIndices[0],
+        bottomIndices[1],
+        bottomIndices[2],
+        bottomIndices[3]
+      );
+    }
+
+    return 2;
+  }
+
   const elevationData = buildProjectedLayerRegionElevationData(
     region,
     bottomElevationResolver,
@@ -33706,7 +33777,8 @@ function addRhinoProjectedLayerMultiPolygonMesh(
   multiPolygon,
   siteContext,
   seed,
-  terrainHeightResolver = null
+  terrainHeightResolver = null,
+  options = {}
 ) {
   const sourceMultiPolygon = Array.isArray(multiPolygon) ? multiPolygon : [];
   const bounds = computeLocalMultiPolygonBounds(sourceMultiPolygon);
@@ -33720,7 +33792,8 @@ function addRhinoProjectedLayerMultiPolygonMesh(
 
   const sampleStepMeters = resolveProjectedLayerSampleStepMeters(
     siteContext,
-    bounds
+    bounds,
+    options
   );
   const bottomElevationResolver = (xMeters, yMeters) =>
     Number(
@@ -33745,7 +33818,8 @@ function addRhinoProjectedLayerMultiPolygonMesh(
 
   for (const region of buildProjectedLayerCellRegionsFromMultiPolygon(
     sourceMultiPolygon,
-    siteContext
+    siteContext,
+    options
   )) {
     const addedFaces = addRhinoProjectedLayerRegionCaps(
       mesh,
@@ -33891,7 +33965,14 @@ function addRhinoRoads(
       roadFootprintMultiPolygon,
       siteContext,
       seed,
-      terrainHeightResolver
+      terrainHeightResolver,
+      {
+        minSampleStepMeters: RHINO_ROAD_PROJECTED_LAYER_MIN_SAMPLE_STEP_METERS,
+        maxSampleStepMeters: RHINO_ROAD_PROJECTED_LAYER_MAX_SAMPLE_STEP_METERS,
+        maxGridCells: RHINO_ROAD_PROJECTED_LAYER_MAX_GRID_CELLS,
+        terrainStepMultiplier: 5,
+        includeBoundaryAnchors: false,
+      }
     );
 
     if (projectedStats.faceCount > 0) {
