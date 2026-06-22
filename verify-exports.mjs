@@ -3167,6 +3167,29 @@ async function runBaselineVerification() {
       Number(roadPlacementDiagnostics?.elevationCount || 0) >= 1,
       "Road placement diagnostics should record at least one terrain elevation for the synthetic road footprint."
     );
+    const syntheticSmoothRoadSketchUpSiteContext = prepareSiteContextForExport(
+      cloneJsonValue({
+        ...syntheticRoadPlacementSiteContext,
+        options: {
+          ...syntheticRoadPlacementSiteContext.options,
+          terrainSurfaceMode: "smooth",
+        },
+      }),
+      {
+        ...syntheticRoadPlacementSiteContext.options,
+        terrainSurfaceMode: "smooth",
+      },
+      "skp"
+    );
+    const syntheticSmoothRoadSketchUpPayload =
+      buildSketchUpPayloadFromSiteContext(syntheticSmoothRoadSketchUpSiteContext);
+    const smoothRoadCenterlineGroup = (
+      syntheticSmoothRoadSketchUpPayload.groups || []
+    ).find((group) => group?.name === "ROADS_SMOOTH_CENTERLINES");
+    assert.ok(
+      Number(smoothRoadCenterlineGroup?.polylines?.length || 0) >= 1,
+      "SKP smooth terrain roads should include projected road centerline curves above the road surface."
+    );
     const syntheticFlatFallbackBuildingSiteContext = cloneJsonValue({
       ...syntheticContourSiteContext,
       contourLines: {
@@ -3246,14 +3269,20 @@ async function runBaselineVerification() {
     );
     const flatFallbackBuildingPlacementDebug =
       preparedFlatFallbackBuildingSiteContext?.stats?.buildingPlacementDebug?.[0];
+    const expectedFlatFallbackBuildingElevation =
+      29 +
+      Number(
+        preparedFlatFallbackBuildingSiteContext?.stats
+          ?.exportModelElevationOffset || 0
+      );
     assert.equal(
       flatFallbackBuildingPlacementDebug?.finalBaseElevation,
-      29,
+      expectedFlatFallbackBuildingElevation,
       "Flat fallback contour terrain should still place the building on the exported flat terrain basis."
     );
     assert.equal(
       flatFallbackBuildingPlacementDebug?.terrainBasisElevation,
-      29,
+      expectedFlatFallbackBuildingElevation,
       "Flat fallback contour terrain should expose the exported flat terrain basis for building placement."
     );
     assert.equal(
@@ -3269,13 +3298,14 @@ async function runBaselineVerification() {
     const refinedSketchUpPayload = buildSketchUpPayloadFromSiteContext(
       refinedSketchUpSiteContext
     );
-    const refinedContourCurves = (refinedSketchUpPayload.groups || [])
+    const refinedContourPolylines = (refinedSketchUpPayload.groups || [])
       .filter((group) =>
         String(group?.layer || "")
           .trim()
           .startsWith("contours")
       )
-      .flatMap((group) => group?.polylines || [])
+      .flatMap((group) => group?.polylines || []);
+    const refinedContourCurves = refinedContourPolylines
       .map((polyline) => polyline?.curve === true);
     assert.ok(
       refinedContourCurves.length > 0,
@@ -3284,6 +3314,21 @@ async function runBaselineVerification() {
     assert.ok(
       refinedContourCurves.every(Boolean),
       "SKP contour polylines should be exported as curves."
+    );
+    const refinedContourPolylineElevations = refinedContourPolylines
+      .flatMap((polyline) => polyline?.points || [])
+      .map((point) => Number(point?.[2]))
+      .filter((value) => Number.isFinite(value));
+    assert.ok(
+      Math.min(...refinedContourPolylineElevations) >=
+        Number(refinedSketchUpSiteContext?.terrainGrid?.maxElevation || 0) + 4.999,
+      "SKP contour curves should float above the exported terrain model."
+    );
+    assert.ok(
+      Math.max(...refinedContourPolylineElevations) -
+        Math.min(...refinedContourPolylineElevations) >=
+        3.999,
+      "SKP contour curves should preserve real contour elevation differences while floating above the model."
     );
     const stairStepSketchUpSource = cloneJsonValue({
       ...syntheticContourSiteContext,

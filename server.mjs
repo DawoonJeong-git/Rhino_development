@@ -74,6 +74,7 @@ const SKETCHUP_PROJECTED_LAYER_MAX_GRID_CELLS = 420;
 const FLAT_EXPORT_CURVE_ELEVATION = 0;
 const TERRAIN_BAND_OVERLAP_METERS = 0.02;
 const TERRAIN_BASE_MODEL_CLEARANCE_METERS = 0.001;
+const EXPORT_FLOATING_CURVE_CLEARANCE_METERS = 5;
 const TERRAIN_BASELIKE_CONTOUR_MIN_AREA_RATIO = 0.975;
 const TERRAIN_BASELIKE_CONTOUR_BOUNDS_TOLERANCE_METERS = 0.05;
 const RHINO_SMOOTH_TERRAIN_MIN_CONTROL_POINTS = 6;
@@ -13688,6 +13689,194 @@ function getTerrainBaseElevation(siteContext, fallbackElevation = 0) {
   return Number((reference - 10).toFixed(3));
 }
 
+function addElevationOffset(value, offsetMeters) {
+  const numericValue = Number(value);
+  const numericOffset = Number(offsetMeters);
+
+  if (!Number.isFinite(numericValue) || !Number.isFinite(numericOffset)) {
+    return value;
+  }
+
+  return Number((numericValue + numericOffset).toFixed(3));
+}
+
+function applyTerrainGridElevationOffset(terrainGrid, offsetMeters) {
+  if (!terrainGrid || typeof terrainGrid !== "object") {
+    return;
+  }
+
+  if (Number.isFinite(Number(terrainGrid.minElevation))) {
+    terrainGrid.minElevation = addElevationOffset(
+      terrainGrid.minElevation,
+      offsetMeters
+    );
+  }
+
+  if (Number.isFinite(Number(terrainGrid.maxElevation))) {
+    terrainGrid.maxElevation = addElevationOffset(
+      terrainGrid.maxElevation,
+      offsetMeters
+    );
+  }
+
+  if (Array.isArray(terrainGrid.elevations)) {
+    terrainGrid.elevations = terrainGrid.elevations.map((row) =>
+      Array.isArray(row)
+        ? row.map((value) => addElevationOffset(value, offsetMeters))
+        : row
+    );
+  }
+}
+
+function applyFeatureCollectionElevationOffset(collection, offsetMeters) {
+  if (!collection?.features?.length) {
+    return;
+  }
+
+  for (const feature of collection.features) {
+    if (!feature || typeof feature !== "object") {
+      continue;
+    }
+
+    feature.properties =
+      feature.properties && typeof feature.properties === "object"
+        ? feature.properties
+        : {};
+
+    if (Number.isFinite(Number(feature.properties.elevation))) {
+      feature.properties.elevation = addElevationOffset(
+        feature.properties.elevation,
+        offsetMeters
+      );
+    }
+  }
+}
+
+function resolveExportModelElevationOffset(siteContext) {
+  const terrainGrid = siteContext?.terrainGrid;
+  const fallbackElevation = Number.isFinite(Number(terrainGrid?.minElevation))
+    ? Number(terrainGrid.minElevation)
+    : 0;
+  const baseElevation = getTerrainBaseElevation(siteContext, fallbackElevation);
+
+  return Number.isFinite(baseElevation)
+    ? Number((-baseElevation).toFixed(3))
+    : 0;
+}
+
+function applyExportElevationNormalization(siteContext) {
+  if (!siteContext || siteContext.__exportElevationNormalized === true) {
+    return 0;
+  }
+
+  const offsetMeters = resolveExportModelElevationOffset(siteContext);
+
+  if (!Number.isFinite(offsetMeters) || Math.abs(offsetMeters) <= 1e-9) {
+    siteContext.__exportElevationNormalized = true;
+    return 0;
+  }
+
+  applyTerrainGridElevationOffset(siteContext.terrainGrid, offsetMeters);
+  applyTerrainGridElevationOffset(siteContext.nativeContourAnchorGrid, offsetMeters);
+  applyFeatureCollectionElevationOffset(siteContext.contourLines, offsetMeters);
+  applyFeatureCollectionElevationOffset(siteContext.curveContourLines, offsetMeters);
+  applyFeatureCollectionElevationOffset(siteContext.exportContourLines, offsetMeters);
+
+  if (siteContext.stats && typeof siteContext.stats === "object") {
+    siteContext.stats.minElevation = addElevationOffset(
+      siteContext.stats.minElevation,
+      offsetMeters
+    );
+    siteContext.stats.maxElevation = addElevationOffset(
+      siteContext.stats.maxElevation,
+      offsetMeters
+    );
+    siteContext.stats.exportModelElevationOffset = Number(
+      offsetMeters.toFixed(3)
+    );
+  }
+
+  siteContext.__exportElevationNormalized = true;
+  return offsetMeters;
+}
+
+function collectContourCurveElevations(siteContext) {
+  const contourCollection =
+    siteContext?.curveContourLines?.features?.length
+      ? siteContext.curveContourLines
+      : siteContext?.exportContourLines?.features?.length
+        ? siteContext.exportContourLines
+        : siteContext?.contourLines;
+
+  return (contourCollection?.features || [])
+    .map((feature) => Number(feature?.properties?.elevation))
+    .filter(Number.isFinite);
+}
+
+function resolveTerrainModelTopElevation(siteContext) {
+  const candidates = [
+    Number(siteContext?.stats?.maxElevation),
+    Number(siteContext?.terrainGrid?.maxElevation),
+  ].filter(Number.isFinite);
+
+  if (
+    siteContext?.options?.terrainMode === "contour" &&
+    siteContext?.terrainGrid?.elevations?.length
+  ) {
+    const terrainPlan = resolveContourTerrainRenderPlan(siteContext);
+
+    if (terrainPlan) {
+      candidates.push(
+        Number(terrainPlan.baseModelTopElevation),
+        Number(terrainPlan.baseModelExportTopElevation),
+        Number(terrainPlan.flatTopElevation)
+      );
+
+      for (const group of [
+        ...(terrainPlan.absoluteContourGroups || []),
+        ...(terrainPlan.bandGroups || []),
+      ]) {
+        candidates.push(Number(group?.topElevation));
+      }
+    }
+  }
+
+  return candidates.length ? Math.max(...candidates) : 0;
+}
+
+function resolveExportCurveElevationLayout(siteContext) {
+  const terrainTopElevation = resolveTerrainModelTopElevation(siteContext);
+  const contourElevations = collectContourCurveElevations(siteContext);
+  const minContourElevation = contourElevations.length
+    ? Math.min(...contourElevations)
+    : Number.isFinite(Number(siteContext?.terrainGrid?.minElevation))
+      ? Number(siteContext.terrainGrid.minElevation)
+      : terrainTopElevation;
+  const baseCurveElevation = Number(
+    (terrainTopElevation + EXPORT_FLOATING_CURVE_CLEARANCE_METERS).toFixed(3)
+  );
+
+  return {
+    terrainTopElevation,
+    baseCurveElevation,
+    minContourElevation,
+    contourElevationOffset: Number(
+      (baseCurveElevation - minContourElevation).toFixed(3)
+    ),
+  };
+}
+
+function resolveExportContourCurveElevation(siteContext, feature) {
+  const rawElevation = Number(feature?.properties?.elevation);
+  const layout = resolveExportCurveElevationLayout(siteContext);
+
+  if (!Number.isFinite(rawElevation)) {
+    return layout.baseCurveElevation;
+  }
+
+  return Number((rawElevation + layout.contourElevationOffset).toFixed(3));
+}
+
 function resolveTerrainExportGridStep(
   siteContext,
   widthMeters,
@@ -26177,6 +26366,48 @@ function buildSketchUpFacePoint(xMeters, yMeters, elevation) {
   ];
 }
 
+function dedupeSketchUpPolylinePoints(points, toleranceMeters = 0.001) {
+  const deduped = [];
+
+  for (const point of points || []) {
+    if (
+      !Array.isArray(point) ||
+      point.length < 3 ||
+      !Number.isFinite(Number(point[0])) ||
+      !Number.isFinite(Number(point[1])) ||
+      !Number.isFinite(Number(point[2]))
+    ) {
+      continue;
+    }
+
+    const normalizedPoint = [
+      Number(point[0]),
+      Number(point[1]),
+      Number(point[2]),
+    ];
+
+    if (
+      !deduped.length ||
+      !pointsMatchInMeters(
+        deduped[deduped.length - 1],
+        normalizedPoint,
+        toleranceMeters
+      )
+    ) {
+      deduped.push(normalizedPoint);
+    }
+  }
+
+  if (
+    deduped.length >= 2 &&
+    pointsMatchInMeters(deduped[0], deduped[deduped.length - 1], toleranceMeters)
+  ) {
+    deduped.pop();
+  }
+
+  return deduped;
+}
+
 function getSketchUpFacePointKey(point) {
   return `${Number(point?.[0] || 0).toFixed(6)},${Number(point?.[1] || 0).toFixed(
     6
@@ -27039,7 +27270,7 @@ function simplifySketchUpSolidRegion(region, toleranceMeters = 0) {
 
 function buildSketchUpPolyline(points, closed = false, options = {}) {
   const normalizedPoints = closed
-    ? dedupeLocalPolygonPoints(points, 0.001)
+    ? dedupeSketchUpPolylinePoints(points, 0.001)
     : (points || []).filter(
         (point) =>
           Array.isArray(point) &&
@@ -27061,11 +27292,15 @@ function buildSketchUpPolyline(points, closed = false, options = {}) {
 }
 
 function buildSketchUpContourPolyline(points, elevation, closed = false) {
+  const resolvedElevation = Number.isFinite(Number(elevation))
+    ? Number(elevation)
+    : FLAT_EXPORT_CURVE_ELEVATION;
+
   return buildSketchUpPolyline(
     (points || []).map(([xMeters, yMeters]) => [
       Number(xMeters || 0),
       Number(yMeters || 0),
-      FLAT_EXPORT_CURVE_ELEVATION,
+      resolvedElevation,
     ]),
     closed,
     { curve: true }
@@ -28576,6 +28811,81 @@ function buildSketchUpSmoothRoadMeshGroup(
   };
 }
 
+function buildSketchUpSmoothRoadCenterlineGroup(
+  siteContext,
+  center,
+  seed,
+  terrainHeightResolver
+) {
+  if (typeof terrainHeightResolver !== "function") {
+    return null;
+  }
+
+  const polylines = [];
+
+  for (const feature of siteContext.roads?.features || []) {
+    const widthMeters = resolveRoadWidthMeters(feature);
+    const coordinateSets =
+      feature?.geometry?.type === "LineString" ||
+      feature?.geometry?.type === "MultiLineString"
+        ? getLineStringsFromGeometry(feature.geometry)
+        : getOuterRings(feature);
+
+    for (const coordinates of coordinateSets) {
+      const path = buildRoadLocalPath(
+        coordinates,
+        center,
+        siteContext,
+        widthMeters
+      );
+
+      if (path.length < 2) {
+        continue;
+      }
+
+      const polyline = buildSketchUpPolyline(
+        path.map(([xMeters, yMeters]) => {
+          const terrainElevation = resolveRhinoTerrainHeightAtLocalPoint(
+            siteContext,
+            xMeters,
+            yMeters,
+            seed,
+            terrainHeightResolver
+          );
+          const elevation = Number(
+            (
+              terrainElevation +
+              ROAD_SURFACE_OFFSET_METERS +
+              ROAD_SURFACE_THICKNESS_METERS +
+              0.04
+            ).toFixed(3)
+          );
+
+          return [xMeters, yMeters, elevation];
+        }),
+        false,
+        { curve: true }
+      );
+
+      if (polyline) {
+        polylines.push(polyline);
+      }
+    }
+  }
+
+  if (!polylines.length) {
+    return null;
+  }
+
+  return {
+    layer: "roads",
+    name: "ROADS_SMOOTH_CENTERLINES",
+    faces: [],
+    polylines,
+    solids: [],
+  };
+}
+
 function buildSketchUpPayloadFromSiteContext(siteContext) {
   const location = siteContext.location;
   const center = { lat: location.lat, lng: location.lng };
@@ -28595,6 +28905,8 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
     typeof smoothTerrainModel?.heightAtLocalPoint === "function"
       ? smoothTerrainModel.heightAtLocalPoint
       : null;
+  const curveElevationLayout = resolveExportCurveElevationLayout(siteContext);
+  const flatCurveElevation = curveElevationLayout.baseCurveElevation;
   const pushGroup = (group) => {
     if (
       group &&
@@ -28833,6 +29145,14 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
           smoothTerrainHeightResolver
         )
       );
+      pushGroup(
+        buildSketchUpSmoothRoadCenterlineGroup(
+          siteContext,
+          center,
+          seed,
+          smoothTerrainHeightResolver
+        )
+      );
     }
   }
 
@@ -28850,7 +29170,7 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
           buildSketchUpPolyline(
             ring.map((point) => {
               const [xMeters, yMeters] = localMetersFromLngLat(point, center);
-              return [xMeters, yMeters, FLAT_EXPORT_CURVE_ELEVATION];
+              return [xMeters, yMeters, flatCurveElevation];
             }),
             true
           )
@@ -28904,7 +29224,7 @@ function buildSketchUpPayloadFromSiteContext(siteContext) {
     };
 
     for (const feature of contourCollection?.features || []) {
-      const elevation = Number(feature?.properties?.elevation || 0);
+      const elevation = resolveExportContourCurveElevation(siteContext, feature);
       const closedLoop = feature?.properties?.closedLoop === true;
       const layerName = resolveContourFeatureExportLayer(siteContext, feature);
 
@@ -31877,8 +32197,10 @@ function createRhinoContourDisplayCurve(rhino, points) {
   return createRhinoPolylineCurve(rhino, normalizedPoints);
 }
 
-function resolveRhinoContourCurveElevation(feature) {
-  return FLAT_EXPORT_CURVE_ELEVATION;
+function resolveRhinoContourCurveElevation(feature, siteContext = null) {
+  return siteContext
+    ? resolveExportContourCurveElevation(siteContext, feature)
+    : FLAT_EXPORT_CURVE_ELEVATION;
 }
 
 function createRhinoLocalProfileCurve(rhino, polygonPoints) {
@@ -33053,7 +33375,8 @@ function addRhinoFlatBoundaryCurve(
   layerIndex,
   boundaryFeature,
   center,
-  objectName
+  objectName,
+  elevation = FLAT_EXPORT_CURVE_ELEVATION
 ) {
   const openRing = getOpenRing(getOuterRing(boundaryFeature));
 
@@ -33064,7 +33387,7 @@ function addRhinoFlatBoundaryCurve(
   const closedRing = [...openRing, openRing[0]];
   const points = closedRing.map((point) => {
     const [xMeters, yMeters] = localMetersFromLngLat(point, center);
-    return [xMeters, yMeters, FLAT_EXPORT_CURVE_ELEVATION];
+    return [xMeters, yMeters, elevation];
   });
   const curve = createRhinoContourDisplayCurve(rhino, points);
 
@@ -33725,7 +34048,15 @@ function addRhinoContourBandRoadSolids(
   };
 }
 
-function addRhinoRoadCenterlines(doc, rhino, layerIndex, siteContext, center, seed) {
+function addRhinoRoadCenterlines(
+  doc,
+  rhino,
+  layerIndex,
+  siteContext,
+  center,
+  seed,
+  elevation = FLAT_EXPORT_CURVE_ELEVATION
+) {
   let objectCount = 0;
   let lineCount = 0;
 
@@ -33751,7 +34082,7 @@ function addRhinoRoadCenterlines(doc, rhino, layerIndex, siteContext, center, se
       }
 
       const points = path.map(([xMeters, yMeters]) => {
-        return [xMeters, yMeters, FLAT_EXPORT_CURVE_ELEVATION];
+        return [xMeters, yMeters, elevation];
       });
 
       doc.objects().add(
@@ -33967,6 +34298,12 @@ function prepareSiteContextForExport(siteContext, requestedOptions, format) {
     }
   }
   markPreparePhase("contourDisplayMs");
+
+  const exportModelElevationOffset = applyExportElevationNormalization(
+    exportSiteContext
+  );
+  exportSiteContext.stats.exportModelElevationOffset =
+    Number(exportModelElevationOffset.toFixed(3));
 
   if (
     isContourModelExport &&
@@ -34233,6 +34570,8 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
     RHINO_LAYER_NAMES.CURVE_ROAD,
     RHINO_LAYER_COLORS.CURVE_ROAD
   );
+  const curveElevationLayout = resolveExportCurveElevationLayout(siteContext);
+  const flatCurveElevation = curveElevationLayout.baseCurveElevation;
   progress(18, "3DM 지형 레이어를 구성하는 중입니다.");
 
   let smoothTerrainHeightResolver = null;
@@ -34298,7 +34637,8 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
     modelBoundaryCurveLayer,
     siteContext.clipBoundary,
     center,
-    "CURVE_MODEL_BOUNDARY"
+    "CURVE_MODEL_BOUNDARY",
+    flatCurveElevation
   );
 
   if (siteContext.options?.includeBuildings !== false) {
@@ -34320,7 +34660,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
       buildingCurveLayer,
       siteContext.buildings?.features || [],
       center,
-      () => FLAT_EXPORT_CURVE_ELEVATION,
+      () => flatCurveElevation,
       {
         objectNamePrefix: "CURVE_BUILDING",
       }
@@ -34337,7 +34677,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
         ? targetParcelFeatures
         : [siteContext.parcelBoundary].filter(Boolean),
       center,
-      () => FLAT_EXPORT_CURVE_ELEVATION,
+      () => flatCurveElevation,
       {
         objectNamePrefix: "CURVE_SITE_BOUNDARY",
         groupIndicesResolver: (feature) =>
@@ -34355,7 +34695,7 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
         parcelContextLayer,
         siteContext.parcelContext.features,
         center,
-        () => FLAT_EXPORT_CURVE_ELEVATION,
+        () => flatCurveElevation,
         {
           objectNamePrefix: "CURVE_PARCEL_CONTEXT",
         }
@@ -34376,7 +34716,10 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
     ) {
       const feature = contourCollection.features[index];
       const lineStrings = getLineStringsFromGeometry(feature.geometry);
-      const contourElevation = resolveRhinoContourCurveElevation(feature);
+      const contourElevation = resolveRhinoContourCurveElevation(
+        feature,
+        siteContext
+      );
 
       for (let lineIndex = 0; lineIndex < lineStrings.length; lineIndex += 1) {
         const points = lineStrings[lineIndex].map((point) => {
@@ -34469,7 +34812,8 @@ async function build3dmFromSiteContext(siteContext, reportProgress = null) {
       roadCurveLayer,
       siteContext,
       center,
-      seed
+      seed,
+      flatCurveElevation
     );
     console.log(
       `[export-3dm] roadCurves features=${Number(
