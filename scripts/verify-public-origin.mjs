@@ -127,11 +127,16 @@ async function main() {
   assert.equal(hubResponse.status, 200, "Public hub route should stay reachable.");
   assert.doesNotMatch(
     hubSummary,
-    /\/heritage-risk|\/max-mass/i,
-    "Public hub should not expose unfinished internal routes."
+    /\/heritage-risk/i,
+    "Public hub should not expose unreleased internal routes."
+  );
+  assert.match(
+    hubSummary,
+    /\/max-mass/i,
+    "Public hub should expose the max-mass development preview."
   );
 
-  const hiddenRoutes = ["/heritage-risk", "/max-mass"];
+  const hiddenRoutes = ["/heritage-risk"];
 
   for (const pathname of hiddenRoutes) {
     const hiddenResponse = await fetch(`${baseUrl}${pathname}`, {
@@ -146,6 +151,24 @@ async function main() {
       hiddenResponse.status,
       404,
       `Unfinished route ${pathname} should stay blocked on the public origin.`
+    );
+  }
+
+  const publicPreviewRoutes = ["/max-mass"];
+
+  for (const pathname of publicPreviewRoutes) {
+    const previewResponse = await fetch(`${baseUrl}${pathname}`, {
+      redirect: "manual",
+      headers: {
+        Accept: "text/html,application/json",
+        "Cache-Control": "no-cache",
+      },
+    });
+
+    assert.equal(
+      previewResponse.status,
+      200,
+      `Public preview route ${pathname} should stay reachable on the public origin.`
     );
   }
 
@@ -201,7 +224,12 @@ async function main() {
             httpStatus: runtimeStatsResponse.status,
           },
           {
-            id: "public-hub-hides-internal-routes",
+            id: "public-hub-hides-unreleased-routes",
+            status: "pass",
+            httpStatus: hubResponse.status,
+          },
+          {
+            id: "public-hub-shows-max-mass-preview",
             status: "pass",
             httpStatus: hubResponse.status,
           },
@@ -210,6 +238,11 @@ async function main() {
             id: `public-hidden-route-${pathname.slice(1)}-blocked`,
             status: "pass",
             httpStatus: 404,
+          })),
+          ...publicPreviewRoutes.map((pathname) => ({
+            id: `public-preview-route-${pathname.slice(1)}-reachable`,
+            status: "pass",
+            httpStatus: 200,
           })),
         ],
       },
