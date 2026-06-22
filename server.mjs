@@ -27956,6 +27956,15 @@ function buildSmoothContourBandHeightRecords(siteContext) {
       continue;
     }
 
+    const groupAreaSqm = group.regions.reduce(
+      (sum, region) => sum + computeLocalRegionArea(region),
+      0
+    );
+
+    if (!(groupAreaSqm > 0.001)) {
+      continue;
+    }
+
     records.push({
       kind: "band",
       bottomElevation,
@@ -28379,7 +28388,7 @@ function resolveSmoothContourStepHeightAtLocalPoint(point, records, snapDistance
     );
   }
 
-  return records[0]?.elevation ?? null;
+  return null;
 }
 
 function resolveSmoothContourBandHeightAtLocalPoint(point, records, snapDistance) {
