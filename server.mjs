@@ -83,6 +83,13 @@ const TERRAIN_BASELIKE_CONTOUR_BOUNDS_TOLERANCE_METERS = 0.05;
 const RHINO_SMOOTH_TERRAIN_MIN_CONTROL_POINTS = 6;
 const RHINO_SMOOTH_TERRAIN_MAX_CONTROL_POINTS = 96;
 const RHINO_SMOOTH_TERRAIN_INTERIOR_SMOOTHING_PASSES = 0;
+const RHINO_SMOOTH_TERRAIN_ISOLATED_PIT_REPAIR_PASSES = 8;
+const RHINO_SMOOTH_TERRAIN_ISOLATED_PIT_DROP_METERS = 6;
+const RHINO_SMOOTH_TERRAIN_ISOLATED_PIT_MIN_NEIGHBORS = 5;
+const RHINO_SMOOTH_TERRAIN_ISOLATED_PIT_MIN_RESIDUAL_DROP_METERS = 1.25;
+const RHINO_SMOOTH_TERRAIN_ISOLATED_PIT_MAX_RESIDUAL_DROP_METERS = 2.5;
+const RHINO_SMOOTH_TERRAIN_EDGE_SPIKE_RISE_METERS = 6;
+const RHINO_SMOOTH_TERRAIN_EDGE_SPIKE_MIN_NEIGHBORS = 3;
 const RHINO_SMOOTH_TERRAIN_SOLID_TOP_OFFSET_METERS = 0.015;
 const RHINO_SMOOTH_TERRAIN_SOLID_MAX_SAMPLE_COUNT = 72;
 const RHINO_SMOOTH_TERRAIN_WIRE_DENSITY = -1;
@@ -28586,7 +28593,8 @@ function buildSmoothTerrainHeightModel(siteContext, center, seed) {
     elevations.push(elevationRow);
   }
 
-  const smoothedElevations = smoothRhinoTerrainElevationGrid(elevations);
+  const repairedElevations = repairRhinoTerrainIsolatedArtifacts(elevations);
+  const smoothedElevations = smoothRhinoTerrainElevationGrid(repairedElevations);
 
   return {
     frame,
@@ -32642,6 +32650,143 @@ function resolveRhinoSmoothTerrainControlPointCount(lengthMeters, terrainStepMet
   );
 }
 
+// Repairs only isolated terrain artifacts; broad slopes and ridge/valley chains stay untouched.
+function repairRhinoTerrainIsolatedArtifacts(elevations) {
+  if (!Array.isArray(elevations) || elevations.length < 3) {
+    return elevations;
+  }
+
+  let repaired = elevations.map((row) => [...row]);
+
+  for (
+    let pass = 0;
+    pass < RHINO_SMOOTH_TERRAIN_ISOLATED_PIT_REPAIR_PASSES;
+    pass += 1
+  ) {
+    const source = repaired.map((row) => [...row]);
+    let changed = false;
+
+    for (let rowIndex = 0; rowIndex < source.length; rowIndex += 1) {
+      const row = source[rowIndex];
+
+      for (let columnIndex = 0; columnIndex < row.length; columnIndex += 1) {
+        const value = Number(row[columnIndex]);
+        const isBoundaryPoint =
+          rowIndex === 0 ||
+          columnIndex === 0 ||
+          rowIndex === source.length - 1 ||
+          columnIndex === row.length - 1;
+
+        if (!Number.isFinite(value)) {
+          continue;
+        }
+
+        const neighbors = [
+          source[rowIndex - 1]?.[columnIndex],
+          source[rowIndex + 1]?.[columnIndex],
+          source[rowIndex]?.[columnIndex - 1],
+          source[rowIndex]?.[columnIndex + 1],
+          source[rowIndex - 1]?.[columnIndex - 1],
+          source[rowIndex - 1]?.[columnIndex + 1],
+          source[rowIndex + 1]?.[columnIndex - 1],
+          source[rowIndex + 1]?.[columnIndex + 1],
+        ].filter((neighbor) => Number.isFinite(neighbor));
+
+        if (neighbors.length < RHINO_SMOOTH_TERRAIN_EDGE_SPIKE_MIN_NEIGHBORS) {
+          continue;
+        }
+
+        const sortedNeighbors = [...neighbors].sort(
+          (left, right) => left - right
+        );
+        const medianNeighbor =
+          sortedNeighbors[Math.floor(sortedNeighbors.length / 2)];
+
+        if (
+          neighbors.length >= RHINO_SMOOTH_TERRAIN_ISOLATED_PIT_MIN_NEIGHBORS
+        ) {
+          const medianDrop = medianNeighbor - value;
+
+          if (medianDrop >= RHINO_SMOOTH_TERRAIN_ISOLATED_PIT_DROP_METERS) {
+            const requiredHigherNeighbors =
+              neighbors.length >= 8
+                ? 6
+                : Math.max(4, Math.ceil(neighbors.length * 0.75));
+            const higherNeighborCount = neighbors.filter(
+              (neighbor) => neighbor > value + 0.25
+            ).length;
+
+            if (higherNeighborCount >= requiredHigherNeighbors) {
+              const residualDrop = Math.min(
+                RHINO_SMOOTH_TERRAIN_ISOLATED_PIT_MAX_RESIDUAL_DROP_METERS,
+                Math.max(
+                  RHINO_SMOOTH_TERRAIN_ISOLATED_PIT_MIN_RESIDUAL_DROP_METERS,
+                  medianDrop * 0.35
+                )
+              );
+              const repairedValue = Number(
+                Math.max(value, medianNeighbor - residualDrop).toFixed(3)
+              );
+
+              if (repairedValue > value) {
+                repaired[rowIndex][columnIndex] = repairedValue;
+                changed = true;
+                continue;
+              }
+            }
+          }
+        }
+
+        if (!isBoundaryPoint) {
+          continue;
+        }
+
+        const medianRise = value - medianNeighbor;
+
+        if (medianRise < RHINO_SMOOTH_TERRAIN_EDGE_SPIKE_RISE_METERS) {
+          continue;
+        }
+
+        const requiredLowerNeighbors =
+          neighbors.length >= 8
+            ? 6
+            : neighbors.length >= 5
+              ? Math.max(4, Math.ceil(neighbors.length * 0.75))
+              : neighbors.length;
+        const lowerNeighborCount = neighbors.filter(
+          (neighbor) => neighbor < value - 0.25
+        ).length;
+
+        if (lowerNeighborCount < requiredLowerNeighbors) {
+          continue;
+        }
+
+        const residualRise = Math.min(
+          RHINO_SMOOTH_TERRAIN_ISOLATED_PIT_MAX_RESIDUAL_DROP_METERS,
+          Math.max(
+            RHINO_SMOOTH_TERRAIN_ISOLATED_PIT_MIN_RESIDUAL_DROP_METERS,
+            medianRise * 0.35
+          )
+        );
+        const repairedValue = Number(
+          Math.min(value, medianNeighbor + residualRise).toFixed(3)
+        );
+
+        if (repairedValue < value) {
+          repaired[rowIndex][columnIndex] = repairedValue;
+          changed = true;
+        }
+      }
+    }
+
+    if (!changed) {
+      break;
+    }
+  }
+
+  return repaired;
+}
+
 function smoothRhinoTerrainElevationGrid(
   elevations,
   passCount = RHINO_SMOOTH_TERRAIN_INTERIOR_SMOOTHING_PASSES
@@ -33157,7 +33302,8 @@ function addRhinoSmoothTerrainSurface(
     pointRows.push(pointRow);
   }
 
-  const smoothedElevations = smoothRhinoTerrainElevationGrid(elevations);
+  const repairedElevations = repairRhinoTerrainIsolatedArtifacts(elevations);
+  const smoothedElevations = smoothRhinoTerrainElevationGrid(repairedElevations);
   const orderU = Math.min(2, xValues.length);
   const orderV = Math.min(2, yValues.length);
   const surface = rhino.NurbsSurface.create(
