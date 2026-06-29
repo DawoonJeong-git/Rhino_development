@@ -121,7 +121,7 @@ const RHINO_LAYER_COLORS = Object.freeze({
   CURVE_ROAD: { r: 126, g: 87, b: 194 },
 });
 const SKETCHUP_METERS_TO_INCHES = 39.37007874015748;
-const SKETCHUP_EXPORT_TIMEOUT_MS = 1000 * 60 * 3;
+const DEFAULT_SKETCHUP_EXPORT_TIMEOUT_MS = 1000 * 60 * 15;
 const SKETCHUP_EXPORT_EXIT_GRACE_MS = 15_000;
 const CHILD_PROCESS_FORCE_KILL_GRACE_MS = 5_000;
 const DEFAULT_ROAD_WIDTH_METERS = 6;
@@ -2569,6 +2569,12 @@ function buildRuntimeConfig(localConfig) {
     ),
     sketchUpExe: normalizeConfigString(
       process.env.SKETCHUP_EXE || localConfig.SKETCHUP_EXE || ""
+    ),
+    sketchUpExportTimeoutMs: resolvePositiveInteger(
+      process.env.SKETCHUP_EXPORT_TIMEOUT_MS ||
+        localConfig.SKETCHUP_EXPORT_TIMEOUT_MS ||
+        DEFAULT_SKETCHUP_EXPORT_TIMEOUT_MS,
+      DEFAULT_SKETCHUP_EXPORT_TIMEOUT_MS
     ),
     useNominatimFallback:
       String(
@@ -29401,6 +29407,15 @@ function resolveSkpExportRuntimeConfig(exportConfig = null) {
     sketchUpExe: normalizeConfigString(
       source.sketchUpExe ?? process.env.SKETCHUP_EXE ?? ""
     ),
+    sketchUpExportTimeoutMs: Math.max(
+      30_000,
+      resolvePositiveInteger(
+        source.sketchUpExportTimeoutMs ??
+          process.env.SKETCHUP_EXPORT_TIMEOUT_MS ??
+          DEFAULT_SKETCHUP_EXPORT_TIMEOUT_MS,
+        DEFAULT_SKETCHUP_EXPORT_TIMEOUT_MS
+      )
+    ),
   };
 }
 
@@ -29872,12 +29887,38 @@ end
 `;
 }
 
-async function waitForSketchUpExportResult(statusPath, outputPath, childProcess) {
+function formatSketchUpExportTimeout(timeoutMs) {
+  const totalSeconds = Math.max(1, Math.round(Number(timeoutMs) / 1000));
+
+  if (totalSeconds < 60) {
+    return `${totalSeconds} seconds`;
+  }
+
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  if (seconds === 0) {
+    return `${minutes} minutes`;
+  }
+
+  return `${minutes} minutes ${seconds} seconds`;
+}
+
+async function waitForSketchUpExportResult(
+  statusPath,
+  outputPath,
+  childProcess,
+  timeoutMs = DEFAULT_SKETCHUP_EXPORT_TIMEOUT_MS
+) {
   const startedAt = Date.now();
+  const normalizedTimeoutMs = Math.max(
+    1000,
+    Number(timeoutMs) || DEFAULT_SKETCHUP_EXPORT_TIMEOUT_MS
+  );
   let observedExitCode = null;
   let exitObservedAt = 0;
 
-  while (Date.now() - startedAt < SKETCHUP_EXPORT_TIMEOUT_MS) {
+  while (Date.now() - startedAt < normalizedTimeoutMs) {
     try {
       const status = String(await readFile(statusPath, "utf8")).trim();
 
@@ -29936,13 +29977,25 @@ async function waitForSketchUpExportResult(statusPath, outputPath, childProcess)
     );
   }
 
-  throw new Error("SketchUp export timed out before the SKP file was created.");
+  throw new Error(
+    `SketchUp export timed out after ${formatSketchUpExportTimeout(
+      normalizedTimeoutMs
+    )} before the SKP file was created.`
+  );
 }
 
-async function waitForStandaloneSkpExportResult(outputPath, childProcess) {
+async function waitForStandaloneSkpExportResult(
+  outputPath,
+  childProcess,
+  timeoutMs = DEFAULT_SKETCHUP_EXPORT_TIMEOUT_MS
+) {
   const startedAt = Date.now();
+  const normalizedTimeoutMs = Math.max(
+    1000,
+    Number(timeoutMs) || DEFAULT_SKETCHUP_EXPORT_TIMEOUT_MS
+  );
 
-  while (Date.now() - startedAt < SKETCHUP_EXPORT_TIMEOUT_MS) {
+  while (Date.now() - startedAt < normalizedTimeoutMs) {
     try {
       if (childProcess.exitCode === 0) {
         return readFile(outputPath);
@@ -29969,7 +30022,9 @@ async function waitForStandaloneSkpExportResult(outputPath, childProcess) {
   }
 
   throw new Error(
-    "Standalone SKP exporter timed out before the SKP file was created."
+    `Standalone SKP exporter timed out after ${formatSketchUpExportTimeout(
+      normalizedTimeoutMs
+    )} before the SKP file was created.`
   );
 }
 
@@ -29981,6 +30036,7 @@ async function buildSkpFromSiteContext(
   const progress =
     typeof reportProgress === "function" ? reportProgress : () => null;
   const runtimeConfig = resolveSkpExportRuntimeConfig(exportConfig);
+  const sketchUpExportTimeoutMs = runtimeConfig.sketchUpExportTimeoutMs;
 
   progress(12, "SKP 변환용 SketchUp payload를 준비하는 중입니다.");
   const payload = buildSketchUpPayloadFromSiteContext(siteContext);
@@ -30030,7 +30086,12 @@ async function buildSkpFromSiteContext(
         tempDirectory
       );
       skpBuffer = await Promise.race([
-        waitForSketchUpExportResult(statusPath, outputPath, childProcess),
+        waitForSketchUpExportResult(
+          statusPath,
+          outputPath,
+          childProcess,
+          sketchUpExportTimeoutMs
+        ),
         new Promise((_, reject) => {
           childProcess.once("error", reject);
         }),
@@ -30051,7 +30112,11 @@ async function buildSkpFromSiteContext(
         tempDirectory
       );
       skpBuffer = await Promise.race([
-        waitForStandaloneSkpExportResult(outputPath, childProcess),
+        waitForStandaloneSkpExportResult(
+          outputPath,
+          childProcess,
+          sketchUpExportTimeoutMs
+        ),
         new Promise((_, reject) => {
           childProcess.once("error", reject);
         }),
