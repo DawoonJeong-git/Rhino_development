@@ -922,7 +922,7 @@ async function readErrorMessageFromResponse(response, fallbackMessage) {
 
     if (contentType.includes("text/html") || /^<!doctype html/i.test(text)) {
       if (response.status === 524 || text.toLowerCase().includes("error code 524")) {
-        return `${fallbackMessage} 서버 작업이 오래 걸려 Cloudflare 연결 제한에 걸렸습니다. 대형 모델은 백그라운드 작업으로 다시 시도해주세요.`;
+        return `${fallbackMessage} 서버 작업이 오래 걸려 Cloudflare 연결 제한에 걸렸습니다. 모델 파일은 백그라운드 작업으로 다시 시도해주세요.`;
       }
 
       return `${fallbackMessage} 서버가 HTML 오류 페이지를 반환했습니다. 잠시 후 다시 시도해주세요.`;
@@ -5316,7 +5316,7 @@ async function generateModelSpec() {
   try {
     const options = collectModelOptions();
 
-    if (shouldUseAsyncExportJob(options, options.exportFormat)) {
+    if (shouldDeferPreviewForLargeExport(options, options.exportFormat)) {
       const summary = [
         `범위 ${Number(options.radius) || 0}m`,
         `대지 방식 ${describeTerrainSurfaceMode(options.terrainSurfaceMode)}`,
@@ -5367,6 +5367,17 @@ async function generateModelSpec() {
 }
 
 function shouldUseAsyncExportJob(options, format) {
+  const exportConfig = state.runtimeConfig?.exports || {};
+
+  if (exportConfig.asyncJobsEnabled !== true) {
+    return false;
+  }
+
+  const normalizedFormat = normalizeExportFormat(format || options?.exportFormat);
+  return ["3dm", "skp", "obj", "dxf"].includes(normalizedFormat);
+}
+
+function shouldDeferPreviewForLargeExport(options, format) {
   const exportConfig = state.runtimeConfig?.exports || {};
 
   if (exportConfig.asyncJobsEnabled !== true) {
@@ -5506,7 +5517,7 @@ async function downloadObj(format = collectModelOptions().exportFormat) {
   startModelProgress(
     operationKey,
     useAsyncExportJob
-      ? `${describeExportFormat(normalizedFormat)} 대형 작업을 백그라운드에 접수하는 중입니다.`
+      ? `${describeExportFormat(normalizedFormat)} 파일 작업을 백그라운드에 접수하는 중입니다.`
       : `${describeExportFormat(normalizedFormat)} 파일을 준비하는 중입니다.`,
     {
       startValue: 8,
