@@ -2,6 +2,7 @@ param(
   [string]$TunnelName = "space-work-home",
   [string]$CloudflaredPath = "C:\Cloudflared\bin\cloudflared.exe",
   [switch]$Managed,
+  [switch]$StopOnly,
   [string]$PidFile = "",
   [string]$LogDir = ""
 )
@@ -79,7 +80,7 @@ function Normalize-ProcessEnvironmentPath {
   }
 }
 
-if (-not (Test-Path $CloudflaredPath)) {
+if (-not $StopOnly -and -not (Test-Path $CloudflaredPath)) {
   throw "cloudflared executable was not found: $CloudflaredPath"
 }
 
@@ -108,6 +109,13 @@ Stop-ManagedProcess -PidPath $PidFile
 Stop-MatchingProcesses -ProcessName "cloudflared.exe" -Patterns @("tunnel", "run", $TunnelName)
 Stop-MatchingProcesses -ProcessName "powershell.exe" -Patterns @($repoRoot, "start-cloudflare-tunnel.ps1", $TunnelName)
 Stop-MatchingProcesses -ProcessName "cmd.exe" -Patterns @("cloudflared.exe", "tunnel", "run", $TunnelName)
+
+if ($StopOnly) {
+  Write-Host "Cloudflare tunnel stopped in managed mode."
+  Write-Host "PID file: $PidFile"
+  Write-Host "Tunnel: $TunnelName"
+  exit 0
+}
 
 Normalize-ProcessEnvironmentPath
 $tunnelProcess = Start-Process `

@@ -1,5 +1,6 @@
 param(
   [switch]$Managed,
+  [switch]$StopOnly,
   [string]$PidFile = "",
   [string]$LogDir = ""
 )
@@ -183,6 +184,13 @@ Stop-PortListenerProcess -Port $serverPort
 Stop-MatchingProcesses -ProcessName "node.exe" -Patterns @($repoRoot, "server.mjs")
 Stop-MatchingProcesses -ProcessName "powershell.exe" -Patterns @($repoRoot, "deploy\start-server.ps1")
 Stop-MatchingProcesses -ProcessName "cmd.exe" -Patterns @($repoRoot, "deploy\start-server.ps1")
+
+if ($StopOnly) {
+  Write-Host "Space Work server stopped in managed mode."
+  Write-Host "PID file: $PidFile"
+  Write-Host "Port: $serverPort"
+  exit 0
+}
 
 $nodeCommand = Get-Command node -ErrorAction Stop
 Normalize-ProcessEnvironmentPath

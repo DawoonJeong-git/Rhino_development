@@ -43,6 +43,10 @@ const state = {
   searchRequestId: 0,
   searchDebounceId: null,
   isExportDownloadInFlight: false,
+  exportDownloadController: null,
+  exportDownloadJobId: "",
+  exportDownloadCancelRequested: false,
+  exportDownloadFormat: "",
   modelProgressTimer: null,
   modelProgressPollTimer: null,
   modelProgressValue: 0,
@@ -147,6 +151,7 @@ const modelCard = modelForm?.closest(".card");
 const MIN_CONTOUR_INTERVAL_METERS = 0.1;
 const DEFAULT_CONTOUR_INTERVAL_METERS = 5;
 const DEFAULT_TERRAIN_SURFACE_MODE = "smooth";
+const MAX_MODEL_RADIUS_METERS = 1000;
 const DEFAULT_SELECTION_SUMMARY =
   "주소를 검색하거나 지도에서 위치를 선택하세요.";
 const MODEL_PROGRESS_STORAGE_KEY =
@@ -173,6 +178,7 @@ const MODEL_PROGRESS_DEFAULT_ESTIMATES_MS = Object.freeze({
   "export-obj-async": 90000,
   "export-dxf-async": 90000,
 });
+const APPROX_METERS_PER_DEGREE_LAT = 111_320;
 const REQUEST_UI_PHASE_MESSAGES = Object.freeze({
   siteContext: {
     loading:
@@ -1449,6 +1455,29 @@ function normalizeRangeBounds(bounds) {
     maxLat: Math.max(minLat, maxLat),
     minLng: Math.min(minLng, maxLng),
     maxLng: Math.max(minLng, maxLng),
+  };
+}
+
+function measureRangeBoundsMeters(bounds) {
+  const normalizedBounds = normalizeRangeBounds(bounds);
+
+  if (!normalizedBounds) {
+    return null;
+  }
+
+  const centerLat = (normalizedBounds.minLat + normalizedBounds.maxLat) / 2;
+  const widthMeters =
+    (normalizedBounds.maxLng - normalizedBounds.minLng) *
+    APPROX_METERS_PER_DEGREE_LAT *
+    Math.max(0.2, Math.cos((centerLat * Math.PI) / 180));
+  const heightMeters =
+    (normalizedBounds.maxLat - normalizedBounds.minLat) *
+    APPROX_METERS_PER_DEGREE_LAT;
+
+  return {
+    width: Math.abs(widthMeters),
+    height: Math.abs(heightMeters),
+    maxSide: Math.max(Math.abs(widthMeters), Math.abs(heightMeters)),
   };
 }
 
@@ -3948,6 +3977,61 @@ function showRangeDraftBounds(bounds) {
   return rectangle;
 }
 
+function buildRadiusPreviewBounds(location, options = collectModelOptions()) {
+  if (isRangeSelection(location)) {
+    return normalizeRangeBounds(location.customBounds);
+  }
+
+  const lat = Number(location?.lat);
+  const lng = Number(location?.lng);
+  const radiusMeters = Math.max(0, Number(options?.radius) || 0);
+
+  if (
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    !(radiusMeters > 0)
+  ) {
+    return null;
+  }
+
+  const latDelta = radiusMeters / APPROX_METERS_PER_DEGREE_LAT;
+  const lngDelta =
+    radiusMeters /
+    (APPROX_METERS_PER_DEGREE_LAT *
+      Math.max(0.2, Math.cos((lat * Math.PI) / 180)));
+
+  return normalizeRangeBounds({
+    minLat: lat - latDelta,
+    maxLat: lat + latDelta,
+    minLng: lng - lngDelta,
+    maxLng: lng + lngDelta,
+  });
+}
+
+function focusMapOnBounds(bounds) {
+  if (!state.map || !bounds) {
+    return false;
+  }
+
+  const leafletBounds = L.latLngBounds(
+    [bounds.minLat, bounds.minLng],
+    [bounds.maxLat, bounds.maxLng]
+  );
+
+  if (!leafletBounds.isValid()) {
+    return false;
+  }
+
+  state.map.stop();
+  state.map.closePopup();
+  state.map.fitBounds(leafletBounds.pad(0.12), {
+    animate: false,
+    padding: [32, 32],
+    maxZoom: 19,
+  });
+  return true;
+}
+
 function selectionHasParcelReference(location = state.selectedLocation) {
   if (isMultiParcelSelection(location)) {
     return getSelectedParcels(location).length > 0;
@@ -4689,16 +4773,105 @@ function updateDownloadButtonLabel() {
   }
 }
 
-function setExportActionBusy(isBusy, format = collectModelOptions().exportFormat) {
+function setExportActionBusy(
+  isBusy,
+  format = collectModelOptions().exportFormat,
+  options = {}
+) {
   if (!downloadObjButton) {
     return;
   }
 
-  downloadObjButton.disabled = Boolean(isBusy);
+  downloadObjButton.disabled = Boolean(options?.canceling);
   downloadObjButton.setAttribute("aria-busy", isBusy ? "true" : "false");
+  downloadObjButton.dataset.downloadState = isBusy
+    ? options?.canceling
+      ? "canceling"
+      : "busy"
+    : "idle";
   downloadObjButton.textContent = isBusy
-    ? `${describeExportFormat(format)} 준비 중...`
+    ? options?.canceling
+      ? "취소 중..."
+      : "다운로드 취소"
     : "파일 다운로드";
+}
+
+function createExportDownloadCancelError() {
+  const error = new Error("모델 파일 다운로드가 취소되었습니다.");
+  error.name = "AbortError";
+  return error;
+}
+
+function isExportDownloadCancelError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return (
+    error?.name === "AbortError" ||
+    message.includes("aborted") ||
+    message.includes("abort") ||
+    message.includes("cancel") ||
+    message.includes("중단") ||
+    message.includes("취소")
+  );
+}
+
+async function requestExportJobCancellation(jobId) {
+  const normalizedJobId = String(jobId || "").trim();
+
+  if (!normalizedJobId) {
+    return null;
+  }
+
+  const response = await fetchApp(
+    `/api/export-jobs/${encodeURIComponent(normalizedJobId)}`,
+    {
+      method: "DELETE",
+      headers: {
+        Accept: "application/json",
+      },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error("백그라운드 모델 파일 작업 취소에 실패했습니다.");
+  }
+
+  return response.json().catch(() => null);
+}
+
+async function cancelCurrentExportDownload() {
+  if (!state.isExportDownloadInFlight) {
+    return false;
+  }
+
+  state.exportDownloadCancelRequested = true;
+  setExportActionBusy(
+    true,
+    state.exportDownloadFormat || collectModelOptions().exportFormat,
+    { canceling: true }
+  );
+  advanceModelProgress(
+    Math.max(1, Number(state.modelProgressValue || 0)),
+    "모델 파일 다운로드를 취소하는 중입니다."
+  );
+
+  const jobId = state.exportDownloadJobId;
+  const controller = state.exportDownloadController;
+
+  try {
+    if (jobId) {
+      try {
+        await requestExportJobCancellation(jobId);
+      } catch (error) {
+        console.warn("[export] failed to cancel background job", error);
+      }
+    }
+  } finally {
+    if (controller && !controller.signal.aborted) {
+      controller.abort(createExportDownloadCancelError());
+    }
+  }
+
+  return true;
 }
 
 function ensureStatusChip(id, labelElement) {
@@ -5366,6 +5539,84 @@ async function generateModelSpec() {
   }
 }
 
+async function previewModelRangeOnly() {
+  if (!state.selectedLocation) {
+    throw new Error("먼저 위치를 선택하세요.");
+  }
+
+  const operationKey = "preview";
+  const startedAt = performance.now();
+  const options = collectModelOptions();
+  const radiusMeters = Math.max(0, Number(options?.radius) || 0);
+  const manualRangeLimitMeters = MAX_MODEL_RADIUS_METERS;
+
+  if (!isRangeSelection(state.selectedLocation) && radiusMeters > MAX_MODEL_RADIUS_METERS) {
+    throw new Error(`모델 미리보기는 ${MAX_MODEL_RADIUS_METERS}m 이하에서만 가능합니다.`);
+  }
+
+  const bounds = buildRadiusPreviewBounds(state.selectedLocation, options);
+
+  if (!bounds) {
+    throw new Error("미리보기 범위를 계산하지 못했습니다.");
+  }
+
+  if (isRangeSelection(state.selectedLocation)) {
+    const rangeSize = measureRangeBoundsMeters(bounds);
+
+    if (Number(rangeSize?.maxSide || 0) > manualRangeLimitMeters) {
+      throw new Error(
+        `모델 미리보기 직접 지정 범위는 최대 ${manualRangeLimitMeters}m x ${manualRangeLimitMeters}m 이하여야 합니다.`
+      );
+    }
+  }
+
+  state.siteContextNoteOverride = "";
+  specPreview.textContent = "현재 반경 범위를 지도에 표시하는 중입니다.";
+  setActionFeedback("모델 미리보기 범위를 표시하는 중입니다.");
+  renderSiteContextMeta();
+  startModelProgress(operationKey, "범위 반경을 지도에 표시하는 중입니다.", {
+    startValue: 16,
+    maxValue: 92,
+  });
+
+  try {
+    clearContextLayers();
+    state.siteContext = null;
+    state.siteContextOptionsSignature = `range-preview:${buildModelOptionsSignature(
+      options
+    )}`;
+    renderSiteContextMeta();
+
+    const rectangle = showRangeDraftBounds(bounds);
+    const focused = focusMapOnBounds(bounds);
+    const radiusLabel = isRangeSelection(state.selectedLocation)
+      ? "직접 지정 범위"
+      : `범위 ${Number(options.radius) || 0}m`;
+    const summary = `${radiusLabel} 미리보기`;
+
+    state.latestSpec = {
+      generatedAt: Date.now(),
+      options,
+      summary,
+    };
+    specPreview.textContent = summary;
+    siteContextNote.textContent = rectangle
+      ? focused
+        ? "반경 범위만 지도에 표시했습니다."
+        : "반경 범위를 표시했습니다."
+      : "반경 범위를 표시하지 못했습니다.";
+    finishModelProgress("범위 미리보기 표시 완료");
+    rememberModelProgressEstimate(operationKey, performance.now() - startedAt);
+    return null;
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "범위 적용에 실패했습니다.";
+    failModelProgress(message);
+    specPreview.textContent = message;
+    throw error;
+  }
+}
+
 function shouldUseAsyncExportJob(options, format) {
   const exportConfig = state.runtimeConfig?.exports || {};
 
@@ -5399,9 +5650,24 @@ function shouldDeferPreviewForLargeExport(options, format) {
   return radius >= threshold;
 }
 
-function waitForAsyncExportPollDelay() {
-  return new Promise((resolve) => {
-    window.setTimeout(resolve, ASYNC_EXPORT_JOB_POLL_INTERVAL_MS);
+function waitForAsyncExportPollDelay(signal = null) {
+  if (signal?.aborted) {
+    return Promise.reject(createExportDownloadCancelError());
+  }
+
+  return new Promise((resolve, reject) => {
+    let timeoutId = 0;
+    const handleAbort = () => {
+      window.clearTimeout(timeoutId);
+      reject(createExportDownloadCancelError());
+    };
+
+    timeoutId = window.setTimeout(() => {
+      signal?.removeEventListener?.("abort", handleAbort);
+      resolve();
+    }, ASYNC_EXPORT_JOB_POLL_INTERVAL_MS);
+
+    signal?.addEventListener?.("abort", handleAbort, { once: true });
   });
 }
 
@@ -5410,7 +5676,7 @@ function applyAsyncExportProgress(job, fallbackMessage) {
   advanceModelProgress(percent, job?.message || fallbackMessage);
 }
 
-async function startAsyncExportJob(currentOptions, normalizedFormat) {
+async function startAsyncExportJob(currentOptions, normalizedFormat, signal = null) {
   const response = await fetchWithDiagnostics(
     "/api/export-jobs",
     {
@@ -5418,6 +5684,7 @@ async function startAsyncExportJob(currentOptions, normalizedFormat) {
       headers: {
         "Content-Type": "application/json",
       },
+      signal,
       body: JSON.stringify({
         location: state.selectedLocation,
         options: currentOptions,
@@ -5435,11 +5702,26 @@ async function startAsyncExportJob(currentOptions, normalizedFormat) {
   return job;
 }
 
-async function pollAsyncExportJob(job, normalizedFormat) {
+async function pollAsyncExportJob(job, normalizedFormat, signal = null) {
   let currentJob = job;
 
   while (currentJob?.status !== "succeeded") {
+    if (signal?.aborted) {
+      throw createExportDownloadCancelError();
+    }
+
+    if (currentJob?.id) {
+      state.exportDownloadJobId = currentJob.id;
+    }
+
     if (currentJob?.status === "failed" || currentJob?.status === "cancelled") {
+      if (
+        currentJob?.status === "cancelled" ||
+        state.exportDownloadCancelRequested
+      ) {
+        throw createExportDownloadCancelError();
+      }
+
       throw new Error(
         currentJob?.error ||
           currentJob?.message ||
@@ -5451,7 +5733,7 @@ async function pollAsyncExportJob(job, normalizedFormat) {
       currentJob,
       `${describeExportFormat(normalizedFormat)} 파일을 백그라운드에서 생성하는 중입니다.`
     );
-    await waitForAsyncExportPollDelay();
+    await waitForAsyncExportPollDelay(signal);
 
     const response = await fetchWithDiagnostics(
       `/api/export-jobs/${encodeURIComponent(currentJob.id)}/status`,
@@ -5459,6 +5741,7 @@ async function pollAsyncExportJob(job, normalizedFormat) {
         headers: {
           Accept: "application/json",
         },
+        signal,
       },
       `${describeExportFormat(normalizedFormat)} 백그라운드 작업 상태 확인에 실패했습니다.`
     );
@@ -5474,13 +5757,14 @@ async function pollAsyncExportJob(job, normalizedFormat) {
   return currentJob;
 }
 
-async function downloadAsyncExportJobResult(job, normalizedFormat) {
+async function downloadAsyncExportJobResult(job, normalizedFormat, signal = null) {
   const response = await fetchWithDiagnostics(
     job.downloadUrl || `/api/export-jobs/${encodeURIComponent(job.id)}/download`,
     {
       headers: {
         Accept: "application/octet-stream",
       },
+      signal,
     },
     `${describeExportFormat(normalizedFormat)} 파일 다운로드에 실패했습니다.`
   );
@@ -5498,7 +5782,8 @@ async function downloadObj(format = collectModelOptions().exportFormat) {
   const normalizedFormat = normalizeExportFormat(format);
 
   if (state.isExportDownloadInFlight) {
-    throw new Error("이미 모델 파일을 준비하고 있습니다. 현재 작업이 끝날 때까지 잠시 기다려주세요.");
+    await cancelCurrentExportDownload();
+    return;
   }
 
   const currentOptions = {
@@ -5524,24 +5809,36 @@ async function downloadObj(format = collectModelOptions().exportFormat) {
       maxValue: 96,
     }
   );
+  const exportController = new AbortController();
   state.isExportDownloadInFlight = true;
+  state.exportDownloadController = exportController;
+  state.exportDownloadJobId = "";
+  state.exportDownloadCancelRequested = false;
+  state.exportDownloadFormat = normalizedFormat;
   setExportActionBusy(true, normalizedFormat);
 
   try {
     if (useAsyncExportJob) {
       const queuedJob = await startAsyncExportJob(
         currentOptions,
-        normalizedFormat
+        normalizedFormat,
+        exportController.signal
       );
+      state.exportDownloadJobId = queuedJob.id;
       applyAsyncExportProgress(
         queuedJob,
         `${describeExportFormat(normalizedFormat)} 파일 작업이 접수되었습니다.`
       );
       const completedJob = await pollAsyncExportJob(
         queuedJob,
-        normalizedFormat
+        normalizedFormat,
+        exportController.signal
       );
-      await downloadAsyncExportJobResult(completedJob, normalizedFormat);
+      await downloadAsyncExportJobResult(
+        completedJob,
+        normalizedFormat,
+        exportController.signal
+      );
 
       const summary = state.siteContext
         ? buildAppliedModelSummary(state.siteContext, currentOptions)
@@ -5574,6 +5871,7 @@ async function downloadObj(format = collectModelOptions().exportFormat) {
         headers: {
           "Content-Type": "application/json",
         },
+        signal: exportController.signal,
         body: JSON.stringify({
           location: state.selectedLocation,
           options: currentOptions,
@@ -5602,6 +5900,13 @@ async function downloadObj(format = collectModelOptions().exportFormat) {
     );
     rememberModelProgressEstimate(operationKey, performance.now() - startedAt);
   } catch (error) {
+    if (state.exportDownloadCancelRequested || isExportDownloadCancelError(error)) {
+      const message = "모델 파일 다운로드를 취소했습니다.";
+      specPreview.textContent = message;
+      finishModelProgress(message);
+      return;
+    }
+
     const message =
       error instanceof Error
         ? error.message
@@ -5610,6 +5915,10 @@ async function downloadObj(format = collectModelOptions().exportFormat) {
     throw error;
   } finally {
     state.isExportDownloadInFlight = false;
+    state.exportDownloadController = null;
+    state.exportDownloadJobId = "";
+    state.exportDownloadCancelRequested = false;
+    state.exportDownloadFormat = "";
     setExportActionBusy(false, normalizedFormat);
   }
 }
@@ -5734,7 +6043,7 @@ function attachEvents() {
 
   previewSiteContextButton?.addEventListener("click", async () => {
     try {
-      await generateModelSpec();
+      await previewModelRangeOnly();
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "범위 적용에 실패했습니다.");
     }
@@ -5754,6 +6063,10 @@ function attachEvents() {
     try {
       await downloadObj(collectModelOptions().exportFormat);
     } catch (error) {
+      if (isExportDownloadCancelError(error)) {
+        return;
+      }
+
       window.alert(error instanceof Error ? error.message : "모델 파일 다운로드에 실패했습니다.");
     }
   });

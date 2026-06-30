@@ -291,6 +291,41 @@ async function runSiteContextPreview(page, timeoutMs = 120000) {
   };
 }
 
+async function runRangeOnlyPreview(page, timeoutMs = 120000) {
+  await waitForButtonEnabled(page, "#previewSiteContextButton", timeoutMs);
+  await page.locator("#previewSiteContextButton").click();
+
+  const specSummary = await waitForStableText(
+    page,
+    "#specPreview",
+    ["모델 미리보기를 누르면", "설정이 바뀌었습니다"],
+    timeoutMs
+  );
+  assert.match(
+    String(specSummary || ""),
+    /미리보기|preview/i,
+    "Preview flow should update the preview summary without loading full site-context."
+  );
+
+  const siteContextNote = await waitForStableText(
+    page,
+    "#siteContextNote",
+    [],
+    timeoutMs
+  );
+  assert.match(
+    String(siteContextNote || ""),
+    /반경|범위|range/i,
+    "Preview flow should confirm that only the range boundary was refreshed."
+  );
+
+  return {
+    specSummary,
+    siteContextChip: "",
+    siteContextNote,
+  };
+}
+
 async function loadLandInfo(page, timeoutMs = 60000) {
   if (await hasUiVerificationMethod(page, "loadLandInfo")) {
     const hookResult = await callUiVerificationMethod(page, "loadLandInfo");
@@ -422,9 +457,13 @@ async function downloadModel(page, format, timeoutMs = 120000) {
     timeout: timeoutMs,
   });
   const exportResponsePromise = page.waitForResponse(
-    (response) =>
-      response.url().includes("/api/export-model") &&
-      response.request().method() === "POST",
+    (response) => {
+      const url = response.url();
+      return (
+        response.request().method() === "POST" &&
+        (url.includes("/api/export-model") || url.includes("/api/export-jobs"))
+      );
+    },
     { timeout: timeoutMs }
   );
   await page.locator("#downloadObjButton").click();
@@ -495,7 +534,7 @@ async function runSmokeScenario(context, baseUrl, searchQuery) {
     }
 
     const selectionSummary = await searchAndConfirmSelection(page, searchQuery, 30000);
-    const previewResult = await runSiteContextPreview(page, 120000);
+    const previewResult = await runRangeOnlyPreview(page, 120000);
     const landInfoResult = await loadLandInfo(page, 60000);
     const buildingResult = await loadBuildingRegister(page, 60000);
     const downloadResult = await downloadModel(page, "3dm", 180000);
@@ -603,7 +642,7 @@ async function runManualRange3dmScenario(context, baseUrl) {
       ["선택 전"],
       60000
     );
-    const previewResult = await runSiteContextPreview(page, 120000);
+    const previewResult = await runRangeOnlyPreview(page, 120000);
     const landInfoChip = await waitForChipText(
       page,
       "#landInfoStatusChip",
@@ -650,7 +689,7 @@ async function runOneKmSkpScenario(context, baseUrl, searchQuery) {
       modelOptionOverrides,
     });
 
-    const previewResult = await runSiteContextPreview(page, 180000);
+    const previewResult = await runRangeOnlyPreview(page, 180000);
     const downloadResult = await downloadModel(page, "skp", 480000);
 
     return {
